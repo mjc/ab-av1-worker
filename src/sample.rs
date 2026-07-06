@@ -24,8 +24,7 @@ pub fn sample_dest_path(
         sample_start_s = sample_start_s.floor();
     }
 
-    let mut dest =
-        temporary::process_dir(temp_dir, input.parent().map(Path::to_path_buf))?;
+    let mut dest = temporary::process_dir(temp_dir, input.parent().map(Path::to_path_buf))?;
     // Always using mkv for the samples works better than, e.g. using mp4 for mp4s
     // see https://github.com/alexheretic/ab-av1/issues/82#issuecomment-1337306325
     dest.push(
@@ -206,6 +205,7 @@ pub(crate) mod test_hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::{env, fs};
 
     mod helpers {
@@ -223,7 +223,8 @@ mod tests {
 
         /// 1×1 GIF — valid media for real ffmpeg copy e2e (see ffprobe minimal gif test).
         pub fn temp_gif_input(name: &str) -> PathBuf {
-            const MINIMAL_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00,\
+            const MINIMAL_GIF: &[u8] =
+                b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00,\
 \x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
             let path = env::temp_dir().join(format!(
                 "ab-av1-sample-test-{}-{}.gif",
@@ -335,8 +336,8 @@ mod tests {
     async fn copy_returns_existing_dest_without_spawning() {
         // setup
         let input = temp_input("existing");
-        let dest = sample_dest_path(&input, Duration::from_secs(0), true, 10, None)
-            .expect("sample dest");
+        let dest =
+            sample_dest_path(&input, Duration::from_secs(0), true, 10, None).expect("sample dest");
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).expect("create temp parent");
         }
@@ -355,6 +356,7 @@ mod tests {
         let _ = fs::remove_file(input);
     }
 
+    #[serial]
     #[tokio::test]
     async fn copy_succeeds_with_process_fixture() {
         // setup
@@ -375,6 +377,7 @@ mod tests {
     }
 
     /// Real ffmpeg copy against a minimal GIF input (devshell provides ffmpeg-full).
+    #[serial]
     #[tokio::test]
     async fn copy_e2e_real_ffmpeg() {
         // setup
