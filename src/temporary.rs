@@ -46,8 +46,8 @@ pub async fn clean_all() {
 
     for file in files {
         match file.is_dir() {
-            true => _ = tokio::fs::remove_dir(file).await,
-            false => _ = tokio::fs::remove_file(file).await,
+            true => _ = tokio::fs::remove_dir_all(&file).await,
+            false => _ = tokio::fs::remove_file(&file).await,
         }
     }
 }
@@ -64,7 +64,7 @@ async fn clean_non_keepables() {
 
     for file in matching {
         match file.is_dir() {
-            true => _ = tokio::fs::remove_dir(&file).await,
+            true => _ = tokio::fs::remove_dir_all(&file).await,
             false => _ = tokio::fs::remove_file(&file).await,
         }
         TEMPS.lock().unwrap().remove(&file);
@@ -92,8 +92,8 @@ pub fn process_dir(
         .unwrap_or_else(|| env::current_dir().context("current working directory"))?;
     temp_dir.push(&*SUBDIR);
 
+    add(&temp_dir, TempKind::Keepable);
     if !temp_dir.exists() {
-        add(&temp_dir, TempKind::Keepable);
         std::fs::create_dir_all(&temp_dir).context("failed to create temp-dir")?;
     }
 
