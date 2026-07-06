@@ -8,7 +8,7 @@ use crate::{
     ffprobe::{self, Ffprobe},
     log::ProgressLogger,
     process::FfmpegOut,
-    temporary::{self, TempKind},
+    temporary::{self, NotKeepableOutput},
 };
 use anyhow::Context;
 use clap::Parser;
@@ -154,7 +154,8 @@ pub async fn run(
     );
 
     let tmp_output = tmp_output_name(&output)?;
-    temporary::add(&tmp_output, TempKind::NotKeepable);
+    let mut temp_output = NotKeepableOutput::new(tmp_output.clone());
+    temp_output.register();
 
     let mut enc = {
         #[cfg(test)]
@@ -196,7 +197,8 @@ pub async fn run(
     }
 
     std::fs::rename(&tmp_output, &output)?;
-    temporary::unadd(&tmp_output);
+    // successful encode, so don't delete it!
+    temp_output.commit();
 
     // print output info
     let output_size = fs::metadata(&output).await?.len();
@@ -418,7 +420,7 @@ mod tests {
         // setup
         let input = temp_input("downmix-copy");
         let output = env::temp_dir().join(format!("ab-av1-encode-out-{}", std::process::id()));
-        let mut args = encode_args(input.clone(), Some(output));
+        let mut args = encode_args(input.clone(), Some(output.clone()));
         args.encode.downmix_to_stereo = true;
         args.encode.audio_codec = Some("copy".into());
         let bar = ProgressBar::new(1);
@@ -430,6 +432,10 @@ mod tests {
 
         // assert
         assert!(err.to_string().contains("--stereo-downmix"));
+        assert!(
+            !temporary::unadd(&output),
+            "validation failure must not register output for cleanup"
+        );
 
         // cleanup
         let _ = fs::remove_file(input);
