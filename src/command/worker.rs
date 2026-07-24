@@ -20,6 +20,7 @@ use std::{
     collections::HashMap,
     fs, io,
     io::Read,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -35,7 +36,7 @@ use tokio_tungstenite::{
     tungstenite::{Error as WsError, Message},
     tungstenite::{client::IntoClientRequest, http::header::ORIGIN, protocol::WebSocketConfig},
 };
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 const PHOENIX_VSN: &str = "2.0.0";
 const SUPPORTED_PROTOCOL_VERSION: u64 = 1;
@@ -47,6 +48,58 @@ const MAX_TRANSFER_FRAME_BYTES: usize = 640 * 1024 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HTTP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 static HEARTBEAT_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BytesPerSecond(Option<NonZeroU64>);
+
+impl BytesPerSecond {
+    #[must_use]
+    fn from_elapsed(received_bytes: u64, elapsed: Duration) -> Self {
+        let elapsed_secs = elapsed.as_secs().max(1);
+        Self(NonZeroU64::new(received_bytes / elapsed_secs))
+    }
+
+    #[must_use]
+    fn get(self) -> u64 {
+        self.0.map_or(0, NonZeroU64::get)
+    }
+
+    #[must_use]
+    fn eta(self, remaining_bytes: u64) -> Option<u64> {
+        self.0
+            .map(|bytes_per_second| remaining_bytes / bytes_per_second.get())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TransferProgressMetrics {
+    received_bytes: u64,
+    expected_bytes: u64,
+    percent: f64,
+    bytes_per_second: BytesPerSecond,
+    eta: Option<u64>,
+}
+
+impl TransferProgressMetrics {
+    #[must_use]
+    fn new(expected_bytes: u64, received_bytes: u64, elapsed: Duration) -> Self {
+        let bytes_per_second = BytesPerSecond::from_elapsed(received_bytes, elapsed);
+        let remaining_bytes = expected_bytes.saturating_sub(received_bytes);
+        let percent = if expected_bytes == 0 {
+            100.0
+        } else {
+            100.0 * received_bytes as f64 / expected_bytes as f64
+        };
+
+        Self {
+            received_bytes,
+            expected_bytes,
+            percent,
+            bytes_per_second,
+            eta: bytes_per_second.eta(remaining_bytes),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -528,31 +581,22 @@ impl PendingJob {
             .as_ref()
             .map(ChunkReceiver::received_bytes)
             .unwrap_or(self.job.assignment.size_bytes);
-        let expected_bytes = Some(self.job.assignment.size_bytes);
-        let elapsed = self.transfer_started_at.elapsed().as_secs().max(1);
-        let bytes_per_second = received_bytes / elapsed;
-        let remaining_bytes = self
-            .job
-            .assignment
-            .size_bytes
-            .saturating_sub(received_bytes);
-        let eta = (bytes_per_second > 0).then_some(remaining_bytes / bytes_per_second);
-        let percent = if self.job.assignment.size_bytes == 0 {
-            100.0
-        } else {
-            100.0 * received_bytes as f64 / self.job.assignment.size_bytes as f64
-        };
+        let progress = TransferProgressMetrics::new(
+            self.job.assignment.size_bytes,
+            received_bytes,
+            self.transfer_started_at.elapsed(),
+        );
 
         TransferProgressPayload {
             job_id: self.job.assignment.job_id.clone(),
             transfer_id: self.job.assignment.job_id.clone(),
             video_id: self.job.assignment.video_id,
             filename: self.job.assignment.source_name.clone(),
-            received_bytes,
-            expected_bytes,
-            percent,
-            bytes_per_second,
-            eta,
+            received_bytes: progress.received_bytes,
+            expected_bytes: Some(progress.expected_bytes),
+            percent: progress.percent,
+            bytes_per_second: progress.bytes_per_second.get(),
+            eta: progress.eta,
             chunk_index,
             total_chunks,
         }
@@ -2479,26 +2523,19 @@ fn http_transfer_progress_payload(
     received_bytes: u64,
     started_at: Instant,
 ) -> TransferProgressPayload {
-    let elapsed = started_at.elapsed().as_secs().max(1);
-    let bytes_per_second = received_bytes / elapsed;
-    let remaining_bytes = expected_size.saturating_sub(received_bytes);
-    let eta = (bytes_per_second > 0).then_some(remaining_bytes / bytes_per_second);
-    let percent = if expected_size == 0 {
-        100.0
-    } else {
-        100.0 * received_bytes as f64 / expected_size as f64
-    };
+    let progress =
+        TransferProgressMetrics::new(expected_size, received_bytes, started_at.elapsed());
 
     TransferProgressPayload {
         job_id: job_id.to_owned(),
         transfer_id: job_id.to_owned(),
         video_id,
         filename: filename.to_owned(),
-        received_bytes,
-        expected_bytes: Some(expected_size),
-        percent,
-        bytes_per_second,
-        eta,
+        received_bytes: progress.received_bytes,
+        expected_bytes: Some(progress.expected_bytes),
+        percent: progress.percent,
+        bytes_per_second: progress.bytes_per_second.get(),
+        eta: progress.eta,
         chunk_index: 0,
         total_chunks: 0,
     }
@@ -2955,6 +2992,7 @@ async fn run_multiplexed_worker(
         if connection_lost {
             connection = None;
             pending.clear();
+            no_work.clear();
         }
 
         if runtime.max_pulls.is_some_and(|max| *completed_pulls >= max) && jobs.is_empty() {
@@ -3191,15 +3229,22 @@ async fn handle_multiplex_frame(
                 if let Some(decoded) =
                     decode_expected_reply::<ServerReply>(&text, reference, "pull_work")?
                 {
-                    reply = Some((reference.clone(), decoded?));
+                    reply = Some((reference.clone(), decoded));
                     break;
                 }
             }
             if let Some((reference, response)) = reply {
-                *completed_pulls += 1;
                 let (job_type, resend_for) = pending
                     .remove(&reference)
                     .expect("pending pull reference still present");
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        warn!(error = %error, "pull_work reply failed; reconnecting worker");
+                        return Ok(false);
+                    }
+                };
+                *completed_pulls += 1;
                 *no_work.entry(job_type).or_insert(false) =
                     matches!(response, ServerReply::NoWork(_));
                 match response {
@@ -4656,6 +4701,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn multiplexed_pull_error_requests_reconnect() -> Result<()> {
+        let coordinator = FakeCoordinator::with_no_work_replies(0).await?;
+        let connected =
+            ConnectedWorker::connect(&coordinator.worker_config(WorkerTestConfig::continuous()))
+                .await?;
+        let mut worker = MultiplexedWorker::from_connected(connected);
+        let mut jobs = HashMap::new();
+        let mut pending = HashMap::from([("3".into(), (JobKind::CrfSearch, None))]);
+        let mut no_work = HashMap::new();
+        let (output, _outputs) = mpsc::unbounded_channel();
+        let mut completed_pulls = 0;
+        let frame = Message::Text(serde_json::to_string(&ServerFrame::reply(
+            3,
+            ReplyBody::error(ErrorReplyPayload::new("unmatched topic")),
+        ))?);
+
+        let connection_is_lost = handle_multiplex_frame(
+            &mut worker,
+            Some(Ok(frame)),
+            &mut jobs,
+            &mut pending,
+            &mut no_work,
+            &output,
+            &mut completed_pulls,
+            None,
+        )
+        .await?;
+
+        assert!(!connection_is_lost);
+        assert_eq!(completed_pulls, 0);
+        coordinator.finish().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_requests_input_resend_when_resumed_job_lacks_local_file() -> Result<()> {
         let job_id = "missing-input-resend";
         let _ = fs::remove_dir_all(worker_job_input_dir(job_id));
@@ -5120,6 +5200,29 @@ mod tests {
         assert_eq!(fs::read(&input_path)?, b"data");
         fs::remove_dir_all(input_dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn transfer_progress_zero_rate_has_no_eta() {
+        let payload = http_transfer_progress_payload(
+            "job-zero-rate",
+            1,
+            "input.mkv",
+            1024,
+            0,
+            Instant::now(),
+        );
+
+        assert_eq!(payload.eta, None);
+    }
+
+    #[test]
+    fn transfer_progress_reports_eta_when_rate_is_nonzero() {
+        let payload =
+            http_transfer_progress_payload("job-rate", 1, "input.mkv", 2048, 1024, Instant::now());
+
+        assert_eq!(payload.bytes_per_second, 1024);
+        assert_eq!(payload.eta, Some(1));
     }
 
     #[test]
