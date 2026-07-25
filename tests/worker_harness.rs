@@ -100,15 +100,10 @@ async fn worker_binary_handles_job_assignment() -> Result<()> {
     });
 
     let output = Command::new(env!("CARGO_BIN_EXE_ab-av1"))
-        .args([
-            "worker",
-            "--connect",
-            &format!("http://{address}"),
-            "--worker-id",
-            "abav1-dev",
-            "--once",
-        ])
+        .args(["worker", "--once"])
+        .env("REENCODARR_WORKER_CONNECT_URL", format!("http://{address}"))
         .env("REENCODARR_WORKER_TOKEN", "test-worker-token")
+        .env("REENCODARR_WORKER_ID", "abav1-dev")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

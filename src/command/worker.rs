@@ -173,7 +173,7 @@ impl WorkerCapacity {
 #[derive(Parser, Debug, Clone)]
 pub struct Args {
     /// Reencodarr base URL, e.g. http://127.0.0.1:4000
-    #[arg(long)]
+    #[arg(long, env = "REENCODARR_WORKER_CONNECT_URL")]
     connect: String,
 
     /// Worker authentication token.
@@ -181,7 +181,7 @@ pub struct Args {
     token: String,
 
     /// Client worker id announced to Reencodarr.
-    #[arg(long)]
+    #[arg(long, env = "REENCODARR_WORKER_ID")]
     worker_id: String,
 
     /// Worker version announced to Reencodarr.
