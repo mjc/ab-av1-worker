@@ -1324,7 +1324,10 @@ fn cleanup_multiplex_worker_input(
         let retain_local_output = job.assignment.job_type == JobKind::Encode
             && job.assignment.output_transfer.is_none()
             && job.assignment.output_shared_path.is_none();
-        if retain_local_output && job.input_dir == worker_job_input_dir(&job.assignment.job_id) {
+        if retain_local_output
+            && job.input_dir == worker_job_input_dir(&job.assignment.job_id)
+            && job.input_path().starts_with(&job.input_dir)
+        {
             fs::remove_file(job.input_path()).with_context(|| {
                 format!(
                     "remove completed worker input {}",
@@ -2295,22 +2298,16 @@ fn build_worker_job(
     assignment: crate::command::worker_protocol::JobAssignedPayload,
     local_path: Option<&Path>,
 ) -> Result<WorkerJob> {
-    if local_path.is_none()
-        && let Some(input_path) = offered_local_input(&assignment)
-    {
-        return Ok(WorkerJob::new(
-            assignment,
-            std::env::current_dir().context("current working directory")?,
-            input_path,
-        ));
-    }
-
     let input_dir = worker_job_input_dir(&assignment.job_id);
     fs::create_dir_all(&input_dir).context("create worker job dir")?;
     let input_path = local_path
         .map(Path::to_path_buf)
         .map(Ok)
-        .unwrap_or_else(|| worker_job_input_path(&input_dir, &assignment))?;
+        .unwrap_or_else(|| {
+            offered_local_input(&assignment)
+                .map(Ok)
+                .unwrap_or_else(|| worker_job_input_path(&input_dir, &assignment))
+        })?;
     Ok(WorkerJob::new(assignment, input_dir, input_path))
 }
 
@@ -5205,7 +5202,9 @@ mod tests {
         let job = build_worker_job(assignment, None)?;
 
         assert_eq!(job.input_path(), local_path.as_path());
-        assert!(!worker_dir.exists());
+        assert_eq!(job.input_dir, worker_dir);
+        assert!(worker_dir.exists());
+        fs::remove_dir_all(&worker_dir)?;
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -5509,6 +5508,51 @@ mod tests {
         assert!(!input_path.exists());
         assert!(output_path.exists());
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn completed_offered_local_encode_cleanup_preserves_source() -> Result<()> {
+        let job_id = format!("cleanup-offered-local-output-{}", std::process::id());
+        let root = worker_job_input_dir(&job_id);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        let source_root =
+            std::env::temp_dir().join(format!("ab-av1-worker-source-{}", std::process::id()));
+        let source_path = source_root.join("movie.mkv");
+        fs::create_dir_all(&source_root)?;
+        fs::write(&source_path, b"input")?;
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::Encode,
+                job_id,
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 5,
+                chunk_size_bytes: 5,
+                target_vmaf: 0.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: vec![
+                    "encode".into(),
+                    "--input".into(),
+                    source_path.display().to_string(),
+                    "--output".into(),
+                    root.join("movie.av1.mkv").display().to_string(),
+                ],
+                crf_search_args: Vec::new(),
+            },
+            root.clone(),
+            source_path.clone(),
+        );
+
+        cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Completed))?;
+
+        assert!(source_path.exists());
+        assert!(!root.exists());
+        fs::remove_dir_all(source_root)?;
         Ok(())
     }
 
