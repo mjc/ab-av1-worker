@@ -1222,6 +1222,12 @@ struct MultiplexJob {
     finished: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PendingEventAck {
+    job_id: String,
+    name: &'static str,
+}
+
 struct MultiplexedWorker {
     next_ref: u64,
     writer: WorkerWriter,
@@ -1245,10 +1251,11 @@ impl MultiplexedWorker {
         }
     }
 
-    async fn send_event(&mut self, event: ClientEvent) -> Result<()> {
+    async fn send_event(&mut self, event: ClientEvent) -> Result<String> {
         let reference = self.next_ref;
         self.next_ref += 1;
-        send_json(&mut self.writer, ClientFrame::new(reference, event)).await
+        send_json(&mut self.writer, ClientFrame::new(reference, event)).await?;
+        Ok(reference.to_string())
     }
 
     async fn send_pull(&mut self, payload: PullWorkPayload) -> Result<String> {
@@ -2916,6 +2923,7 @@ async fn run_multiplexed_worker(
     let (output, mut outputs) = mpsc::unbounded_channel();
     let mut jobs: HashMap<String, MultiplexJob> = HashMap::new();
     let mut pending: HashMap<String, (JobKind, Option<String>)> = HashMap::new();
+    let mut pending_acks: HashMap<String, PendingEventAck> = HashMap::new();
     let mut no_work = HashMap::new();
     let mut reconnect = tokio::time::interval(runtime.reconnect_base_delay);
     reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2944,6 +2952,7 @@ async fn run_multiplexed_worker(
                         item,
                         &mut jobs,
                         &mut pending,
+                        &mut pending_acks,
                     ).await?;
                 }
                 frame = worker.reader.next() => {
@@ -2953,6 +2962,7 @@ async fn run_multiplexed_worker(
                         &mut jobs,
                         &mut pending,
                         &mut no_work,
+                        &mut pending_acks,
                         &output,
                         completed_pulls,
                         config.local_path.as_deref(),
@@ -2974,9 +2984,9 @@ async fn run_multiplexed_worker(
                     match ConnectedWorker::connect(config).await {
                         Ok(candidate) => {
                             let mut candidate = MultiplexedWorker::from_connected(candidate);
-                            if replay_multiplex_jobs(&mut candidate, &jobs).await {
+                            pending_acks.clear();
+                            if replay_multiplex_jobs(&mut candidate, &jobs, &mut pending_acks).await {
                                 connection = Some(candidate);
-                                jobs.retain(|_, job| !job.finished);
                                 reconnect = tokio::time::interval(runtime.reconnect_base_delay);
                                 reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                             }
@@ -2993,6 +3003,7 @@ async fn run_multiplexed_worker(
             connection = None;
             pending.clear();
             no_work.clear();
+            pending_acks.clear();
         }
 
         if runtime.max_pulls.is_some_and(|max| *completed_pulls >= max) && jobs.is_empty() {
@@ -3084,6 +3095,7 @@ async fn handle_multiplex_output(
     item: Option<MultiplexOutput>,
     jobs: &mut HashMap<String, MultiplexJob>,
     pending: &mut HashMap<String, (JobKind, Option<String>)>,
+    pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> Result<bool> {
     let Some(item) = item else {
         bail!("multiplexed worker output channel closed");
@@ -3097,7 +3109,7 @@ async fn handle_multiplex_output(
             if let Some(job) = jobs.get_mut(&job_id) {
                 record_multiplex_event(&mut job.state, &event);
             }
-            Ok(send_multiplex_event(worker, event, &job_id, name).await)
+            Ok(send_multiplex_event(worker, event, &job_id, name, pending_acks).await)
         }
         MultiplexOutput::Done { job_id, result } => {
             let Some(job) = jobs.get_mut(&job_id) else {
@@ -3112,14 +3124,14 @@ async fn handle_multiplex_output(
                     ClientEvent::VideoFailed(failure),
                     &job_id,
                     "video_failed",
+                    pending_acks,
                 )
                 .await
                 {
                     return Ok(false);
                 }
             }
-            jobs.remove(&job_id);
-            pending.retain(|_, (_, resend)| resend.as_deref() != Some(&job_id));
+            remove_finished_job_if_acknowledged(&job_id, jobs, pending, pending_acks);
             Ok(true)
         }
         MultiplexOutput::RequestInputResend { job_id } => {
@@ -3139,6 +3151,7 @@ async fn handle_multiplex_output(
                 }),
                 &job_id,
                 "transfer_failed",
+                pending_acks,
             )
             .await;
             let reference = worker
@@ -3158,13 +3171,30 @@ async fn send_multiplex_event(
     event: ClientEvent,
     job_id: &str,
     name: &'static str,
+    pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> bool {
-    if let Err(error) = worker.send_event(event).await {
-        debug!(job_id = %job_id, event = name, error = %error, "multiplexed worker send failed");
-        false
-    } else {
-        true
+    match worker.send_event(event).await {
+        Ok(reference) => {
+            if event_requires_ack(name) {
+                pending_acks.insert(
+                    reference,
+                    PendingEventAck {
+                        job_id: job_id.to_owned(),
+                        name,
+                    },
+                );
+            }
+            true
+        }
+        Err(error) => {
+            debug!(job_id = %job_id, event = name, error = %error, "multiplexed worker send failed");
+            false
+        }
     }
+}
+
+fn event_requires_ack(name: &str) -> bool {
+    matches!(name, "encode_completed" | "video_failed")
 }
 
 fn record_multiplex_event(state: &mut WorkerJobReportState, event: &ClientEvent) {
@@ -3192,6 +3222,7 @@ async fn handle_multiplex_frame(
     jobs: &mut HashMap<String, MultiplexJob>,
     pending: &mut HashMap<String, (JobKind, Option<String>)>,
     no_work: &mut HashMap<JobKind, bool>,
+    pending_acks: &mut HashMap<String, PendingEventAck>,
     output: &UnboundedSender<MultiplexOutput>,
     completed_pulls: &mut usize,
     local_path: Option<&Path>,
@@ -3224,6 +3255,28 @@ async fn handle_multiplex_frame(
             Ok(true)
         }
         Message::Text(text) => {
+            let mut event_ack = None;
+            for (reference, ack) in pending_acks.iter() {
+                if let Some(decoded) = decode_expected_reply::<Value>(&text, reference, ack.name)? {
+                    event_ack = Some((reference.clone(), ack.clone(), decoded));
+                    break;
+                }
+            }
+            if let Some((reference, ack, decoded)) = event_ack {
+                pending_acks.remove(&reference);
+                if let Err(error) = decoded {
+                    debug!(
+                        job_id = %ack.job_id,
+                        event = ack.name,
+                        error = %error,
+                        "multiplexed worker event was rejected"
+                    );
+                    return Ok(false);
+                }
+                acknowledge_multiplex_event(&ack, jobs, pending);
+                return Ok(true);
+            }
+
             let mut reply = None;
             for reference in pending.keys() {
                 if let Some(decoded) =
@@ -3344,9 +3397,46 @@ async fn handle_multiplex_frame(
     }
 }
 
+fn acknowledge_multiplex_event(
+    ack: &PendingEventAck,
+    jobs: &mut HashMap<String, MultiplexJob>,
+    pending: &mut HashMap<String, (JobKind, Option<String>)>,
+) {
+    if !event_requires_ack(ack.name) {
+        return;
+    }
+
+    if jobs.get(&ack.job_id).is_some_and(|job| job.finished) {
+        jobs.remove(&ack.job_id);
+        pending.retain(|_, (_, resend)| resend.as_deref() != Some(&ack.job_id));
+    }
+}
+
+fn remove_finished_job_if_acknowledged(
+    job_id: &str,
+    jobs: &mut HashMap<String, MultiplexJob>,
+    pending: &mut HashMap<String, (JobKind, Option<String>)>,
+    pending_acks: &HashMap<String, PendingEventAck>,
+) {
+    let Some(job) = jobs.get(job_id) else {
+        return;
+    };
+    if !job.finished {
+        return;
+    }
+    if job.state.encode_completed.is_some() || job.state.failure.is_some() {
+        if pending_acks.values().any(|ack| ack.job_id == job_id) {
+            return;
+        }
+    }
+    jobs.remove(job_id);
+    pending.retain(|_, (_, resend)| resend.as_deref() != Some(job_id));
+}
+
 async fn replay_multiplex_jobs(
     worker: &mut MultiplexedWorker,
     jobs: &HashMap<String, MultiplexJob>,
+    pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> bool {
     for (job_id, job) in jobs {
         if !send_multiplex_event(
@@ -3358,6 +3448,7 @@ async fn replay_multiplex_jobs(
             }),
             job_id,
             "control_state",
+            pending_acks,
         )
         .await
         {
@@ -3369,12 +3460,13 @@ async fn replay_multiplex_jobs(
                 ClientEvent::EncodeProgress(progress),
                 job_id,
                 "encode_progress",
+                pending_acks,
             )
             .await
         {
             return false;
         }
-        if !replay_multiplex_state(worker, &job.state, job_id).await {
+        if !replay_multiplex_state(worker, &job.state, job_id, pending_acks).await {
             return false;
         }
     }
@@ -3407,6 +3499,7 @@ async fn replay_multiplex_state(
     worker: &mut MultiplexedWorker,
     state: &WorkerJobReportState,
     job_id: &str,
+    pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> bool {
     if let Some(payload) = &state.heartbeat
         && !send_multiplex_event(
@@ -3414,6 +3507,7 @@ async fn replay_multiplex_state(
             ClientEvent::Heartbeat(payload.clone()),
             job_id,
             "heartbeat",
+            pending_acks,
         )
         .await
     {
@@ -3425,6 +3519,7 @@ async fn replay_multiplex_state(
             ClientEvent::TransferProgress(payload.clone()),
             job_id,
             "transfer_progress",
+            pending_acks,
         )
         .await
     {
@@ -3436,6 +3531,7 @@ async fn replay_multiplex_state(
             ClientEvent::CrfSearchProgress(payload.clone()),
             job_id,
             "crf_progress",
+            pending_acks,
         )
         .await
     {
@@ -3447,6 +3543,7 @@ async fn replay_multiplex_state(
             ClientEvent::CrfSearchResult(payload.clone()),
             job_id,
             "crf_result",
+            pending_acks,
         )
         .await
         {
@@ -3459,6 +3556,7 @@ async fn replay_multiplex_state(
             ClientEvent::CrfSearchCompleted(payload.clone()),
             job_id,
             "crf_search_completed",
+            pending_acks,
         )
         .await
     {
@@ -3470,6 +3568,7 @@ async fn replay_multiplex_state(
             ClientEvent::EncodeProgress(payload.clone()),
             job_id,
             "encode_progress",
+            pending_acks,
         )
         .await
     {
@@ -3481,6 +3580,7 @@ async fn replay_multiplex_state(
             ClientEvent::EncodeCompleted(payload.clone()),
             job_id,
             "encode_completed",
+            pending_acks,
         )
         .await
     {
@@ -3492,6 +3592,7 @@ async fn replay_multiplex_state(
             ClientEvent::VideoFailed(payload.clone()),
             job_id,
             "video_failed",
+            pending_acks,
         )
         .await
     {
@@ -4112,6 +4213,63 @@ mod tests {
     }
 
     #[test]
+    fn finished_encode_waits_for_completion_ack_before_job_removal() {
+        let (command, _commands) = mpsc::unbounded_channel();
+        let mut jobs = HashMap::from([(
+            "encode-123".into(),
+            MultiplexJob {
+                job: WorkerJob::new(
+                    JobAssignedPayload {
+                        status: WorkStatus::JobAssigned,
+                        job_type: JobKind::Encode,
+                        job_id: "encode-123".into(),
+                        video_id: 123,
+                        source_name: "movie.mkv".into(),
+                        size_bytes: 1_000,
+                        chunk_size_bytes: 256,
+                        target_vmaf: 95.0,
+                        transfer: None,
+                        output_transfer: None,
+                        output_shared_path: Some("/tmp/movie.av1.mkv".into()),
+                        encode_args: vec!["encode".into(), "--input".into(), "movie.mkv".into()],
+                        crf_search_args: Vec::new(),
+                    },
+                    PathBuf::from("/tmp"),
+                    PathBuf::from("/tmp/movie.mkv"),
+                ),
+                command,
+                state: WorkerJobReportState {
+                    encode_completed: Some(EncodeCompletedPayload {
+                        job_id: "encode-123".into(),
+                        video_id: 123,
+                        source_name: "movie.mkv".into(),
+                        output_path: "/tmp/movie.av1.mkv".into(),
+                        output_bytes: 500,
+                        output_percent: 50.0,
+                    }),
+                    ..WorkerJobReportState::default()
+                },
+                finished: true,
+            },
+        )]);
+        let mut pending = HashMap::new();
+        let mut pending_acks = HashMap::from([(
+            "7".into(),
+            PendingEventAck {
+                job_id: "encode-123".into(),
+                name: "encode_completed",
+            },
+        )]);
+
+        remove_finished_job_if_acknowledged("encode-123", &mut jobs, &mut pending, &pending_acks);
+        assert!(jobs.contains_key("encode-123"));
+
+        let ack = pending_acks.remove("7").expect("pending ack");
+        acknowledge_multiplex_event(&ack, &mut jobs, &mut pending);
+        assert!(!jobs.contains_key("encode-123"));
+    }
+
+    #[test]
     fn reconnect_progress_identifies_active_encode_without_prior_progress() {
         let job = WorkerJob::new(
             JobAssignedPayload {
@@ -4469,6 +4627,17 @@ mod tests {
                 let frame: Value = serde_json::from_str(&text).expect("worker event json");
                 if frame[3] == "encode_completed" {
                     assert_eq!(frame[4]["output_path"], expected_output);
+                    let request_ref = frame[1].as_str().expect("encode_completed ref");
+                    writer
+                        .send(Message::Text(
+                            json!(["1", request_ref, CRF_SEARCH_TOPIC, "phx_reply", {
+                                "status": "ok",
+                                "response": {}
+                            }])
+                            .to_string(),
+                        ))
+                        .await
+                        .expect("send encode_completed ack");
                     break;
                 }
             }
@@ -4710,6 +4879,7 @@ mod tests {
         let mut jobs = HashMap::new();
         let mut pending = HashMap::from([("3".into(), (JobKind::CrfSearch, None))]);
         let mut no_work = HashMap::new();
+        let mut pending_acks = HashMap::new();
         let (output, _outputs) = mpsc::unbounded_channel();
         let mut completed_pulls = 0;
         let frame = Message::Text(serde_json::to_string(&ServerFrame::reply(
@@ -4723,6 +4893,7 @@ mod tests {
             &mut jobs,
             &mut pending,
             &mut no_work,
+            &mut pending_acks,
             &output,
             &mut completed_pulls,
             None,
