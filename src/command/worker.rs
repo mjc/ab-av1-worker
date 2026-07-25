@@ -36,7 +36,7 @@ use tokio_tungstenite::{
     tungstenite::{Error as WsError, Message},
     tungstenite::{client::IntoClientRequest, http::header::ORIGIN, protocol::WebSocketConfig},
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 const PHOENIX_VSN: &str = "2.0.0";
 const SUPPORTED_PROTOCOL_VERSION: u64 = 1;
@@ -2915,8 +2915,15 @@ async fn run_multiplexed_worker(
     completed_pulls: &mut usize,
 ) -> Result<()> {
     let connected = ConnectedWorker::connect(config).await?;
-    let mut connection = Some(MultiplexedWorker::from_connected(connected));
     let capacity = WorkerCapacity::detect(config.worker_mode, config.max_active_jobs);
+    info!(
+        worker_id = %connected.assigned_worker_id,
+        protocol_version = connected.negotiated_protocol_version,
+        mode = %config.worker_mode.as_str(),
+        max_active_jobs = capacity.max_active_jobs(),
+        "worker connected"
+    );
+    let mut connection = Some(MultiplexedWorker::from_connected(connected));
     let (output, mut outputs) = mpsc::unbounded_channel();
     let mut jobs: HashMap<String, MultiplexJob> = HashMap::new();
     let mut pending: HashMap<String, (JobKind, Option<String>)> = HashMap::new();
@@ -2980,9 +2987,15 @@ async fn run_multiplexed_worker(
                 _ = reconnect.tick() => {
                     match ConnectedWorker::connect(config).await {
                         Ok(candidate) => {
+                            let worker_id = candidate.assigned_worker_id.clone();
                             let mut candidate = MultiplexedWorker::from_connected(candidate);
                             pending_acks.clear();
                             if replay_multiplex_jobs(&mut candidate, &jobs, &mut pending_acks).await {
+                                info!(
+                                    %worker_id,
+                                    active_jobs = jobs.len(),
+                                    "worker reconnected"
+                                );
                                 connection = Some(candidate);
                                 reconnect = tokio::time::interval(runtime.reconnect_base_delay);
                                 reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3113,6 +3126,10 @@ async fn handle_multiplex_output(
                 return Ok(true);
             };
             job.finished = true;
+            match &result {
+                Ok(outcome) => info!(%job_id, ?outcome, "worker job finished"),
+                Err(error) => warn!(%job_id, %error, "worker job failed"),
+            }
             if let Err(error) = result {
                 let failure = job.job.failure_payload(&anyhow!(error));
                 job.state.failure = Some(failure.clone());
@@ -3323,6 +3340,13 @@ async fn handle_multiplex_frame(
                         } else {
                             let job = build_worker_job(assignment, local_path)?;
                             let job_id = job.assignment.job_id.clone();
+                            info!(
+                                %job_id,
+                                video_id = job.assignment.video_id,
+                                job_type = ?job.assignment.job_type,
+                                source_name = %job.assignment.source_name,
+                                "worker job assigned"
+                            );
                             let (command, commands) = mpsc::unbounded_channel();
                             let _ = multiplex_event(
                                 output,
