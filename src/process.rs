@@ -1,7 +1,9 @@
 pub mod managed;
 
 use crate::process::managed::{ManagedEvent, ManagedProcess};
-use anyhow::{anyhow, ensure};
+use anyhow::anyhow;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::{
     borrow::Cow,
     ffi::OsStr,
@@ -15,30 +17,41 @@ use std::{
 };
 use tokio_stream::{Stream, StreamExt};
 
-pub fn ensure_success(name: &'static str, out: &Output) -> anyhow::Result<()> {
-    ensure!(
-        out.status.success(),
-        "{name} exit code {}\n---stderr---\n{}\n------------",
-        out.status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "None".into()),
-        String::from_utf8_lossy(&out.stderr).trim(),
-    );
-    Ok(())
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct ProcessExitError {
+    code: Option<i32>,
+    message: String,
 }
 
-/// Convert exit code result into simple result.
-pub fn exit_ok(name: &'static str, done: io::Result<ExitStatus>) -> anyhow::Result<()> {
-    let code = done?;
-    ensure!(
-        code.success(),
-        "{name} exit code {}",
-        code.code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "None".into())
-    );
-    Ok(())
+impl ProcessExitError {
+    #[must_use]
+    pub fn new(code: Option<i32>, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn code(&self) -> Option<i32> {
+        self.code
+    }
+}
+
+pub fn ensure_success(name: &'static str, out: &Output) -> anyhow::Result<()> {
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(ProcessExitError::new(
+        exit_status_code(out.status),
+        format!(
+            "{name} exit code {}\n---stderr---\n{}\n------------",
+            display_exit_status(out.status),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ),
+    )
+    .into())
 }
 
 /// Convert exit code result into simple result adding stderr to error messages.
@@ -48,7 +61,37 @@ pub fn exit_ok_stderr(
     cmd_str: &str,
     stderr: &Chunks,
 ) -> anyhow::Result<()> {
-    exit_ok(name, done).map_err(|e| cmd_err(e, cmd_str, stderr))
+    let status = done?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(ProcessExitError::new(
+        exit_status_code(status),
+        format!(
+            "{name} exit code {}\n----cmd-----\n{cmd_str}\n---stderr---\n{}\n------------",
+            display_exit_status(status),
+            String::from_utf8_lossy(&stderr.out).trim()
+        ),
+    )
+    .into())
+}
+
+fn display_exit_status(status: ExitStatus) -> String {
+    exit_status_code(status).map_or_else(|| "None".into(), |code| code.to_string())
+}
+
+fn exit_status_code(status: ExitStatus) -> Option<i32> {
+    status.code().or_else(|| signal_exit_code(status))
+}
+
+#[cfg(unix)]
+fn signal_exit_code(status: ExitStatus) -> Option<i32> {
+    status.signal().map(|signal| 128 + signal)
+}
+
+#[cfg(not(unix))]
+fn signal_exit_code(_status: ExitStatus) -> Option<i32> {
+    None
 }
 
 pub fn cmd_err(err: impl Display, cmd_str: &str, stderr: &Chunks) -> anyhow::Error {
@@ -650,12 +693,17 @@ mod stream_tests {
             .next()
             .await
             .expect("failure item")
-            .expect_err("non-zero exit should surface as stream error")
-            .to_string();
+            .expect_err("non-zero exit should surface as stream error");
 
-        assert!(err.contains("failure fixture exit code 7"));
-        assert!(err.contains("----cmd-----\nfailure fixture"));
-        assert!(err.contains("---stderr---\nbadness"));
+        assert_eq!(
+            err.downcast_ref::<ProcessExitError>()
+                .and_then(ProcessExitError::code),
+            Some(7)
+        );
+        let message = err.to_string();
+        assert!(message.contains("failure fixture exit code 7"));
+        assert!(message.contains("----cmd-----\nfailure fixture"));
+        assert!(message.contains("---stderr---\nbadness"));
     }
 
     #[tokio::test]

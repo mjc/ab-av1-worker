@@ -1118,10 +1118,10 @@ mod tests {
         let pid = process.id().expect("fixture process id");
 
         pause_active_processes()?;
-        assert_eq!(linux_process_state(pid)?, 'T');
+        wait_for_linux_process_state(pid, 'T').await?;
 
         resume_active_processes()?;
-        assert_ne!(linux_process_state(pid)?, 'T');
+        wait_for_linux_process_not_state(pid, 'T').await?;
 
         process.terminate_after(Duration::ZERO).await?;
         Ok(())

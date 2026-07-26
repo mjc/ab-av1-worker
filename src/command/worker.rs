@@ -9,7 +9,7 @@ use crate::command::worker_protocol::{
 use crate::command::worker_transfer::{Chunk, ChunkReceiver};
 use crate::command::{crf_search, encode, sample_encode};
 use crate::ffprobe::Ffprobe;
-use crate::process::managed::ProcessScope;
+use crate::process::{ProcessExitError, managed::ProcessScope};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -468,7 +468,11 @@ impl WorkerJob {
     }
 
     fn failure_payload(&self, error: &anyhow::Error) -> FailureReportPayload {
-        let exit_code = crate::FAILURE_EXIT_CODE;
+        let exit_code = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ProcessExitError>())
+            .and_then(ProcessExitError::code)
+            .unwrap_or(crate::FAILURE_EXIT_CODE);
 
         FailureReportPayload {
             job_id: self.assignment.job_id.clone(),
@@ -4376,12 +4380,15 @@ mod tests {
             PathBuf::from("/tmp/crf-search-123/movie.mkv"),
         );
 
-        let payload = job.failure_payload(&anyhow!("ab-av1 failed"));
+        let payload = job.failure_payload(&anyhow!(ProcessExitError::new(
+            Some(254),
+            "ffmpeg exited unsuccessfully",
+        )));
 
         assert_eq!(payload.stage, "crf_search");
         assert_eq!(payload.category, "process_failure");
-        assert_eq!(payload.code, "EXIT_1");
-        assert_eq!(payload.context["exit_code"], json!(1));
+        assert_eq!(payload.code, "EXIT_254");
+        assert_eq!(payload.context["exit_code"], json!(254));
     }
 
     #[test]
