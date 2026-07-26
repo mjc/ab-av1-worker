@@ -47,6 +47,7 @@ const TRANSFER_CHUNK_HEADER_LEN: usize = 52;
 const MAX_TRANSFER_FRAME_BYTES: usize = 640 * 1024 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HTTP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
+const HTTP_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 static HEARTBEAT_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
 #[derive(Debug)]
@@ -75,7 +76,7 @@ impl TransferGate {
         }
         if *state == ControlState::Stopped {
             return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
+                io::ErrorKind::ConnectionAborted,
                 "worker transfer stopped",
             ));
         }
@@ -86,6 +87,13 @@ impl TransferGate {
 struct ControlledReader<R> {
     inner: R,
     gate: Arc<TransferGate>,
+}
+
+fn worker_http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_read(HTTP_TRANSFER_IDLE_TIMEOUT)
+        .timeout_write(HTTP_TRANSFER_IDLE_TIMEOUT)
+        .build()
 }
 
 impl<R: Read> Read for ControlledReader<R> {
@@ -1573,7 +1581,8 @@ async fn download_multiplex_input(
     let copy_gate = Arc::clone(&gate);
     let copy_job_id = job_id.clone();
     let copy = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let response = ureq::get(&transfer.url)
+        let response = worker_http_agent()
+            .get(&transfer.url)
             .set(&transfer.auth.header, &transfer.auth.value)
             .call()
             .map_err(|error| {
@@ -2002,7 +2011,8 @@ async fn upload_multiplex_output(
             inner: file,
             gate: copy_gate,
         };
-        ureq::put(&transfer.url)
+        worker_http_agent()
+            .put(&transfer.url)
             .set(&transfer.auth.header, &transfer.auth.value)
             .set("Content-Length", &output_bytes.to_string())
             .send(reader)
@@ -2659,7 +2669,8 @@ async fn download_worker_input(worker: &mut ConnectedWorker, job: &WorkerJob) ->
     let copy_received = Arc::clone(&received);
 
     let mut copy = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let response = ureq::get(&transfer.url)
+        let response = worker_http_agent()
+            .get(&transfer.url)
             .set(&transfer.auth.header, &transfer.auth.value)
             .call()
             .map_err(|error| anyhow!("HTTP input download failed for job {job_id}: {error}"))?;
@@ -4881,6 +4892,173 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn stop_during_http_input_does_not_fall_through_to_execution() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request)?;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")?;
+            std::thread::sleep(Duration::from_millis(25));
+            let _ = stream.write_all(b"data");
+            Ok(())
+        });
+        let job_id = format!("stop-http-input-{}", std::process::id());
+        let input_dir = worker_job_input_dir(&job_id);
+        let _ = fs::remove_dir_all(&input_dir);
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::CrfSearch,
+                job_id: job_id.clone(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: Some(TransferSpec {
+                    url: format!("http://{address}"),
+                    auth: TransferAuth {
+                        scheme: "Bearer".into(),
+                        header: "Authorization".into(),
+                        value: "token".into(),
+                    },
+                }),
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: Vec::new(),
+            },
+            input_dir.clone(),
+            input_dir.join("movie.mkv"),
+        );
+        let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Stop,
+            video_id: Some(123),
+            job_id: Some(job_id),
+            command_id: Some("stop-http-input".into()),
+        }))?;
+
+        assert_eq!(
+            download_multiplex_input(&job, &mut command_receiver, &output).await?,
+            Some(WorkerJobOutcome::Stopped)
+        );
+        assert!(matches!(
+            outputs.recv().await,
+            Some(MultiplexOutput::Event {
+                event: ClientEvent::ControlState(ControlStatePayload {
+                    state: ControlState::Stopped,
+                    ..
+                }),
+                ..
+            })
+        ));
+        assert!(!job.input_path().exists());
+        server.join().expect("HTTP input server")?;
+        let _ = fs::remove_dir_all(input_dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_during_http_output_does_not_report_completion() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    return Ok(());
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .context("missing HTTP request header terminator")?
+                + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .context("missing output content length")?
+                .parse::<usize>()?;
+            std::thread::sleep(Duration::from_millis(25));
+            while request.len() < header_end + content_length {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&buffer[..read]),
+                }
+            }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            Ok(())
+        });
+        let job = probe_phase_job("stop-http-output");
+        let output_path = std::env::temp_dir().join(format!(
+            "ab-av1-stop-http-output-{}.mkv",
+            std::process::id()
+        ));
+        let output_file = fs::File::create(&output_path)?;
+        output_file.set_len(4 * 1024 * 1024)?;
+        let transfer = TransferSpec {
+            url: format!("http://{address}"),
+            auth: TransferAuth {
+                scheme: "Bearer".into(),
+                header: "Authorization".into(),
+                value: "token".into(),
+            },
+        };
+        let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Stop,
+            video_id: Some(123),
+            job_id: Some("stop-http-output".into()),
+            command_id: Some("stop-http-output".into()),
+        }))?;
+
+        assert_eq!(
+            upload_multiplex_output(
+                &job,
+                &output_path,
+                &transfer,
+                4 * 1024 * 1024,
+                &mut command_receiver,
+                &output,
+            )
+            .await?,
+            Some(WorkerJobOutcome::Stopped)
+        );
+        assert!(matches!(
+            outputs.recv().await,
+            Some(MultiplexOutput::Event {
+                event: ClientEvent::ControlState(ControlStatePayload {
+                    state: ControlState::Stopped,
+                    ..
+                }),
+                ..
+            })
+        ));
+        while let Ok(event) = outputs.try_recv() {
+            assert!(!matches!(
+                event,
+                MultiplexOutput::Event {
+                    event: ClientEvent::EncodeCompleted(_),
+                    ..
+                }
+            ));
+        }
+        server.join().expect("HTTP output server")?;
+        fs::remove_file(output_path)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn multiplex_encode_sends_heartbeat_without_ffmpeg_progress() -> Result<()> {
         let input_dir =
             std::env::temp_dir().join(format!("ab-av1-multiplex-heartbeat-{}", std::process::id()));
@@ -5892,7 +6070,7 @@ mod tests {
         };
         assert_eq!(
             stopped.read(&mut [0; 4]).expect_err("stopped read").kind(),
-            io::ErrorKind::Interrupted
+            io::ErrorKind::ConnectionAborted
         );
         Ok(())
     }
