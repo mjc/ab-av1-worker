@@ -1138,6 +1138,7 @@ struct WorkerRuntime {
     idle_delay: Duration,
     reconnect_base_delay: Duration,
     reconnect_max_delay: Duration,
+    offline_job_timeout: Duration,
     max_pulls: Option<usize>,
 }
 
@@ -1147,6 +1148,7 @@ impl Default for WorkerRuntime {
             idle_delay: Duration::from_secs(5),
             reconnect_base_delay: Duration::from_secs(1),
             reconnect_max_delay: Duration::from_secs(30),
+            offline_job_timeout: Duration::from_secs(90),
             max_pulls: None,
         }
     }
@@ -2458,7 +2460,7 @@ async fn run_worker_encode(
 }
 
 fn remove_worker_input(job: &WorkerJob) -> Result<()> {
-    if job.input_dir != worker_job_input_dir(&job.assignment.job_id) {
+    if job.input_dir != worker_job_input_dir(&job.assignment.job_id) || !job.input_dir.exists() {
         return Ok(());
     }
 
@@ -3134,6 +3136,7 @@ async fn run_multiplexed_worker(
     let mut no_work = HashMap::new();
     let mut reconnect = tokio::time::interval(runtime.reconnect_base_delay);
     reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut offline_deadline = None;
 
     loop {
         if let Some(worker) = connection.as_mut() {
@@ -3200,6 +3203,7 @@ async fn run_multiplexed_worker(
                                     "worker reconnected"
                                 );
                                 connection = Some(candidate);
+                                offline_deadline = None;
                                 reconnect = tokio::time::interval(runtime.reconnect_base_delay);
                                 reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                             }
@@ -3209,11 +3213,18 @@ async fn run_multiplexed_worker(
                         }
                     }
                 }
+                _ = wait_for_offline_deadline(offline_deadline) => {
+                    expire_offline_jobs(&mut jobs, &mut pending, &mut outputs).await?;
+                    bail!("coordinator unavailable until worker job lease expired");
+                }
             }
         }
 
         if connection_lost {
             connection = None;
+            if !jobs.is_empty() {
+                offline_deadline = Some(Instant::now() + runtime.offline_job_timeout);
+            }
             pending.clear();
             no_work.clear();
             pending_acks.clear();
@@ -3223,6 +3234,47 @@ async fn run_multiplexed_worker(
             return Ok(());
         }
     }
+}
+
+async fn wait_for_offline_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn expire_offline_jobs(
+    jobs: &mut HashMap<String, MultiplexJob>,
+    pending: &mut HashMap<String, (JobKind, Option<String>)>,
+    outputs: &mut UnboundedReceiver<MultiplexOutput>,
+) -> Result<()> {
+    for (job_id, job) in &*jobs {
+        if !job.finished {
+            job.command
+                .send(JobCommand::Cancel(CancelPayload {
+                    job_id: job_id.clone(),
+                    reason: "worker job lease expired while coordinator was unavailable".into(),
+                }))
+                .map_err(|_| anyhow!("worker job {job_id} command channel closed"))?;
+        }
+    }
+
+    while jobs.values().any(|job| !job.finished) {
+        let item = outputs
+            .recv()
+            .await
+            .context("worker output channel closed while expiring offline jobs")?;
+        handle_multiplex_output_offline(item, jobs, pending)?;
+    }
+
+    for job in jobs.values() {
+        remove_worker_input(&job.job)?;
+    }
+    jobs.clear();
+    pending.clear();
+    Ok(())
 }
 
 fn handle_multiplex_output_offline(
@@ -4950,6 +5002,7 @@ mod tests {
                     idle_delay: Duration::from_millis(10),
                     reconnect_base_delay: Duration::from_millis(10),
                     reconnect_max_delay: Duration::from_millis(10),
+                    offline_job_timeout: Duration::from_secs(1),
                     max_pulls: Some(1),
                 },
             ))
@@ -5025,6 +5078,7 @@ mod tests {
                 idle_delay: Duration::from_millis(1),
                 reconnect_base_delay: Duration::from_millis(1),
                 reconnect_max_delay: Duration::from_millis(1),
+                offline_job_timeout: Duration::from_secs(1),
                 max_pulls: Some(2),
             },
         )
@@ -5072,6 +5126,7 @@ mod tests {
                 idle_delay: Duration::from_secs(30),
                 reconnect_base_delay: Duration::from_millis(1),
                 reconnect_max_delay: Duration::from_millis(1),
+                offline_job_timeout: Duration::from_secs(1),
                 max_pulls: Some(1),
             },
         )
@@ -5118,6 +5173,7 @@ mod tests {
                 idle_delay: Duration::from_secs(30),
                 reconnect_base_delay: Duration::from_millis(1),
                 reconnect_max_delay: Duration::from_millis(1),
+                offline_job_timeout: Duration::from_secs(1),
                 max_pulls: Some(1),
             },
         )
@@ -5138,6 +5194,7 @@ mod tests {
                     idle_delay: Duration::from_millis(1),
                     reconnect_base_delay: Duration::from_millis(1),
                     reconnect_max_delay: Duration::from_millis(2),
+                    offline_job_timeout: Duration::from_secs(1),
                     max_pulls: Some(2),
                 },
             )
@@ -5238,6 +5295,7 @@ mod tests {
                 idle_delay: Duration::from_millis(50),
                 reconnect_base_delay: Duration::from_millis(1),
                 reconnect_max_delay: Duration::from_millis(1),
+                offline_job_timeout: Duration::from_secs(1),
                 max_pulls: None,
             },
             &mut completed_pulls,
@@ -5795,6 +5853,61 @@ mod tests {
         cleanup_multiplex_worker_input(&job, &Err(anyhow!("encode failed")))?;
         assert!(!root.exists());
         Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_offline_lease_cancels_jobs_and_removes_owned_files() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let job_id = format!("offline-expired-{}", std::process::id());
+                let root = worker_job_input_dir(&job_id);
+                let _ = fs::remove_dir_all(&root);
+                fs::create_dir_all(&root)?;
+                let input_path = root.join("movie.mkv");
+                let job = WorkerJob::new(
+                    JobAssignedPayload {
+                        status: WorkStatus::JobAssigned,
+                        job_type: JobKind::CrfSearch,
+                        job_id: job_id.clone(),
+                        video_id: 123,
+                        source_name: "movie.mkv".into(),
+                        size_bytes: 4,
+                        chunk_size_bytes: 4,
+                        target_vmaf: 95.0,
+                        transfer: None,
+                        output_transfer: None,
+                        output_shared_path: None,
+                        encode_args: Vec::new(),
+                        crf_search_args: vec![
+                            "crf-search".into(),
+                            "--input".into(),
+                            "movie.mkv".into(),
+                        ],
+                    },
+                    root.clone(),
+                    input_path,
+                );
+                let (output, mut outputs) = mpsc::unbounded_channel();
+                let (command, commands) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(run_multiplex_job(job.clone(), commands, output));
+                let mut jobs = HashMap::from([(
+                    job_id,
+                    MultiplexJob {
+                        job,
+                        command,
+                        state: WorkerJobReportState::default(),
+                        finished: false,
+                    },
+                )]);
+                let mut pending = HashMap::new();
+
+                expire_offline_jobs(&mut jobs, &mut pending, &mut outputs).await?;
+
+                assert!(jobs.is_empty());
+                assert!(!root.exists());
+                Ok(())
+            })
+            .await
     }
 
     #[test]
