@@ -450,6 +450,8 @@ impl WorkerJob {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct WorkerJobReportState {
     #[serde(skip_serializing_if = "Option::is_none")]
+    control_state: Option<ControlStatePayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     heartbeat: Option<HeartbeatPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transfer_progress: Option<TransferProgressPayload>,
@@ -3225,10 +3227,10 @@ fn record_multiplex_event(state: &mut WorkerJobReportState, event: &ClientEvent)
         ClientEvent::EncodeProgress(payload) => state.encode_progress = Some(payload.clone()),
         ClientEvent::EncodeCompleted(payload) => state.encode_completed = Some(payload.clone()),
         ClientEvent::VideoFailed(payload) => state.failure = Some(payload.clone()),
+        ClientEvent::ControlState(payload) => state.control_state = Some(payload.clone()),
         ClientEvent::Join
         | ClientEvent::Announce(_)
         | ClientEvent::PullWork(_)
-        | ClientEvent::ControlState(_)
         | ClientEvent::TransferFailure(_) => {}
     }
 }
@@ -3464,13 +3466,19 @@ async fn replay_multiplex_jobs(
     pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> bool {
     for (job_id, job) in jobs {
+        let control_state =
+            job.state
+                .control_state
+                .clone()
+                .unwrap_or_else(|| ControlStatePayload {
+                    state: ControlState::Running,
+                    active_video_id: Some(job.job.assignment.video_id),
+                    job_id: Some(job_id.clone()),
+                });
+
         if !send_multiplex_event(
             worker,
-            ClientEvent::ControlState(ControlStatePayload {
-                state: ControlState::Running,
-                active_video_id: Some(job.job.assignment.video_id),
-                job_id: Some(job_id.clone()),
-            }),
+            ClientEvent::ControlState(control_state),
             job_id,
             "control_state",
             pending_acks,
@@ -4325,6 +4333,20 @@ mod tests {
                 ..
             }) if job_id == "encode-123"
         ));
+    }
+
+    #[test]
+    fn multiplex_reconnect_retains_job_control_state() {
+        let mut state = WorkerJobReportState::default();
+        let paused = ControlStatePayload {
+            state: ControlState::Paused,
+            active_video_id: Some(123),
+            job_id: Some("crf-123".into()),
+        };
+
+        record_multiplex_event(&mut state, &ClientEvent::ControlState(paused.clone()));
+
+        assert_eq!(state.control_state, Some(paused));
     }
 
     #[test]
