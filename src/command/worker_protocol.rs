@@ -452,6 +452,8 @@ pub(crate) struct ControlPayload {
     pub(crate) video_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) command_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,6 +463,8 @@ pub(crate) struct ControlStatePayload {
     pub(crate) active_video_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) command_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -650,7 +654,8 @@ mod tests {
             ClientEvent::ControlState(ControlStatePayload {
                 state: ControlState::Paused,
                 active_video_id: Some(123),
-                job_id: None,
+                job_id: Some("job-123".into()),
+                command_id: Some("command-456".into()),
             }),
         );
 
@@ -661,7 +666,12 @@ mod tests {
                 "5",
                 "workers:crf_search",
                 "control_state",
-                {"state": "paused", "active_video_id": 123}
+                {
+                    "state": "paused",
+                    "active_video_id": 123,
+                    "job_id": "job-123",
+                    "command_id": "command-456"
+                }
             ])
         );
     }
@@ -1192,7 +1202,9 @@ mod tests {
             "control",
             {
                 "action": "pause",
-                "video_id": 123
+                "video_id": 123,
+                "job_id": "job-123",
+                "command_id": "command-456"
             }
         ]))
         .expect("parse worker control push");
@@ -1204,7 +1216,8 @@ mod tests {
                 ControlPayload {
                     action: ControlAction::Pause,
                     video_id: Some(123),
-                    job_id: None,
+                    job_id: Some("job-123".into()),
+                    command_id: Some("command-456".into()),
                 },
             )
         );

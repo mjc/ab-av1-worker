@@ -445,6 +445,19 @@ impl WorkerJob {
             stderr_excerpt: Some(format!("{error:#}")),
         }
     }
+
+    fn control_state_payload(
+        &self,
+        control: &ControlPayload,
+        state: ControlState,
+    ) -> ControlStatePayload {
+        ControlStatePayload {
+            state,
+            active_video_id: Some(self.assignment.video_id),
+            job_id: Some(self.assignment.job_id.clone()),
+            command_id: control.command_id.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1536,11 +1549,9 @@ async fn run_multiplex_crf(
                             let _ = multiplex_event(
                                 output,
                                 &job.assignment.job_id,
-                                ClientEvent::ControlState(ControlStatePayload {
-                                    state: ControlState::Paused,
-                                    active_video_id: Some(job.assignment.video_id),
-                                    job_id: Some(job.assignment.job_id.clone()),
-                                }),
+                                ClientEvent::ControlState(
+                                    job.control_state_payload(&control, ControlState::Paused),
+                                ),
                                 "control_state",
                             );
                         }
@@ -1550,11 +1561,9 @@ async fn run_multiplex_crf(
                             let _ = multiplex_event(
                                 output,
                                 &job.assignment.job_id,
-                                ClientEvent::ControlState(ControlStatePayload {
-                                    state: ControlState::Running,
-                                    active_video_id: Some(job.assignment.video_id),
-                                    job_id: Some(job.assignment.job_id.clone()),
-                                }),
+                                ClientEvent::ControlState(
+                                    job.control_state_payload(&control, ControlState::Running),
+                                ),
                                 "control_state",
                             );
                         }
@@ -1563,11 +1572,9 @@ async fn run_multiplex_crf(
                             let _ = multiplex_event(
                                 output,
                                 &job.assignment.job_id,
-                                ClientEvent::ControlState(ControlStatePayload {
-                                    state: ControlState::Stopped,
-                                    active_video_id: Some(job.assignment.video_id),
-                                    job_id: Some(job.assignment.job_id.clone()),
-                                }),
+                                ClientEvent::ControlState(
+                                    job.control_state_payload(&control, ControlState::Stopped),
+                                ),
                                 "control_state",
                             );
                             return Ok(WorkerJobOutcome::Stopped);
@@ -1760,11 +1767,9 @@ async fn run_multiplex_encode_with_heartbeat_interval(
                         let _ = multiplex_event(
                             output,
                             &job.assignment.job_id,
-                            ClientEvent::ControlState(ControlStatePayload {
-                                state: ControlState::Paused,
-                                active_video_id: Some(job.assignment.video_id),
-                                job_id: Some(job.assignment.job_id.clone()),
-                            }),
+                            ClientEvent::ControlState(
+                                job.control_state_payload(&control, ControlState::Paused),
+                            ),
                             "control_state",
                         );
                     }
@@ -1773,11 +1778,9 @@ async fn run_multiplex_encode_with_heartbeat_interval(
                         let _ = multiplex_event(
                             output,
                             &job.assignment.job_id,
-                            ClientEvent::ControlState(ControlStatePayload {
-                                state: ControlState::Running,
-                                active_video_id: Some(job.assignment.video_id),
-                                job_id: Some(job.assignment.job_id.clone()),
-                            }),
+                            ClientEvent::ControlState(
+                                job.control_state_payload(&control, ControlState::Running),
+                            ),
                             "control_state",
                         );
                     }
@@ -1786,11 +1789,9 @@ async fn run_multiplex_encode_with_heartbeat_interval(
                         let _ = multiplex_event(
                             output,
                             &job.assignment.job_id,
-                            ClientEvent::ControlState(ControlStatePayload {
-                                state: ControlState::Stopped,
-                                active_video_id: Some(job.assignment.video_id),
-                                job_id: Some(job.assignment.job_id.clone()),
-                            }),
+                            ClientEvent::ControlState(
+                                job.control_state_payload(&control, ControlState::Stopped),
+                            ),
                             "control_state",
                         );
                         return Ok(WorkerJobOutcome::Stopped);
@@ -1974,6 +1975,7 @@ impl ConnectedWorker {
             state,
             active_video_id,
             job_id: None,
+            command_id: None,
         }))
         .await
     }
@@ -3214,7 +3216,10 @@ async fn send_multiplex_event(
 }
 
 fn event_requires_ack(name: &str) -> bool {
-    matches!(name, "encode_completed" | "video_failed")
+    matches!(
+        name,
+        "crf_search_completed" | "encode_completed" | "video_failed" | "control_state"
+    )
 }
 
 fn record_multiplex_event(state: &mut WorkerJobReportState, event: &ClientEvent) {
@@ -3451,10 +3456,8 @@ fn remove_finished_job_if_acknowledged(
     if !job.finished {
         return;
     }
-    if job.state.encode_completed.is_some() || job.state.failure.is_some() {
-        if pending_acks.values().any(|ack| ack.job_id == job_id) {
-            return;
-        }
+    if pending_acks.values().any(|ack| ack.job_id == job_id) {
+        return;
     }
     jobs.remove(job_id);
     pending.retain(|_, (_, resend)| resend.as_deref() != Some(job_id));
@@ -3466,24 +3469,15 @@ async fn replay_multiplex_jobs(
     pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> bool {
     for (job_id, job) in jobs {
-        let control_state =
-            job.state
-                .control_state
-                .clone()
-                .unwrap_or_else(|| ControlStatePayload {
-                    state: ControlState::Running,
-                    active_video_id: Some(job.job.assignment.video_id),
-                    job_id: Some(job_id.clone()),
-                });
-
-        if !send_multiplex_event(
-            worker,
-            ClientEvent::ControlState(control_state),
-            job_id,
-            "control_state",
-            pending_acks,
-        )
-        .await
+        if let Some(control_state) = &job.state.control_state
+            && !send_multiplex_event(
+                worker,
+                ClientEvent::ControlState(control_state.clone()),
+                job_id,
+                "control_state",
+                pending_acks,
+            )
+            .await
         {
             return false;
         }
@@ -4303,6 +4297,15 @@ mod tests {
     }
 
     #[test]
+    fn every_terminal_worker_event_requires_acknowledgement() {
+        assert!(event_requires_ack("crf_search_completed"));
+        assert!(event_requires_ack("encode_completed"));
+        assert!(event_requires_ack("video_failed"));
+        assert!(event_requires_ack("control_state"));
+        assert!(!event_requires_ack("encode_progress"));
+    }
+
+    #[test]
     fn reconnect_progress_identifies_active_encode_without_prior_progress() {
         let job = WorkerJob::new(
             JobAssignedPayload {
@@ -4342,6 +4345,7 @@ mod tests {
             state: ControlState::Paused,
             active_video_id: Some(123),
             job_id: Some("crf-123".into()),
+            command_id: Some("pause-123".into()),
         };
 
         record_multiplex_event(&mut state, &ClientEvent::ControlState(paused.clone()));
@@ -4595,6 +4599,7 @@ mod tests {
             action: ControlAction::Stop,
             video_id: Some(123),
             job_id: Some("heartbeat-job".into()),
+            command_id: Some("stop-heartbeat-job".into()),
         }))?;
         assert!(matches!(run.await?, WorkerJobOutcome::Stopped));
         let mut stopped = false;
@@ -4606,9 +4611,11 @@ mod tests {
                         state: ControlState::Stopped,
                         active_video_id: Some(123),
                         ref job_id,
+                        ref command_id,
                     }),
                     ..
                 } if job_id.as_deref() == Some("heartbeat-job")
+                    && command_id.as_deref() == Some("stop-heartbeat-job")
             );
         }
         assert!(stopped);
@@ -5115,6 +5122,7 @@ mod tests {
                 action: crate::command::worker_protocol::ControlAction::Pause,
                 video_id: Some(123),
                 job_id: None,
+                command_id: None,
             },
         ))?;
 
@@ -5125,6 +5133,7 @@ mod tests {
                     action: crate::command::worker_protocol::ControlAction::Pause,
                     video_id: Some(123),
                     job_id: None,
+                    command_id: None,
                 }
             ))
         ));
@@ -5137,6 +5146,7 @@ mod tests {
             action: crate::command::worker_protocol::ControlAction::Resume,
             video_id: None,
             job_id: None,
+            command_id: None,
         };
 
         assert!(control_targets_job(&control, "crf-1", 1, false));
@@ -6183,6 +6193,7 @@ mod tests {
                         action,
                         video_id,
                         job_id: None,
+                        command_id: None,
                     },
                 ))
                 .expect("control push json"),
