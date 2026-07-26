@@ -17,13 +17,13 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs, io,
     io::Read,
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -48,6 +48,52 @@ const MAX_TRANSFER_FRAME_BYTES: usize = 640 * 1024 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HTTP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 static HEARTBEAT_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+
+#[derive(Debug)]
+struct TransferGate {
+    state: Mutex<ControlState>,
+    changed: Condvar,
+}
+
+impl TransferGate {
+    fn running() -> Self {
+        Self {
+            state: Mutex::new(ControlState::Running),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn set(&self, state: ControlState) {
+        *self.state.lock().expect("transfer gate lock") = state;
+        self.changed.notify_all();
+    }
+
+    fn wait_until_running(&self) -> io::Result<()> {
+        let mut state = self.state.lock().expect("transfer gate lock");
+        while *state == ControlState::Paused {
+            state = self.changed.wait(state).expect("transfer gate wait");
+        }
+        if *state == ControlState::Stopped {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "worker transfer stopped",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct ControlledReader<R> {
+    inner: R,
+    gate: Arc<TransferGate>,
+}
+
+impl<R: Read> Read for ControlledReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.gate.wait_until_running()?;
+        self.inner.read(buffer)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BytesPerSecond(Option<NonZeroU64>);
@@ -1360,6 +1406,60 @@ fn cleanup_multiplex_worker_input(
     Ok(())
 }
 
+fn apply_job_control(
+    job: &WorkerJob,
+    control: &ControlPayload,
+    output: &UnboundedSender<MultiplexOutput>,
+    process_scope: Option<&ProcessScope>,
+    paused: &mut bool,
+) -> Result<Option<WorkerJobOutcome>> {
+    let (state, outcome) = match control.action {
+        ControlAction::Pause => {
+            if let Some(scope) = process_scope {
+                scope.pause()?;
+            }
+            *paused = true;
+            (ControlState::Paused, None)
+        }
+        ControlAction::Resume | ControlAction::Start => {
+            if let Some(scope) = process_scope {
+                scope.resume()?;
+            }
+            *paused = false;
+            (ControlState::Running, None)
+        }
+        ControlAction::Stop => {
+            if let Some(scope) = process_scope {
+                scope.stop()?;
+            }
+            (ControlState::Stopped, Some(WorkerJobOutcome::Stopped))
+        }
+    };
+    let _ = multiplex_event(
+        output,
+        &job.assignment.job_id,
+        ClientEvent::ControlState(job.control_state_payload(control, state)),
+        "control_state",
+    );
+    Ok(outcome)
+}
+
+fn apply_transfer_control(
+    job: &WorkerJob,
+    control: &ControlPayload,
+    output: &UnboundedSender<MultiplexOutput>,
+    gate: &TransferGate,
+    paused: &mut bool,
+) -> Result<Option<WorkerJobOutcome>> {
+    let outcome = apply_job_control(job, control, output, None, paused)?;
+    gate.set(match control.action {
+        ControlAction::Pause => ControlState::Paused,
+        ControlAction::Resume | ControlAction::Start => ControlState::Running,
+        ControlAction::Stop => ControlState::Stopped,
+    });
+    Ok(outcome)
+}
+
 async fn run_multiplex_job_inner(
     job: &WorkerJob,
     commands: &mut UnboundedReceiver<JobCommand>,
@@ -1373,22 +1473,67 @@ async fn run_multiplex_job_inner(
     }
 
     if matches!(phase, WorkerJobPhase::AwaitingInput(InputDelivery::Http)) {
-        download_multiplex_input(job, output).await?;
-    } else if matches!(phase, WorkerJobPhase::AwaitingInput(_)) {
-        receive_multiplex_input(job, commands, output).await?;
+        if let Some(outcome) = download_multiplex_input(job, commands, output).await? {
+            return Ok(outcome);
+        }
+    } else if matches!(phase, WorkerJobPhase::AwaitingInput(_))
+        && let Some(outcome) = receive_multiplex_input(job, commands, output).await?
+    {
+        return Ok(outcome);
     }
 
-    let probe = Arc::new(crate::ffprobe::probe(job.input_path()));
+    let probe = match probe_multiplex_input(job, commands, output).await? {
+        Ok(probe) => probe,
+        Err(outcome) => return Ok(outcome),
+    };
     match job.assignment.job_type {
         JobKind::CrfSearch => run_multiplex_crf(job, probe, commands, output).await,
         JobKind::Encode => run_multiplex_encode(job, probe, commands, output).await,
     }
 }
 
+async fn probe_multiplex_input(
+    job: &WorkerJob,
+    commands: &mut UnboundedReceiver<JobCommand>,
+    output: &UnboundedSender<MultiplexOutput>,
+) -> Result<std::result::Result<Arc<Ffprobe>, WorkerJobOutcome>> {
+    let input = job.input_path().to_path_buf();
+    let probe = tokio::task::spawn_blocking(move || Arc::new(crate::ffprobe::probe(&input)));
+    tokio::pin!(probe);
+    let mut paused = false;
+    loop {
+        tokio::select! {
+            result = &mut probe, if !paused => {
+                return Ok(Ok(result.context("join ffprobe task")?));
+            }
+            command = commands.recv() => match command {
+                Some(JobCommand::Control(control)) => {
+                    if let Some(outcome) =
+                        apply_job_control(job, &control, output, None, &mut paused)?
+                    {
+                        let _ = (&mut probe).await;
+                        return Ok(Err(outcome));
+                    }
+                }
+                Some(JobCommand::Cancel(cancel)) => {
+                    let _ = (&mut probe).await;
+                    bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
+                }
+                Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
+                None => {
+                    let _ = (&mut probe).await;
+                    bail!("worker command channel closed while probing input");
+                }
+            }
+        }
+    }
+}
+
 async fn download_multiplex_input(
     job: &WorkerJob,
+    commands: &mut UnboundedReceiver<JobCommand>,
     output: &UnboundedSender<MultiplexOutput>,
-) -> Result<()> {
+) -> Result<Option<WorkerJobOutcome>> {
     let transfer = job
         .assignment
         .transfer
@@ -1404,7 +1549,9 @@ async fn download_multiplex_input(
     let job_id = job.assignment.job_id.clone();
     let expected_size = job.assignment.size_bytes;
     let received = Arc::new(AtomicU64::new(0));
+    let gate = Arc::new(TransferGate::running());
     let copy_received = Arc::clone(&received);
+    let copy_gate = Arc::clone(&gate);
     let copy_job_id = job_id.clone();
     let copy = tokio::task::spawn_blocking(move || -> Result<u64> {
         let response = ureq::get(&transfer.url)
@@ -1413,9 +1560,12 @@ async fn download_multiplex_input(
             .map_err(|error| {
                 anyhow!("HTTP input download failed for job {copy_job_id}: {error}")
             })?;
-        let reader = CountingReader {
-            inner: response.into_reader(),
-            received: copy_received,
+        let reader = ControlledReader {
+            inner: CountingReader {
+                inner: response.into_reader(),
+                received: copy_received,
+            },
+            gate: copy_gate,
         };
         let mut output_file =
             fs::File::create(&part_path).context("create HTTP worker input part file")?;
@@ -1433,6 +1583,7 @@ async fn download_multiplex_input(
     let mut progress = tokio::time::interval(HTTP_TRANSFER_PROGRESS_INTERVAL);
     progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tokio::pin!(copy);
+    let mut paused = false;
     loop {
         tokio::select! {
             _ = progress.tick() => {
@@ -1453,7 +1604,28 @@ async fn download_multiplex_input(
             }
             result = &mut copy => {
                 result.context("join HTTP worker input download task")??;
-                return Ok(());
+                return Ok(None);
+            }
+            command = commands.recv() => match command {
+                Some(JobCommand::Control(control)) => {
+                    if let Some(outcome) =
+                        apply_transfer_control(job, &control, output, &gate, &mut paused)?
+                    {
+                        let _ = (&mut copy).await;
+                        return Ok(Some(outcome));
+                    }
+                }
+                Some(JobCommand::Cancel(cancel)) => {
+                    gate.set(ControlState::Stopped);
+                    let _ = (&mut copy).await;
+                    bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
+                }
+                Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
+                None => {
+                    gate.set(ControlState::Stopped);
+                    let _ = (&mut copy).await;
+                    bail!("worker command channel closed while downloading input");
+                }
             }
         }
     }
@@ -1463,12 +1635,22 @@ async fn receive_multiplex_input(
     job: &WorkerJob,
     commands: &mut UnboundedReceiver<JobCommand>,
     output: &UnboundedSender<MultiplexOutput>,
-) -> Result<()> {
+) -> Result<Option<WorkerJobOutcome>> {
     let mut pending = PendingJob::waiting(job.clone());
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut paused = false;
+    let mut deferred = VecDeque::new();
 
     loop {
+        let deferred_command = (!paused).then(|| deferred.pop_front()).flatten();
+        if let Some(command) = deferred_command {
+            if apply_input_command(&mut pending, command, output)? {
+                return Ok(None);
+            }
+            continue;
+        }
+
         tokio::select! {
             _ = heartbeat.tick() => {
                 let _ = multiplex_event(
@@ -1479,39 +1661,64 @@ async fn receive_multiplex_input(
                 );
             }
             command = commands.recv() => match command {
-                Some(JobCommand::TransferStarted(started)) => {
-                    pending.ensure_receiver(started.chunk_size_bytes)?;
+                Some(command @ (JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)))
+                    if paused =>
+                {
+                    deferred.push_back(command);
                 }
-                Some(JobCommand::TransferChunk(chunk)) => {
-                    let chunk_index = chunk.chunk_index;
-                    let total_chunks = chunk.total_chunks;
-                    pending.apply_raw_chunk(chunk)?;
-                    let progress = pending.transfer_progress_payload(chunk_index, total_chunks);
-                    let _ = multiplex_event(
-                        output,
-                        &job.assignment.job_id,
-                        ClientEvent::TransferProgress(progress),
-                        "transfer_progress",
-                    );
-                    if pending.receiver.as_ref().is_some_and(|receiver| {
-                        receiver.received_bytes() == pending.job.assignment.size_bytes
-                    }) {
-                        pending.finish()?;
-                        return Ok(());
+                Some(command @ (JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_))) => {
+                    if apply_input_command(&mut pending, command, output)? {
+                        return Ok(None);
                     }
                 }
                 Some(JobCommand::Cancel(cancel)) => {
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
                 Some(JobCommand::Control(control)) => {
-                    if control.action == ControlAction::Stop {
-                        return Ok(());
+                    if let Some(outcome) =
+                        apply_job_control(job, &control, output, None, &mut paused)?
+                    {
+                        return Ok(Some(outcome));
                     }
                 }
                 None => bail!("worker command channel closed while receiving input"),
             }
         }
     }
+}
+
+fn apply_input_command(
+    pending: &mut PendingJob,
+    command: JobCommand,
+    output: &UnboundedSender<MultiplexOutput>,
+) -> Result<bool> {
+    match command {
+        JobCommand::TransferStarted(started) => {
+            pending.ensure_receiver(started.chunk_size_bytes)?;
+        }
+        JobCommand::TransferChunk(chunk) => {
+            let chunk_index = chunk.chunk_index;
+            let total_chunks = chunk.total_chunks;
+            pending.apply_raw_chunk(chunk)?;
+            let progress = pending.transfer_progress_payload(chunk_index, total_chunks);
+            let _ = multiplex_event(
+                output,
+                &pending.job.assignment.job_id,
+                ClientEvent::TransferProgress(progress),
+                "transfer_progress",
+            );
+            if pending.receiver.as_ref().is_some_and(|receiver| {
+                receiver.received_bytes() == pending.job.assignment.size_bytes
+            }) {
+                pending.finish()?;
+                return Ok(true);
+            }
+        }
+        JobCommand::Cancel(_) | JobCommand::Control(_) => {
+            unreachable!("only input transfer commands are deferred")
+        }
+    }
+    Ok(false)
 }
 
 async fn run_multiplex_crf(
@@ -1542,43 +1749,10 @@ async fn run_multiplex_crf(
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
                 Some(JobCommand::Control(control)) => {
-                    match control.action {
-                        ControlAction::Pause => {
-                            process_scope.pause()?;
-                            paused = true;
-                            let _ = multiplex_event(
-                                output,
-                                &job.assignment.job_id,
-                                ClientEvent::ControlState(
-                                    job.control_state_payload(&control, ControlState::Paused),
-                                ),
-                                "control_state",
-                            );
-                        }
-                        ControlAction::Resume | ControlAction::Start => {
-                            process_scope.resume()?;
-                            paused = false;
-                            let _ = multiplex_event(
-                                output,
-                                &job.assignment.job_id,
-                                ClientEvent::ControlState(
-                                    job.control_state_payload(&control, ControlState::Running),
-                                ),
-                                "control_state",
-                            );
-                        }
-                        ControlAction::Stop => {
-                            process_scope.stop()?;
-                            let _ = multiplex_event(
-                                output,
-                                &job.assignment.job_id,
-                                ClientEvent::ControlState(
-                                    job.control_state_payload(&control, ControlState::Stopped),
-                                ),
-                                "control_state",
-                            );
-                            return Ok(WorkerJobOutcome::Stopped);
-                        }
+                    if let Some(outcome) =
+                        apply_job_control(job, &control, output, Some(&process_scope), &mut paused)?
+                    {
+                        return Ok(outcome);
                     }
                 }
                 Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
@@ -1708,6 +1882,7 @@ async fn run_multiplex_encode_with_heartbeat_interval(
     tokio::pin!(run);
     let mut heartbeat = tokio::time::interval(heartbeat_interval);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut paused = false;
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
@@ -1732,10 +1907,19 @@ async fn run_multiplex_encode_with_heartbeat_interval(
                     output_percent,
                     throughput: None,
                 };
-                if let Some(transfer) = &job.assignment.output_transfer {
-                    upload_multiplex_output(&output_path, transfer, output_bytes, &job.assignment.job_id)
-                        .await?;
-                }
+                if let Some(transfer) = &job.assignment.output_transfer
+                    && let Some(outcome) = upload_multiplex_output(
+                        job,
+                        &output_path,
+                        transfer,
+                        output_bytes,
+                        commands,
+                        output,
+                    )
+                    .await?
+                    {
+                        return Ok(outcome);
+                    }
                 let _ = multiplex_event(
                     output,
                     &job.assignment.job_id,
@@ -1761,42 +1945,13 @@ async fn run_multiplex_encode_with_heartbeat_interval(
                 Some(JobCommand::Cancel(cancel)) => {
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
-                Some(JobCommand::Control(control)) => match control.action {
-                    ControlAction::Pause => {
-                        process_scope.pause()?;
-                        let _ = multiplex_event(
-                            output,
-                            &job.assignment.job_id,
-                            ClientEvent::ControlState(
-                                job.control_state_payload(&control, ControlState::Paused),
-                            ),
-                            "control_state",
-                        );
+                Some(JobCommand::Control(control)) => {
+                    if let Some(outcome) =
+                        apply_job_control(job, &control, output, Some(&process_scope), &mut paused)?
+                    {
+                        return Ok(outcome);
                     }
-                    ControlAction::Resume | ControlAction::Start => {
-                        process_scope.resume()?;
-                        let _ = multiplex_event(
-                            output,
-                            &job.assignment.job_id,
-                            ClientEvent::ControlState(
-                                job.control_state_payload(&control, ControlState::Running),
-                            ),
-                            "control_state",
-                        );
-                    }
-                    ControlAction::Stop => {
-                        process_scope.stop()?;
-                        let _ = multiplex_event(
-                            output,
-                            &job.assignment.job_id,
-                            ClientEvent::ControlState(
-                                job.control_state_payload(&control, ControlState::Stopped),
-                            ),
-                            "control_state",
-                        );
-                        return Ok(WorkerJobOutcome::Stopped);
-                    }
-                },
+                }
                 Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
                 None => bail!("worker command channel closed while running encode"),
             }
@@ -1805,31 +1960,67 @@ async fn run_multiplex_encode_with_heartbeat_interval(
 }
 
 async fn upload_multiplex_output(
+    job: &WorkerJob,
     output_path: &Path,
     transfer: &crate::command::worker_protocol::TransferSpec,
     output_bytes: u64,
-    job_id: &str,
-) -> Result<()> {
+    commands: &mut UnboundedReceiver<JobCommand>,
+    output: &UnboundedSender<MultiplexOutput>,
+) -> Result<Option<WorkerJobOutcome>> {
     let output_path = output_path.to_path_buf();
     let transfer = transfer.clone();
-    let job_id = job_id.to_owned();
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let job_id = job.assignment.job_id.clone();
+    let gate = Arc::new(TransferGate::running());
+    let copy_gate = Arc::clone(&gate);
+    let upload = tokio::task::spawn_blocking(move || -> Result<()> {
         let file = fs::File::open(&output_path).with_context(|| {
             format!(
                 "open encoded output for upload for job {job_id}: {}",
                 output_path.display()
             )
         })?;
+        let reader = ControlledReader {
+            inner: file,
+            gate: copy_gate,
+        };
         ureq::put(&transfer.url)
             .set(&transfer.auth.header, &transfer.auth.value)
             .set("Content-Length", &output_bytes.to_string())
-            .send(file)
+            .send(reader)
             .map_err(|error| anyhow!("HTTP output upload failed for job {job_id}: {error}"))?;
         Ok(())
-    })
-    .await
-    .context("join HTTP output upload task")??;
-    Ok(())
+    });
+    tokio::pin!(upload);
+    let mut paused = false;
+    loop {
+        tokio::select! {
+            result = &mut upload => {
+                result.context("join HTTP output upload task")??;
+                return Ok(None);
+            }
+            command = commands.recv() => match command {
+                Some(JobCommand::Control(control)) => {
+                    if let Some(outcome) =
+                        apply_transfer_control(job, &control, output, &gate, &mut paused)?
+                    {
+                        let _ = (&mut upload).await;
+                        return Ok(Some(outcome));
+                    }
+                }
+                Some(JobCommand::Cancel(cancel)) => {
+                    gate.set(ControlState::Stopped);
+                    let _ = (&mut upload).await;
+                    bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
+                }
+                Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
+                None => {
+                    gate.set(ControlState::Stopped);
+                    let _ = (&mut upload).await;
+                    bail!("worker command channel closed while uploading output");
+                }
+            }
+        }
+    }
 }
 
 type WorkerSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -5471,6 +5662,39 @@ mod tests {
     }
 
     #[test]
+    fn controlled_transfer_reader_pauses_resumes_and_stops() -> Result<()> {
+        let gate = Arc::new(TransferGate::running());
+        gate.set(ControlState::Paused);
+        let read_gate = Arc::clone(&gate);
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut reader = ControlledReader {
+                inner: io::Cursor::new(b"data"),
+                gate: read_gate,
+            };
+            let mut buffer = Vec::new();
+            sent.send(reader.read_to_end(&mut buffer).map(|_| buffer))
+                .expect("send read result");
+        });
+
+        assert!(received.recv_timeout(Duration::from_millis(10)).is_err());
+        gate.set(ControlState::Running);
+        assert_eq!(received.recv_timeout(Duration::from_secs(1))??, b"data");
+        reader.join().expect("controlled reader thread");
+
+        gate.set(ControlState::Stopped);
+        let mut stopped = ControlledReader {
+            inner: io::Cursor::new(b"more"),
+            gate,
+        };
+        assert_eq!(
+            stopped.read(&mut [0; 4]).expect_err("stopped read").kind(),
+            io::ErrorKind::Interrupted
+        );
+        Ok(())
+    }
+
+    #[test]
     fn worker_input_cleanup_removes_owned_directory_only() -> Result<()> {
         let root = worker_job_input_dir("cleanup-job");
         let _ = fs::remove_dir_all(&root);
@@ -5702,6 +5926,133 @@ mod tests {
         assert!(
             worker_job_phase(&make_job(WorkStatus::JobAssigned, None), Some(&input_path)).is_err()
         );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_during_input_transfer_acks_and_does_not_start_job() -> Result<()> {
+        let root = worker_job_input_dir("stop-during-input");
+        let _ = fs::remove_dir_all(&root);
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::CrfSearch,
+                job_id: "stop-during-input".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: Vec::new(),
+            },
+            root.clone(),
+            root.join("movie.mkv"),
+        );
+        let (command, mut commands) = mpsc::unbounded_channel();
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        command.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Stop,
+            video_id: Some(123),
+            job_id: Some("stop-during-input".into()),
+            command_id: Some("stop-command".into()),
+        }))?;
+
+        assert_eq!(
+            receive_multiplex_input(&job, &mut commands, &output).await?,
+            Some(WorkerJobOutcome::Stopped)
+        );
+        assert!(matches!(
+            outputs.recv().await,
+            Some(MultiplexOutput::Event {
+                event: ClientEvent::ControlState(ControlStatePayload {
+                    state: ControlState::Stopped,
+                    command_id: Some(command_id),
+                    ..
+                }),
+                ..
+            }) if command_id == "stop-command"
+        ));
+        assert!(!job.input_path().exists());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pause_during_input_transfer_defers_chunks_until_resume() -> Result<()> {
+        let job_id = format!("pause-during-input-{}", std::process::id());
+        let root = worker_job_input_dir(&job_id);
+        let _ = fs::remove_dir_all(&root);
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::CrfSearch,
+                job_id: job_id.clone(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: Vec::new(),
+            },
+            root.clone(),
+            root.join("movie.mkv"),
+        );
+        let (command, mut commands) = mpsc::unbounded_channel();
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        command.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Pause,
+            video_id: Some(123),
+            job_id: Some(job_id.clone()),
+            command_id: Some("pause-command".into()),
+        }))?;
+        command.send(JobCommand::TransferChunk(TransferChunk {
+            transfer_id: job_id.clone(),
+            video_id: 123,
+            chunk_index: 0,
+            total_chunks: 1,
+            bytes_sent: 4,
+            total_bytes: 4,
+            crc32: crc32fast::hash(b"data") as u64,
+            bytes: b"data".to_vec(),
+        }))?;
+
+        let mut receive = std::pin::pin!(receive_multiplex_input(&job, &mut commands, &output));
+        assert!(matches!(
+            tokio::select! {
+                item = outputs.recv() => item,
+                result = &mut receive => panic!("input transfer ended while paused: {result:?}"),
+            },
+            Some(MultiplexOutput::Event {
+                event: ClientEvent::ControlState(ControlStatePayload {
+                    state: ControlState::Paused,
+                    ..
+                }),
+                ..
+            })
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut receive)
+                .await
+                .is_err()
+        );
+        assert!(!job.input_path().exists());
+
+        command.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Resume,
+            video_id: Some(123),
+            job_id: Some(job_id),
+            command_id: Some("resume-command".into()),
+        }))?;
+        assert_eq!(receive.await?, None);
+        assert_eq!(fs::read(job.input_path())?, b"data");
         fs::remove_dir_all(root)?;
         Ok(())
     }
