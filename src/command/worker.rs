@@ -4824,7 +4824,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn worker_accepts_and_completes_encode_assignment() -> Result<()> {
+    async fn worker_replays_finished_encode_until_acknowledged() -> Result<()> {
         let (listener, address) = FakeCoordinator::bind("127.0.0.1:0").await?;
         let input = std::env::temp_dir().join(format!(
             "ab-av1-multiplex-client-input-{}.mkv",
@@ -4894,7 +4894,29 @@ mod tests {
                 let frame: Value = serde_json::from_str(&text).expect("worker event json");
                 if frame[3] == "encode_completed" {
                     assert_eq!(frame[4]["output_path"], expected_output);
-                    let request_ref = frame[1].as_str().expect("encode_completed ref");
+                    break;
+                }
+            }
+            drop(writer);
+            drop(reader);
+
+            let (stream, _) = listener.accept().await.expect("accept reconnect");
+            let socket = accept_async(stream)
+                .await
+                .expect("accept reconnect websocket");
+            let (mut writer, mut reader) = socket.split();
+            expect_join(&mut reader).await;
+            send_join_reply(&mut writer).await;
+            expect_announce_for_mode(&mut reader, 1, WorkerMode::Encode).await;
+            send_announce_reply(&mut writer).await;
+            loop {
+                let Some(Ok(Message::Text(text))) = reader.next().await else {
+                    panic!("worker disconnected before replaying encode completion");
+                };
+                let frame: Value = serde_json::from_str(&text).expect("worker replay event json");
+                if frame[3] == "encode_completed" {
+                    assert_eq!(frame[4]["output_path"], expected_output);
+                    let request_ref = frame[1].as_str().expect("encode_completed replay ref");
                     writer
                         .send(Message::Text(
                             json!(["1", request_ref, CRF_SEARCH_TOPIC, "phx_reply", {
@@ -4904,7 +4926,7 @@ mod tests {
                             .to_string(),
                         ))
                         .await
-                        .expect("send encode_completed ack");
+                        .expect("send replayed encode_completed ack");
                     break;
                 }
             }
