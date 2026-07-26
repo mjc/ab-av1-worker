@@ -422,7 +422,7 @@ impl WorkerJob {
     }
 
     fn failure_payload(&self, error: &anyhow::Error) -> FailureReportPayload {
-        let exit_code = 1;
+        let exit_code = crate::FAILURE_EXIT_CODE;
 
         FailureReportPayload {
             job_id: self.assignment.job_id.clone(),
@@ -1335,7 +1335,7 @@ fn cleanup_multiplex_worker_input(
     job: &WorkerJob,
     outcome: &Result<WorkerJobOutcome>,
 ) -> Result<()> {
-    if matches!(outcome, Ok(WorkerJobOutcome::Stopped)) {
+    if outcome.is_err() || matches!(outcome, Ok(WorkerJobOutcome::Stopped)) {
         return remove_worker_input(job);
     }
 
@@ -5508,7 +5508,7 @@ mod tests {
     }
 
     #[test]
-    fn multiplex_worker_input_cleanup_removes_stopped_job() -> Result<()> {
+    fn multiplex_worker_input_cleanup_removes_stopped_and_failed_jobs() -> Result<()> {
         let job_id = format!("cleanup-outcome-{}", std::process::id());
         let root = worker_job_input_dir(&job_id);
         let _ = fs::remove_dir_all(&root);
@@ -5536,6 +5536,11 @@ mod tests {
         );
 
         cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Stopped))?;
+        assert!(!root.exists());
+
+        fs::create_dir_all(&root)?;
+        fs::write(job.input_path(), b"data")?;
+        cleanup_multiplex_worker_input(&job, &Err(anyhow!("encode failed")))?;
         assert!(!root.exists());
         Ok(())
     }

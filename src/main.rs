@@ -19,6 +19,8 @@ use futures_util::FutureExt;
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, fmt};
 
+const FAILURE_EXIT_CODE: i32 = 1;
+
 #[derive(Parser)]
 #[command(version, about)]
 enum Command {
@@ -82,7 +84,7 @@ async fn main() {
 
     if let Err(err) = out {
         eprintln!("Error: {err}");
-        std::process::exit(1);
+        std::process::exit(FAILURE_EXIT_CODE);
     }
 }
 
