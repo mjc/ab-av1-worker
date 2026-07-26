@@ -1504,30 +1504,43 @@ async fn probe_multiplex_input(
     output: &UnboundedSender<MultiplexOutput>,
 ) -> Result<std::result::Result<Arc<Ffprobe>, WorkerJobOutcome>> {
     let input = job.input_path().to_path_buf();
-    let probe = tokio::task::spawn_blocking(move || Arc::new(crate::ffprobe::probe(&input)));
+    let probe = async move { Arc::new(crate::ffprobe::probe_managed(&input).await) };
+    drive_multiplex_probe(job, commands, output, probe).await
+}
+
+async fn drive_multiplex_probe<F>(
+    job: &WorkerJob,
+    commands: &mut UnboundedReceiver<JobCommand>,
+    output: &UnboundedSender<MultiplexOutput>,
+    probe: F,
+) -> Result<std::result::Result<Arc<Ffprobe>, WorkerJobOutcome>>
+where
+    F: std::future::Future<Output = Arc<Ffprobe>>,
+{
+    let process_scope = ProcessScope::new(job.assignment.job_id.clone());
+    let probe = process_scope.run(probe);
     tokio::pin!(probe);
     let mut paused = false;
     loop {
         tokio::select! {
             result = &mut probe, if !paused => {
-                return Ok(Ok(result.context("join ffprobe task")?));
+                return Ok(Ok(result));
             }
             command = commands.recv() => match command {
                 Some(JobCommand::Control(control)) => {
                     if let Some(outcome) =
-                        apply_job_control(job, &control, output, None, &mut paused)?
+                        apply_job_control(job, &control, output, Some(&process_scope), &mut paused)?
                     {
-                        let _ = (&mut probe).await;
                         return Ok(Err(outcome));
                     }
                 }
                 Some(JobCommand::Cancel(cancel)) => {
-                    let _ = (&mut probe).await;
+                    process_scope.stop()?;
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
                 Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
                 None => {
-                    let _ = (&mut probe).await;
+                    process_scope.stop()?;
                     bail!("worker command channel closed while probing input");
                 }
             }
@@ -3681,13 +3694,31 @@ fn acknowledge_multiplex_event(
     jobs: &mut HashMap<String, MultiplexJob>,
     pending: &mut HashMap<String, (JobKind, Option<String>)>,
 ) {
-    if !event_requires_ack(ack.name) {
-        return;
-    }
-
-    if jobs.get(&ack.job_id).is_some_and(|job| job.finished) {
+    if jobs
+        .get(&ack.job_id)
+        .is_some_and(|job| job.finished && terminal_event_name(job) == Some(ack.name))
+    {
         jobs.remove(&ack.job_id);
         pending.retain(|_, (_, resend)| resend.as_deref() != Some(&ack.job_id));
+    }
+}
+
+fn terminal_event_name(job: &MultiplexJob) -> Option<&'static str> {
+    if job.state.failure.is_some() {
+        Some("video_failed")
+    } else if job.state.encode_completed.is_some() {
+        Some("encode_completed")
+    } else if job.state.crf_completed.is_some() {
+        Some("crf_search_completed")
+    } else if job
+        .state
+        .control_state
+        .as_ref()
+        .is_some_and(|control| control.state == ControlState::Stopped)
+    {
+        Some("control_state")
+    } else {
+        None
     }
 }
 
@@ -4539,6 +4570,19 @@ mod tests {
 
         remove_finished_job_if_acknowledged("encode-123", &mut jobs, &mut pending, &pending_acks);
         assert!(jobs.contains_key("encode-123"));
+
+        acknowledge_multiplex_event(
+            &PendingEventAck {
+                job_id: "encode-123".into(),
+                name: "control_state",
+            },
+            &mut jobs,
+            &mut pending,
+        );
+        assert!(
+            jobs.contains_key("encode-123"),
+            "an unrelated control acknowledgement must not retire the completion"
+        );
 
         let ack = pending_acks.remove("7").expect("pending ack");
         acknowledge_multiplex_event(&ack, &mut jobs, &mut pending);
@@ -6196,6 +6240,110 @@ mod tests {
         assert_eq!(fs::read(job.input_path())?, b"data");
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_pause_defers_completion_and_stop_prevents_execution() -> Result<()> {
+        let job = probe_phase_job("probe-control");
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let probe = async move {
+            released.await.expect("release probe");
+            test_worker_probe()
+        };
+        let mut run = std::pin::pin!(drive_multiplex_probe(
+            &job,
+            &mut command_receiver,
+            &output,
+            probe,
+        ));
+
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Pause,
+            video_id: Some(123),
+            job_id: Some("probe-control".into()),
+            command_id: Some("pause-probe".into()),
+        }))?;
+        let paused = tokio::select! {
+            event = outputs.recv() => event,
+            _ = &mut run => panic!("probe advanced before pause acknowledgement"),
+        };
+        assert!(matches!(
+            paused,
+            Some(MultiplexOutput::Event {
+                event: ClientEvent::ControlState(ControlStatePayload {
+                    state: ControlState::Paused,
+                    ..
+                }),
+                ..
+            })
+        ));
+        release.send(()).expect("release probe sender");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut run)
+                .await
+                .is_err(),
+            "a completed probe must not advance while paused"
+        );
+
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Resume,
+            video_id: Some(123),
+            job_id: Some("probe-control".into()),
+            command_id: Some("resume-probe".into()),
+        }))?;
+        assert!(run.await?.is_ok());
+
+        let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let stopped = std::pin::pin!(drive_multiplex_probe(
+            &job,
+            &mut command_receiver,
+            &output,
+            std::future::pending(),
+        ));
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Stop,
+            video_id: Some(123),
+            job_id: Some("probe-control".into()),
+            command_id: Some("stop-probe".into()),
+        }))?;
+        assert!(matches!(stopped.await?, Err(WorkerJobOutcome::Stopped)));
+        Ok(())
+    }
+
+    fn probe_phase_job(job_id: &str) -> WorkerJob {
+        WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobInProgress,
+                job_type: JobKind::CrfSearch,
+                job_id: job_id.into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: vec!["crf-search".into(), "--input".into(), "movie.mkv".into()],
+            },
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/movie.mkv"),
+        )
+    }
+
+    fn test_worker_probe() -> Arc<Ffprobe> {
+        Arc::new(Ffprobe {
+            duration: Ok(Duration::from_secs(120)),
+            has_audio: false,
+            max_audio_channels: None,
+            fps: Ok(24.0),
+            resolution: Some((1920, 1080)),
+            is_image: false,
+            pix_fmt: Some("yuv420p".into()),
+        })
     }
 
     #[tokio::test(flavor = "current_thread")]
