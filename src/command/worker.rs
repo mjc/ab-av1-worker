@@ -1320,6 +1320,10 @@ fn cleanup_multiplex_worker_input(
     job: &WorkerJob,
     outcome: &Result<WorkerJobOutcome>,
 ) -> Result<()> {
+    if matches!(outcome, Ok(WorkerJobOutcome::Stopped)) {
+        return remove_worker_input(job);
+    }
+
     if matches!(outcome, Ok(WorkerJobOutcome::Completed)) {
         let retain_local_output = job.assignment.job_type == JobKind::Encode
             && job.assignment.output_transfer.is_none()
@@ -1533,7 +1537,7 @@ async fn run_multiplex_crf(
                                 ClientEvent::ControlState(ControlStatePayload {
                                     state: ControlState::Paused,
                                     active_video_id: Some(job.assignment.video_id),
-                                    job_id: None,
+                                    job_id: Some(job.assignment.job_id.clone()),
                                 }),
                                 "control_state",
                             );
@@ -1547,7 +1551,7 @@ async fn run_multiplex_crf(
                                 ClientEvent::ControlState(ControlStatePayload {
                                     state: ControlState::Running,
                                     active_video_id: Some(job.assignment.video_id),
-                                    job_id: None,
+                                    job_id: Some(job.assignment.job_id.clone()),
                                 }),
                                 "control_state",
                             );
@@ -1559,8 +1563,8 @@ async fn run_multiplex_crf(
                                 &job.assignment.job_id,
                                 ClientEvent::ControlState(ControlStatePayload {
                                     state: ControlState::Stopped,
-                                    active_video_id: None,
-                                    job_id: None,
+                                    active_video_id: Some(job.assignment.video_id),
+                                    job_id: Some(job.assignment.job_id.clone()),
                                 }),
                                 "control_state",
                             );
@@ -1782,7 +1786,7 @@ async fn run_multiplex_encode_with_heartbeat_interval(
                             &job.assignment.job_id,
                             ClientEvent::ControlState(ControlStatePayload {
                                 state: ControlState::Stopped,
-                                active_video_id: None,
+                                active_video_id: Some(job.assignment.video_id),
                                 job_id: Some(job.assignment.job_id.clone()),
                             }),
                             "control_state",
@@ -4571,6 +4575,21 @@ mod tests {
             job_id: Some("heartbeat-job".into()),
         }))?;
         assert!(matches!(run.await?, WorkerJobOutcome::Stopped));
+        let mut stopped = false;
+        while let Ok(item) = outputs.try_recv() {
+            stopped |= matches!(
+                item,
+                MultiplexOutput::Event {
+                    event: ClientEvent::ControlState(ControlStatePayload {
+                        state: ControlState::Stopped,
+                        active_video_id: Some(123),
+                        ref job_id,
+                    }),
+                    ..
+                } if job_id.as_deref() == Some("heartbeat-job")
+            );
+        }
+        assert!(stopped);
         crate::command::encode::test_hooks::clear();
         let _ = fs::remove_dir_all(input_dir);
         assert!(heartbeat);
@@ -5457,7 +5476,7 @@ mod tests {
     }
 
     #[test]
-    fn multiplex_worker_input_cleanup_is_success_only() -> Result<()> {
+    fn multiplex_worker_input_cleanup_removes_stopped_job() -> Result<()> {
         let job_id = format!("cleanup-outcome-{}", std::process::id());
         let root = worker_job_input_dir(&job_id);
         let _ = fs::remove_dir_all(&root);
@@ -5485,8 +5504,6 @@ mod tests {
         );
 
         cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Stopped))?;
-        assert!(root.exists());
-        cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Completed))?;
         assert!(!root.exists());
         Ok(())
     }
