@@ -4599,6 +4599,79 @@ mod tests {
     }
 
     #[test]
+    fn terminal_ack_identity_covers_every_terminal_outcome() {
+        let states = [
+            (
+                WorkerJobReportState {
+                    crf_completed: Some(CrfSearchCompletedPayload {
+                        job_id: "crf-123".into(),
+                        video_id: 123,
+                        result: "ok".into(),
+                        chosen_crf: 30.0,
+                        results: Vec::new(),
+                    }),
+                    ..WorkerJobReportState::default()
+                },
+                "crf_search_completed",
+            ),
+            (
+                WorkerJobReportState {
+                    encode_completed: Some(EncodeCompletedPayload {
+                        job_id: "encode-123".into(),
+                        video_id: 123,
+                        source_name: "movie.mkv".into(),
+                        output_path: "movie.av1.mkv".into(),
+                        output_bytes: 500,
+                        output_percent: 50.0,
+                    }),
+                    ..WorkerJobReportState::default()
+                },
+                "encode_completed",
+            ),
+            (
+                WorkerJobReportState {
+                    failure: Some(FailureReportPayload {
+                        job_id: "failed-123".into(),
+                        video_id: 123,
+                        stage: "encode".into(),
+                        category: "process_failure".into(),
+                        code: "EXIT_254".into(),
+                        message: "failed".into(),
+                        context: json!({"exit_code": 254}),
+                        retriable: false,
+                        stderr_excerpt: None,
+                    }),
+                    ..WorkerJobReportState::default()
+                },
+                "video_failed",
+            ),
+            (
+                WorkerJobReportState {
+                    control_state: Some(ControlStatePayload {
+                        state: ControlState::Stopped,
+                        active_video_id: Some(123),
+                        job_id: Some("stopped-123".into()),
+                        command_id: Some("stop-123".into()),
+                    }),
+                    ..WorkerJobReportState::default()
+                },
+                "control_state",
+            ),
+        ];
+
+        for (state, event_name) in states {
+            let (commands, _) = mpsc::unbounded_channel();
+            let job = MultiplexJob {
+                job: probe_phase_job("terminal-123"),
+                command: commands,
+                state,
+                finished: true,
+            };
+            assert_eq!(terminal_event_name(&job), Some(event_name));
+        }
+    }
+
+    #[test]
     fn reconnect_progress_identifies_active_encode_without_prior_progress() {
         let job = WorkerJob::new(
             JobAssignedPayload {
