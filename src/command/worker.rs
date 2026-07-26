@@ -4380,10 +4380,9 @@ mod tests {
             PathBuf::from("/tmp/crf-search-123/movie.mkv"),
         );
 
-        let payload = job.failure_payload(&anyhow!(ProcessExitError::new(
-            Some(254),
-            "ffmpeg exited unsuccessfully",
-        )));
+        let payload = job.failure_payload(&anyhow!(crf_search::Error::Other(anyhow!(
+            ProcessExitError::new(Some(254), "ffmpeg exited unsuccessfully",)
+        ))));
 
         assert_eq!(payload.stage, "crf_search");
         assert_eq!(payload.category, "process_failure");
