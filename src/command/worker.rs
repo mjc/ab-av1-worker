@@ -48,7 +48,7 @@ const TRANSFER_CHUNK_HEADER_LEN: usize = 52;
 const MAX_TRANSFER_FRAME_BYTES: usize = 640 * 1024 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HTTP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
-const HTTP_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+const HTTP_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 static HEARTBEAT_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
 #[derive(Debug)]
