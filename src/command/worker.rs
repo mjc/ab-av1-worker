@@ -3456,10 +3456,10 @@ fn next_multiplex_job_type(
             }),
         ],
     };
-    allowed.into_iter().flatten().find(|kind| {
-        (mode == WorkerMode::Weighted || !occupied(*kind))
-            && !no_work.get(kind).copied().unwrap_or(false)
-    })
+    allowed
+        .into_iter()
+        .flatten()
+        .find(|kind| !occupied(*kind) && !no_work.get(kind).copied().unwrap_or(false))
 }
 
 async fn handle_multiplex_output(
@@ -4809,6 +4809,23 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &no_work,
+            ),
+            Some(JobKind::Encode)
+        );
+    }
+
+    #[test]
+    fn weighted_mode_does_not_pull_an_occupied_job_kind() {
+        let scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(5).unwrap());
+        let pending = HashMap::from([("crf-pull".into(), (JobKind::CrfSearch, None))]);
+
+        assert_eq!(
+            next_multiplex_job_type(
+                WorkerMode::Weighted,
+                &scheduler,
+                &HashMap::new(),
+                &pending,
+                &HashMap::new(),
             ),
             Some(JobKind::Encode)
         );
