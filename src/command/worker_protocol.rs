@@ -31,6 +31,7 @@ impl ClientFrame {
 pub(crate) enum ClientEvent {
     Join,
     Announce(AnnouncePayload),
+    JobActive(ActiveJobPayload),
     PullWork(PullWorkPayload),
     Heartbeat(HeartbeatPayload),
     ControlState(ControlStatePayload),
@@ -50,6 +51,7 @@ impl ClientEvent {
         match self {
             Self::Join => ("phx_join", ClientPayload::Empty(EmptyPayload {})),
             Self::Announce(payload) => ("announce", ClientPayload::Announce(payload)),
+            Self::JobActive(payload) => ("job_active", ClientPayload::JobActive(payload)),
             Self::PullWork(payload) => ("pull_work", ClientPayload::PullWork(payload)),
             Self::Heartbeat(payload) => ("heartbeat", ClientPayload::Heartbeat(payload)),
             Self::ControlState(payload) => ("control_state", ClientPayload::ControlState(payload)),
@@ -84,6 +86,7 @@ impl ClientEvent {
 enum ClientPayload {
     Empty(EmptyPayload),
     Announce(AnnouncePayload),
+    JobActive(ActiveJobPayload),
     PullWork(PullWorkPayload),
     Heartbeat(HeartbeatPayload),
     ControlState(ControlStatePayload),
@@ -99,6 +102,13 @@ enum ClientPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct EmptyPayload {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveJobPayload {
+    pub(crate) job_id: String,
+    pub(crate) video_id: u64,
+    pub(crate) job_type: JobKind,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PullWorkPayload {
@@ -1260,6 +1270,29 @@ mod tests {
         assert_eq!(
             serde_json::to_value(PullWorkPayload::input_missing()).expect("serialize pull_work"),
             json!({"input_missing": true})
+        );
+    }
+
+    #[test]
+    fn active_job_payload_preserves_attempt_identity() {
+        let frame = ClientFrame::new(
+            7,
+            ClientEvent::JobActive(ActiveJobPayload {
+                job_id: "encode-attempt".into(),
+                video_id: 42,
+                job_type: JobKind::Encode,
+            }),
+        );
+
+        let value = serde_json::to_value(frame).expect("serialize active job");
+        assert_eq!(value[3], "job_active");
+        assert_eq!(
+            value[4],
+            serde_json::json!({
+                "job_id": "encode-attempt",
+                "video_id": 42,
+                "job_type": "encode"
+            })
         );
     }
 

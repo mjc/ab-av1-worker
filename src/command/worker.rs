@@ -1,10 +1,11 @@
 use crate::command::worker_protocol::{
-    AnnouncePayload, CRF_SEARCH_TOPIC, CancelPayload, Capabilities, ClientEvent, ClientFrame,
-    ControlAction, ControlPayload, ControlState, ControlStatePayload, CrfSearchCompletedPayload,
-    CrfSearchProgressPayload, CrfSearchResultPayload, EncodeCompletedPayload,
-    EncodeProgressPayload, ErrorReplyPayload, FailureReportPayload, HeartbeatPayload, JobKind,
-    PullWorkPayload, ReplyBody, ServerPushFrame, ServerReply, TransferFailurePayload,
-    TransferProgressPayload, TransferStage, TransferStartedPayload, WorkStatus,
+    ActiveJobPayload, AnnouncePayload, CRF_SEARCH_TOPIC, CancelPayload, Capabilities, ClientEvent,
+    ClientFrame, ControlAction, ControlPayload, ControlState, ControlStatePayload,
+    CrfSearchCompletedPayload, CrfSearchProgressPayload, CrfSearchResultPayload,
+    EncodeCompletedPayload, EncodeProgressPayload, ErrorReplyPayload, FailureReportPayload,
+    HeartbeatPayload, JobKind, PullWorkPayload, ReplyBody, ServerPushFrame, ServerReply,
+    TransferFailurePayload, TransferProgressPayload, TransferStage, TransferStartedPayload,
+    WorkStatus,
 };
 use crate::command::worker_transfer::{Chunk, ChunkReceiver};
 use crate::command::{crf_search, encode, sample_encode};
@@ -3489,7 +3490,11 @@ async fn send_multiplex_event(
 fn event_requires_ack(name: &str) -> bool {
     matches!(
         name,
-        "crf_search_completed" | "encode_completed" | "video_failed" | "control_state"
+        "job_active"
+            | "crf_search_completed"
+            | "encode_completed"
+            | "video_failed"
+            | "control_state"
     )
 }
 
@@ -3506,6 +3511,7 @@ fn record_multiplex_event(state: &mut WorkerJobReportState, event: &ClientEvent)
         ClientEvent::ControlState(payload) => state.control_state = Some(payload.clone()),
         ClientEvent::Join
         | ClientEvent::Announce(_)
+        | ClientEvent::JobActive(_)
         | ClientEvent::PullWork(_)
         | ClientEvent::TransferFailure(_) => {}
     }
@@ -3560,17 +3566,21 @@ async fn handle_multiplex_frame(
             }
             if let Some((reference, ack, decoded)) = event_ack {
                 pending_acks.remove(&reference);
-                if let Err(error) = decoded {
-                    debug!(
-                        job_id = %ack.job_id,
-                        event = ack.name,
-                        error = %error,
-                        "multiplexed worker event was rejected"
-                    );
-                    return Ok(false);
+                match decoded {
+                    Ok(response) => {
+                        handle_multiplex_ack(&ack, &response, jobs, pending)?;
+                        return Ok(true);
+                    }
+                    Err(error) => {
+                        debug!(
+                            job_id = %ack.job_id,
+                            event = ack.name,
+                            error = %error,
+                            "multiplexed worker event was rejected"
+                        );
+                        return Ok(false);
+                    }
                 }
-                acknowledge_multiplex_event(&ack, jobs, pending);
-                return Ok(true);
             }
 
             let mut reply = None;
@@ -3714,6 +3724,33 @@ fn acknowledge_multiplex_event(
     }
 }
 
+fn handle_multiplex_ack(
+    ack: &PendingEventAck,
+    response: &Value,
+    jobs: &mut HashMap<String, MultiplexJob>,
+    pending: &mut HashMap<String, (JobKind, Option<String>)>,
+) -> Result<()> {
+    if ack.name == "job_active"
+        && response
+            .get("discarded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        if let Some(job) = jobs.get(&ack.job_id) {
+            job.command
+                .send(JobCommand::Cancel(CancelPayload {
+                    job_id: ack.job_id.clone(),
+                    reason: "coordinator discarded stale worker attempt".into(),
+                }))
+                .map_err(|_| anyhow!("worker job command channel closed"))?;
+        }
+        return Ok(());
+    }
+
+    acknowledge_multiplex_event(ack, jobs, pending);
+    Ok(())
+}
+
 fn terminal_event_name(job: &MultiplexJob) -> Option<&'static str> {
     if job.state.failure.is_some() {
         Some("video_failed")
@@ -3758,6 +3795,22 @@ async fn replay_multiplex_jobs(
     pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> bool {
     for (job_id, job) in jobs {
+        if !job.finished
+            && !send_multiplex_event(
+                worker,
+                ClientEvent::JobActive(ActiveJobPayload {
+                    job_id: job_id.clone(),
+                    video_id: job.job.assignment.video_id,
+                    job_type: job.job.assignment.job_type,
+                }),
+                job_id,
+                "job_active",
+                pending_acks,
+            )
+            .await
+        {
+            return false;
+        }
         if let Some(control_state) = &job.state.control_state
             && !send_multiplex_event(
                 worker,
@@ -4607,6 +4660,43 @@ mod tests {
         assert!(event_requires_ack("video_failed"));
         assert!(event_requires_ack("control_state"));
         assert!(!event_requires_ack("encode_progress"));
+    }
+
+    #[test]
+    fn discarded_active_attempt_is_cancelled() -> Result<()> {
+        let (command, mut commands) = mpsc::unbounded_channel();
+        let mut jobs = HashMap::from([(
+            "encode-stale".into(),
+            MultiplexJob {
+                job: probe_phase_job("encode-stale"),
+                command,
+                state: WorkerJobReportState::default(),
+                finished: false,
+            },
+        )]);
+        let mut pending = HashMap::new();
+
+        handle_multiplex_ack(
+            &PendingEventAck {
+                job_id: "encode-stale".into(),
+                name: "job_active",
+            },
+            &serde_json::json!({
+                "accepted": false,
+                "discarded": true,
+                "reason": "stale_worker_attempt"
+            }),
+            &mut jobs,
+            &mut pending,
+        )?;
+
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(JobCommand::Cancel(CancelPayload { ref job_id, .. }))
+                if job_id == "encode-stale"
+        ));
+        assert!(jobs.contains_key("encode-stale"));
+        Ok(())
     }
 
     #[test]
