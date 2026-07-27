@@ -209,13 +209,16 @@ impl WorkerCapacity {
 
     #[must_use]
     const fn max_active_jobs(self) -> usize {
+        if matches!(self.mode, WorkerMode::Weighted) {
+            return 1;
+        }
         if let Some(max_active_jobs) = self.max_active_jobs {
             return max_active_jobs.get();
         }
 
         match self.mode {
-            WorkerMode::CrfSearch | WorkerMode::Encode => 1,
-            WorkerMode::Both | WorkerMode::Weighted => {
+            WorkerMode::CrfSearch | WorkerMode::Encode | WorkerMode::Weighted => 1,
+            WorkerMode::Both => {
                 if self.logical_cpus > 8 {
                     2
                 } else {
@@ -293,7 +296,7 @@ pub struct Args {
     #[arg(long = "worker-mode", alias = "mode", default_value = "both")]
     worker_mode: WorkerMode,
 
-    /// Maximum jobs to run concurrently in worker mode.
+    /// Maximum jobs to run concurrently (not supported in weighted mode).
     #[arg(long, env = "AB_AV1_WORKER_MAX_ACTIVE_JOBS")]
     max_active_jobs: Option<std::num::NonZeroUsize>,
 
@@ -338,6 +341,12 @@ impl TryFrom<Args> for WorkerConfig {
         }
         if worker_mode == WorkerMode::Weighted && crf_searches_per_encode.is_none() {
             bail!("--worker-mode weighted requires --crf-searches-per-encode");
+        }
+        if worker_mode == WorkerMode::Weighted && max_active_jobs.is_some() {
+            bail!(
+                "--max-active-jobs is not supported with --worker-mode weighted; \
+                 run multiple worker processes for parallel weighted workers"
+            );
         }
 
         Ok(Self {
@@ -3440,6 +3449,10 @@ fn next_multiplex_job_type(
     pending: &HashMap<String, (JobKind, Option<String>)>,
     no_work: &HashMap<JobKind, bool>,
 ) -> Option<JobKind> {
+    if mode == WorkerMode::Weighted && (!jobs.is_empty() || !pending.is_empty()) {
+        return None;
+    }
+
     let occupied = |kind| {
         jobs.values().any(|job| job.job.assignment.job_type == kind)
             || pending.values().any(|(job_type, _)| *job_type == kind)
@@ -4815,7 +4828,7 @@ mod tests {
     }
 
     #[test]
-    fn weighted_mode_does_not_pull_an_occupied_job_kind() {
+    fn weighted_mode_waits_for_the_active_job_to_finish() {
         let scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(5).unwrap());
         let pending = HashMap::from([("crf-pull".into(), (JobKind::CrfSearch, None))]);
 
@@ -4827,7 +4840,7 @@ mod tests {
                 &pending,
                 &HashMap::new(),
             ),
-            Some(JobKind::Encode)
+            None
         );
     }
 
@@ -4844,12 +4857,34 @@ mod tests {
     }
 
     #[test]
-    fn work_ratio_does_not_change_worker_capacity() {
+    fn weighted_mode_runs_one_job_at_a_time() {
         let capacity = WorkerCapacity::new(16, WorkerMode::Weighted, None);
         let scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(10).unwrap());
 
-        assert_eq!(capacity.max_active_jobs(), 2);
+        assert_eq!(capacity.max_active_jobs(), 1);
         assert_eq!(scheduler.preferred(), JobKind::CrfSearch);
+    }
+
+    #[test]
+    fn weighted_mode_rejects_concurrent_jobs() {
+        let args = Args::try_parse_from([
+            "ab-av1",
+            "--connect",
+            "http://127.0.0.1:4000",
+            "--token",
+            "token",
+            "--worker-id",
+            "worker",
+            "--worker-mode",
+            "weighted",
+            "--crf-searches-per-encode",
+            "3",
+            "--max-active-jobs",
+            "2",
+        ])
+        .expect("parse worker args");
+
+        assert!(WorkerConfig::try_from(args).is_err());
     }
 
     #[test]
