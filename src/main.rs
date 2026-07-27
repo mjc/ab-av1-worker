@@ -69,7 +69,11 @@ async fn main() {
         Command::AutoEncode(args) => {
             command::auto_encode(command::auto_encode::AutoEncodeConfig::from(args)).boxed_local()
         }
-        Command::Worker(args) => command::worker(args.into()).boxed_local(),
+        Command::Worker(args) => async move {
+            let config = command::worker::WorkerConfig::try_from(args)?;
+            command::worker(config).await
+        }
+        .boxed_local(),
         Command::PrintCompletions(args) => return command::print_completions(args.into()),
     });
 
