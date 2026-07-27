@@ -224,6 +224,38 @@ impl WorkerCapacity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkScheduler {
+    crf_searches_per_encode: std::num::NonZeroUsize,
+    crf_searches_since_encode: usize,
+}
+
+impl WorkScheduler {
+    const fn new(crf_searches_per_encode: std::num::NonZeroUsize) -> Self {
+        Self {
+            crf_searches_per_encode,
+            crf_searches_since_encode: 0,
+        }
+    }
+
+    const fn preferred(self) -> JobKind {
+        if self.crf_searches_since_encode < self.crf_searches_per_encode.get() {
+            JobKind::CrfSearch
+        } else {
+            JobKind::Encode
+        }
+    }
+
+    const fn record_assignment(&mut self, job_type: JobKind) {
+        match job_type {
+            JobKind::CrfSearch => {
+                self.crf_searches_since_encode = self.crf_searches_since_encode.saturating_add(1);
+            }
+            JobKind::Encode => self.crf_searches_since_encode = 0,
+        }
+    }
+}
+
 /// Connect to a Reencodarr websocket worker endpoint and request one job.
 #[derive(Parser, Debug, Clone)]
 pub struct Args {
@@ -262,6 +294,14 @@ pub struct Args {
     /// Maximum jobs to run concurrently in worker mode.
     #[arg(long, env = "AB_AV1_WORKER_MAX_ACTIVE_JOBS")]
     max_active_jobs: Option<std::num::NonZeroUsize>,
+
+    /// CRF search jobs selected for each encode job in both mode.
+    #[arg(
+        long,
+        env = "AB_AV1_WORKER_CRF_SEARCHES_PER_ENCODE",
+        default_value = "1"
+    )]
+    crf_searches_per_encode: std::num::NonZeroUsize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +315,7 @@ pub struct WorkerConfig {
     local_path: Option<PathBuf>,
     worker_mode: WorkerMode,
     max_active_jobs: Option<std::num::NonZeroUsize>,
+    crf_searches_per_encode: std::num::NonZeroUsize,
 }
 
 impl From<Args> for WorkerConfig {
@@ -289,6 +330,7 @@ impl From<Args> for WorkerConfig {
             local_path,
             worker_mode,
             max_active_jobs,
+            crf_searches_per_encode,
         }: Args,
     ) -> Self {
         Self {
@@ -301,6 +343,7 @@ impl From<Args> for WorkerConfig {
             local_path,
             worker_mode,
             max_active_jobs,
+            crf_searches_per_encode,
         }
     }
 }
@@ -2108,6 +2151,7 @@ impl ConnectedWorker {
                         mode: config.worker_mode.as_str().into(),
                         logical_cpus: capacity.logical_cpus,
                         max_active_jobs: capacity.max_active_jobs(),
+                        crf_searches_per_encode: config.crf_searches_per_encode.get(),
                     },
                 }),
             ),
@@ -3159,6 +3203,8 @@ async fn run_multiplexed_worker(
     let mut pending: HashMap<String, (JobKind, Option<String>)> = HashMap::new();
     let mut pending_acks: HashMap<String, PendingEventAck> = HashMap::new();
     let mut no_work = HashMap::new();
+    // The ratio survives websocket reconnects but intentionally resets when the worker process does.
+    let mut scheduler = WorkScheduler::new(config.crf_searches_per_encode);
     let mut reconnect = tokio::time::interval(runtime.reconnect_base_delay);
     reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut offline_deadline = None;
@@ -3169,6 +3215,7 @@ async fn run_multiplexed_worker(
                 worker,
                 config.worker_mode,
                 capacity.max_active_jobs(),
+                &scheduler,
                 &jobs,
                 &mut pending,
                 &no_work,
@@ -3198,6 +3245,7 @@ async fn run_multiplexed_worker(
                         &mut pending,
                         &mut no_work,
                         &mut pending_acks,
+                        &mut scheduler,
                         &output,
                         completed_pulls,
                         config.local_path.as_deref(),
@@ -3336,17 +3384,19 @@ async fn schedule_multiplex_pulls(
     worker: &mut MultiplexedWorker,
     mode: WorkerMode,
     max_active_jobs: usize,
+    scheduler: &WorkScheduler,
     jobs: &HashMap<String, MultiplexJob>,
     pending: &mut HashMap<String, (JobKind, Option<String>)>,
     no_work: &HashMap<JobKind, bool>,
     completed_pulls: &mut usize,
     max_pulls: Option<usize>,
 ) -> Result<()> {
-    while jobs.len() + pending.len() < max_active_jobs
-        && max_pulls.is_none_or(|max| *completed_pulls + pending.len() < max)
+    if pending.is_empty()
+        && jobs.len() < max_active_jobs
+        && max_pulls.is_none_or(|max| *completed_pulls < max)
     {
-        let Some(job_type) = next_multiplex_job_type(mode, jobs, pending, no_work) else {
-            break;
+        let Some(job_type) = next_multiplex_job_type(mode, scheduler, no_work) else {
+            return Ok(());
         };
         let reference = worker
             .send_pull(PullWorkPayload {
@@ -3361,23 +3411,24 @@ async fn schedule_multiplex_pulls(
 
 fn next_multiplex_job_type(
     mode: WorkerMode,
-    jobs: &HashMap<String, MultiplexJob>,
-    pending: &HashMap<String, (JobKind, Option<String>)>,
+    scheduler: &WorkScheduler,
     no_work: &HashMap<JobKind, bool>,
 ) -> Option<JobKind> {
-    let occupied = |kind| {
-        jobs.values().any(|job| job.job.assignment.job_type == kind)
-            || pending.values().any(|(job_type, _)| *job_type == kind)
-    };
     let allowed = match mode {
         WorkerMode::CrfSearch => [Some(JobKind::CrfSearch), None],
         WorkerMode::Encode => [Some(JobKind::Encode), None],
-        WorkerMode::Both => [Some(JobKind::CrfSearch), Some(JobKind::Encode)],
+        WorkerMode::Both => [
+            Some(scheduler.preferred()),
+            Some(match scheduler.preferred() {
+                JobKind::CrfSearch => JobKind::Encode,
+                JobKind::Encode => JobKind::CrfSearch,
+            }),
+        ],
     };
     allowed
         .into_iter()
         .flatten()
-        .find(|kind| !occupied(*kind) && !no_work.get(kind).copied().unwrap_or(false))
+        .find(|kind| !no_work.get(kind).copied().unwrap_or(false))
 }
 
 async fn handle_multiplex_output(
@@ -3525,6 +3576,7 @@ async fn handle_multiplex_frame(
     pending: &mut HashMap<String, (JobKind, Option<String>)>,
     no_work: &mut HashMap<JobKind, bool>,
     pending_acks: &mut HashMap<String, PendingEventAck>,
+    scheduler: &mut WorkScheduler,
     output: &UnboundedSender<MultiplexOutput>,
     completed_pulls: &mut usize,
     local_path: Option<&Path>,
@@ -3630,6 +3682,7 @@ async fn handle_multiplex_frame(
                                     .map_err(|_| anyhow!("worker input command channel closed"))?;
                             }
                         } else {
+                            scheduler.record_assignment(job_type);
                             let job = build_worker_job(assignment, local_path)?;
                             let job_id = job.assignment.job_id.clone();
                             info!(
@@ -4387,6 +4440,7 @@ mod tests {
                 local_path: None,
                 worker_mode: WorkerMode::CrfSearch,
                 max_active_jobs: None,
+                crf_searches_per_encode: std::num::NonZeroUsize::new(1).unwrap(),
             }
         }
 
@@ -4407,6 +4461,7 @@ mod tests {
             local_path: None,
             worker_mode: WorkerMode::CrfSearch,
             max_active_jobs: std::num::NonZeroUsize::new(1),
+            crf_searches_per_encode: std::num::NonZeroUsize::new(1).unwrap(),
         });
 
         assert_eq!(config.connect, "http://127.0.0.1:4000");
@@ -4420,6 +4475,7 @@ mod tests {
             config.max_active_jobs.map(std::num::NonZeroUsize::get),
             Some(1)
         );
+        assert_eq!(config.crf_searches_per_encode.get(), 1);
     }
 
     #[test]
@@ -4485,6 +4541,38 @@ mod tests {
                 "--worker-id",
                 "worker",
                 "--max-active-jobs",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn args_accepts_nonzero_crf_searches_per_encode() {
+        let args = Args::try_parse_from([
+            "ab-av1",
+            "--connect",
+            "http://127.0.0.1:4000",
+            "--token",
+            "token",
+            "--worker-id",
+            "worker",
+            "--crf-searches-per-encode",
+            "3",
+        ])
+        .expect("parse CRF searches per encode");
+
+        assert_eq!(args.crf_searches_per_encode.get(), 3);
+        assert!(
+            Args::try_parse_from([
+                "ab-av1",
+                "--connect",
+                "http://127.0.0.1:4000",
+                "--token",
+                "token",
+                "--worker-id",
+                "worker",
+                "--crf-searches-per-encode",
                 "0",
             ])
             .is_err()
@@ -4559,28 +4647,77 @@ mod tests {
 
     #[test]
     fn both_scheduler_prefers_crf_then_uses_encode_slot() {
-        let jobs = HashMap::new();
-        let pending = HashMap::new();
+        let mut scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(1).unwrap());
         let no_work = HashMap::new();
         assert_eq!(
-            next_multiplex_job_type(WorkerMode::Both, &jobs, &pending, &no_work),
+            next_multiplex_job_type(WorkerMode::Both, &scheduler, &no_work),
             Some(JobKind::CrfSearch)
         );
 
-        let mut no_work = HashMap::new();
-        no_work.insert(JobKind::CrfSearch, true);
+        scheduler.record_assignment(JobKind::CrfSearch);
         assert_eq!(
-            next_multiplex_job_type(WorkerMode::Both, &jobs, &pending, &no_work),
+            next_multiplex_job_type(WorkerMode::Both, &scheduler, &no_work),
             Some(JobKind::Encode)
         );
 
-        let mut pending = HashMap::new();
-        pending.insert("crf-pull".into(), (JobKind::CrfSearch, None));
-        let no_work = HashMap::new();
+        scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(1).unwrap());
+        let mut no_work = HashMap::new();
+        no_work.insert(JobKind::CrfSearch, true);
         assert_eq!(
-            next_multiplex_job_type(WorkerMode::Both, &jobs, &pending, &no_work),
+            next_multiplex_job_type(WorkerMode::Both, &scheduler, &no_work),
             Some(JobKind::Encode)
         );
+    }
+
+    #[test]
+    fn both_scheduler_selects_n_crf_searches_per_encode() {
+        let mut scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(3).unwrap());
+        let expected = [
+            JobKind::CrfSearch,
+            JobKind::CrfSearch,
+            JobKind::CrfSearch,
+            JobKind::Encode,
+            JobKind::CrfSearch,
+            JobKind::CrfSearch,
+            JobKind::CrfSearch,
+            JobKind::Encode,
+        ];
+
+        for job_type in expected {
+            assert_eq!(scheduler.preferred(), job_type);
+            scheduler.record_assignment(job_type);
+        }
+    }
+
+    #[test]
+    fn both_scheduler_does_not_count_empty_queue_fallback_as_preferred_work() {
+        let mut scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(2).unwrap());
+
+        scheduler.record_assignment(JobKind::Encode);
+        assert_eq!(scheduler.preferred(), JobKind::CrfSearch);
+        scheduler.record_assignment(JobKind::CrfSearch);
+        assert_eq!(scheduler.preferred(), JobKind::CrfSearch);
+    }
+
+    #[test]
+    fn both_scheduler_state_survives_connection_replacement() {
+        let mut scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(3).unwrap());
+        scheduler.record_assignment(JobKind::CrfSearch);
+        scheduler.record_assignment(JobKind::CrfSearch);
+
+        // Replacing the websocket connection does not replace the scheduler.
+        assert_eq!(scheduler.preferred(), JobKind::CrfSearch);
+        scheduler.record_assignment(JobKind::CrfSearch);
+        assert_eq!(scheduler.preferred(), JobKind::Encode);
+    }
+
+    #[test]
+    fn work_ratio_does_not_change_worker_capacity() {
+        let capacity = WorkerCapacity::new(16, WorkerMode::Both, None);
+        let scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(10).unwrap());
+
+        assert_eq!(capacity.max_active_jobs(), 2);
+        assert_eq!(scheduler.preferred(), JobKind::CrfSearch);
     }
 
     #[test]
@@ -5378,6 +5515,7 @@ mod tests {
             local_path: Some(input.clone()),
             worker_mode: WorkerMode::Encode,
             max_active_jobs: None,
+            crf_searches_per_encode: std::num::NonZeroUsize::new(1).unwrap(),
         };
         let local = tokio::task::LocalSet::new();
         let result = local
@@ -5610,6 +5748,7 @@ mod tests {
         let mut pending = HashMap::from([("3".into(), (JobKind::CrfSearch, None))]);
         let mut no_work = HashMap::new();
         let mut pending_acks = HashMap::new();
+        let mut scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(1).unwrap());
         let (output, _outputs) = mpsc::unbounded_channel();
         let mut completed_pulls = 0;
         let frame = Message::Text(serde_json::to_string(&ServerFrame::reply(
@@ -5624,6 +5763,7 @@ mod tests {
             &mut pending,
             &mut no_work,
             &mut pending_acks,
+            &mut scheduler,
             &output,
             &mut completed_pulls,
             None,
@@ -6967,6 +7107,7 @@ mod tests {
             std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
         );
         assert_eq!(frame[4]["capabilities"]["max_active_jobs"], 1);
+        assert_eq!(frame[4]["capabilities"]["crf_searches_per_encode"], 1);
     }
 
     async fn expect_pull_work<R>(reader: &mut R, request_ref: u64)

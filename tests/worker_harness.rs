@@ -58,7 +58,8 @@ async fn worker_binary_handles_job_assignment() -> Result<()> {
                         1
                     } else {
                         2
-                    }
+                    },
+                    "crf_searches_per_encode": 1
                 }
             }]),
         );

@@ -148,6 +148,7 @@ pub(crate) struct Capabilities {
     pub(crate) mode: String,
     pub(crate) logical_cpus: usize,
     pub(crate) max_active_jobs: usize,
+    pub(crate) crf_searches_per_encode: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -597,6 +598,7 @@ mod tests {
                     mode: "crf-search".into(),
                     logical_cpus: 8,
                     max_active_jobs: 1,
+                    crf_searches_per_encode: 1,
                 },
             }),
         );
@@ -617,7 +619,8 @@ mod tests {
                         "encode": false,
                         "mode": "crf-search",
                         "logical_cpus": 8,
-                        "max_active_jobs": 1
+                        "max_active_jobs": 1,
+                        "crf_searches_per_encode": 1
                     }
                 }
             ])
