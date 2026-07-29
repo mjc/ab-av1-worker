@@ -1194,9 +1194,7 @@ fn heartbeat_payload(path: &Path, active_video_id: Option<u64>) -> HeartbeatPayl
 }
 
 fn worker_job_input_dir(job_id: &str) -> PathBuf {
-    std::env::current_dir()
-        .expect("current working directory")
-        .join(format!("ab-av1-worker-{}", job_id))
+    std::env::temp_dir().join(format!("ab-av1-worker-{}", job_id))
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -6148,6 +6146,14 @@ mod tests {
         }));
 
         assert_eq!(status, "job_assigned (job_id=job-123)");
+    }
+
+    #[test]
+    fn worker_job_input_dir_uses_system_temp_dir() {
+        assert_eq!(
+            worker_job_input_dir("job-123"),
+            std::env::temp_dir().join("ab-av1-worker-job-123")
+        );
     }
 
     #[test]
