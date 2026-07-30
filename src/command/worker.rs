@@ -47,6 +47,7 @@ const TRANSFER_CHUNK_TYPE: u8 = 1;
 const TRANSFER_CHUNK_HEADER_LEN: usize = 52;
 const MAX_TRANSFER_FRAME_BYTES: usize = 640 * 1024 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const EVENT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 const HTTP_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 static HEARTBEAT_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
@@ -893,6 +894,13 @@ async fn run_worker_job_with_reporting(
                                             }
                                         }
                                     }
+                                    Some(WorkerPush::ChannelClosed) => {
+                                        debug!(
+                                            job_id = %job.assignment.job_id,
+                                            "worker channel closed during job"
+                                        );
+                                        *worker = None;
+                                    }
                                     _ => {}
                                 }
                             }
@@ -1317,6 +1325,7 @@ enum WorkerPush {
     Cancel(CancelPayload),
     Control(ControlPayload),
     Started(TransferStartedPayload),
+    ChannelClosed,
 }
 
 #[derive(Debug)]
@@ -1368,6 +1377,21 @@ struct MultiplexJob {
 struct PendingEventAck {
     job_id: String,
     name: &'static str,
+    sent_at: Instant,
+}
+
+impl PendingEventAck {
+    fn new(job_id: impl Into<String>, name: &'static str) -> Self {
+        Self {
+            job_id: job_id.into(),
+            name,
+            sent_at: Instant::now(),
+        }
+    }
+
+    fn deadline(&self, timeout: Duration) -> Instant {
+        self.sent_at + timeout
+    }
 }
 
 struct MultiplexedWorker {
@@ -2226,9 +2250,15 @@ impl ConnectedWorker {
         while let Some(message) = self.socket.next().await {
             match message.context("read websocket message")? {
                 Message::Text(text) => {
-                    if let Some(WorkerPush::Control(control)) = decode_worker_push(&text)? {
-                        self.pending_control = Some(control.action);
-                        continue;
+                    match decode_worker_push(&text)? {
+                        Some(WorkerPush::Control(control)) => {
+                            self.pending_control = Some(control.action);
+                            continue;
+                        }
+                        Some(WorkerPush::ChannelClosed) => {
+                            bail!("worker channel closed while waiting for work");
+                        }
+                        _ => {}
                     }
                     if let Some(reply) = decode_expected_reply(&text, &expected_ref, "pull_work")? {
                         return reply;
@@ -2358,6 +2388,9 @@ impl ConnectedWorker {
                                     Ok(PendingJobOutcome::Waiting)
                                 }
                             },
+                            Some(WorkerPush::ChannelClosed) => {
+                                bail!("worker channel closed while waiting for input")
+                            }
                             Some(_) => Ok(PendingJobOutcome::Waiting),
                             None => Ok(PendingJobOutcome::Waiting),
                         }
@@ -2453,23 +2486,29 @@ impl ConnectedWorker {
                     | Some(Ok(Message::Binary(_)))
                     | Some(Ok(Message::Frame(_))) => {}
                     Some(Ok(Message::Text(text))) => {
-                        if let Some(WorkerPush::Control(control)) = decode_worker_push(&text)? {
-                            match control.action {
-                                ControlAction::Start | ControlAction::Resume => {
-                                    self.send_control_state(ControlState::Running, None).await?;
-                                    *control_state = WorkerControlState::Running;
-                                    return Ok(stopped);
-                                }
-                                ControlAction::Pause if !stopped => {
-                                    self.send_control_state(ControlState::Paused, None).await?;
-                                    *control_state = WorkerControlState::Paused;
-                                }
-                                ControlAction::Pause | ControlAction::Stop => {
-                                    self.send_control_state(ControlState::Stopped, None).await?;
-                                    *control_state = WorkerControlState::Stopped;
-                                    stopped = true;
+                        match decode_worker_push(&text)? {
+                            Some(WorkerPush::Control(control)) => {
+                                match control.action {
+                                    ControlAction::Start | ControlAction::Resume => {
+                                        self.send_control_state(ControlState::Running, None).await?;
+                                        *control_state = WorkerControlState::Running;
+                                        return Ok(stopped);
+                                    }
+                                    ControlAction::Pause if !stopped => {
+                                        self.send_control_state(ControlState::Paused, None).await?;
+                                        *control_state = WorkerControlState::Paused;
+                                    }
+                                    ControlAction::Pause | ControlAction::Stop => {
+                                        self.send_control_state(ControlState::Stopped, None).await?;
+                                        *control_state = WorkerControlState::Stopped;
+                                        stopped = true;
+                                    }
                                 }
                             }
+                            Some(WorkerPush::ChannelClosed) => {
+                                bail!("worker channel closed while worker stopped")
+                            }
+                            _ => {}
                         }
                     }
                     Some(Ok(Message::Close(frame))) => bail!("websocket closed while worker stopped: {frame:?}"),
@@ -3235,6 +3274,9 @@ async fn run_multiplexed_worker(
     let mut scheduler = WorkScheduler::new(config.crf_searches_per_encode());
     let mut reconnect = tokio::time::interval(runtime.reconnect_base_delay);
     reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
     let mut offline_deadline = None;
 
     loop {
@@ -3255,6 +3297,7 @@ async fn run_multiplexed_worker(
 
         let mut connection_lost = false;
         if let Some(worker) = connection.as_mut() {
+            let event_ack_deadline = next_event_ack_deadline(&pending_acks, EVENT_ACK_TIMEOUT);
             tokio::select! {
                 item = outputs.recv() => {
                     connection_lost = !handle_multiplex_output(
@@ -3278,6 +3321,17 @@ async fn run_multiplexed_worker(
                         completed_pulls,
                         config.local_path.as_deref(),
                     ).await?;
+                }
+                _ = heartbeat.tick() => {
+                    connection_lost = !send_multiplex_heartbeat(
+                        worker,
+                        &jobs,
+                        &mut pending_acks,
+                    ).await;
+                }
+                _ = wait_for_deadline(event_ack_deadline) => {
+                    warn!("worker channel acknowledgement timed out; reconnecting");
+                    connection_lost = true;
                 }
                 _ = reconnect.tick() => {
                     no_work.clear();
@@ -3307,6 +3361,9 @@ async fn run_multiplexed_worker(
                                 offline_deadline = None;
                                 reconnect = tokio::time::interval(runtime.reconnect_base_delay);
                                 reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                                heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+                                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                                heartbeat.tick().await;
                             }
                         }
                         Err(error) => {
@@ -3314,7 +3371,7 @@ async fn run_multiplexed_worker(
                         }
                     }
                 }
-                _ = wait_for_offline_deadline(offline_deadline) => {
+                _ = wait_for_deadline(offline_deadline) => {
                     expire_offline_jobs(&mut jobs, &mut pending, &mut outputs).await?;
                     bail!("coordinator unavailable until worker job lease expired");
                 }
@@ -3337,12 +3394,50 @@ async fn run_multiplexed_worker(
     }
 }
 
-async fn wait_for_offline_deadline(deadline: Option<Instant>) {
+async fn wait_for_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => {
             tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
         }
         None => std::future::pending().await,
+    }
+}
+
+fn next_event_ack_deadline(
+    pending_acks: &HashMap<String, PendingEventAck>,
+    timeout: Duration,
+) -> Option<Instant> {
+    pending_acks.values().map(|ack| ack.deadline(timeout)).min()
+}
+
+async fn send_multiplex_heartbeat(
+    worker: &mut MultiplexedWorker,
+    jobs: &HashMap<String, MultiplexJob>,
+    pending_acks: &mut HashMap<String, PendingEventAck>,
+) -> bool {
+    if pending_acks.values().any(|ack| ack.name == "heartbeat") {
+        return true;
+    }
+
+    let active_job = jobs.values().find(|job| !job.finished);
+    let path = active_job.map_or(Path::new("."), |job| job.job.input_dir.as_path());
+    let active_video_id = active_job.map(|job| job.job.assignment.video_id);
+
+    match worker
+        .send_event(ClientEvent::Heartbeat(heartbeat_payload(
+            path,
+            active_video_id,
+        )))
+        .await
+    {
+        Ok(reference) => {
+            pending_acks.insert(reference, PendingEventAck::new("", "heartbeat"));
+            true
+        }
+        Err(error) => {
+            debug!(error = %error, "multiplexed worker heartbeat failed");
+            false
+        }
     }
 }
 
@@ -3563,13 +3658,7 @@ async fn send_multiplex_event(
     match worker.send_event(event).await {
         Ok(reference) => {
             if event_requires_ack(name) {
-                pending_acks.insert(
-                    reference,
-                    PendingEventAck {
-                        job_id: job_id.to_owned(),
-                        name,
-                    },
-                );
+                pending_acks.insert(reference, PendingEventAck::new(job_id, name));
             }
             true
         }
@@ -3797,6 +3886,10 @@ async fn handle_multiplex_frame(
                             .send(JobCommand::TransferStarted(started))
                             .map_err(|_| anyhow!("worker input command channel closed"))?;
                     }
+                }
+                Some(WorkerPush::ChannelClosed) => {
+                    debug!("worker Phoenix channel closed");
+                    return Ok(false);
                 }
                 None => {}
             }
@@ -4128,6 +4221,7 @@ fn decode_worker_push(text: &str) -> Result<Option<WorkerPush>> {
         "received worker push"
     );
     let push = match frame.3.as_str() {
+        "phx_error" | "phx_close" => WorkerPush::ChannelClosed,
         "cancel" => WorkerPush::Cancel(
             serde_json::from_value::<CancelPayload>(payload.clone())
                 .context("decode cancel push")?,
@@ -4928,20 +5022,14 @@ mod tests {
         let mut pending = HashMap::new();
         let mut pending_acks = HashMap::from([(
             "7".into(),
-            PendingEventAck {
-                job_id: "encode-123".into(),
-                name: "encode_completed",
-            },
+            PendingEventAck::new("encode-123", "encode_completed"),
         )]);
 
         remove_finished_job_if_acknowledged("encode-123", &mut jobs, &mut pending, &pending_acks);
         assert!(jobs.contains_key("encode-123"));
 
         acknowledge_multiplex_event(
-            &PendingEventAck {
-                job_id: "encode-123".into(),
-                name: "control_state",
-            },
+            &PendingEventAck::new("encode-123", "control_state"),
             &mut jobs,
             &mut pending,
         );
@@ -4965,6 +5053,32 @@ mod tests {
     }
 
     #[test]
+    fn phoenix_channel_errors_are_connection_loss() -> Result<()> {
+        for event in ["phx_error", "phx_close"] {
+            let text = json!([null, null, CRF_SEARCH_TOPIC, event, {}]).to_string();
+
+            assert!(matches!(
+                decode_worker_push(&text)?,
+                Some(WorkerPush::ChannelClosed)
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn pending_event_ack_sets_liveness_deadline() {
+        let timeout = Duration::from_secs(30);
+        let ack = PendingEventAck {
+            job_id: String::new(),
+            name: "heartbeat",
+            sent_at: Instant::now() - timeout,
+        };
+
+        assert!(ack.deadline(timeout) <= Instant::now());
+    }
+
+    #[test]
     fn discarded_active_attempt_is_cancelled() -> Result<()> {
         let (command, mut commands) = mpsc::unbounded_channel();
         let mut jobs = HashMap::from([(
@@ -4979,10 +5093,7 @@ mod tests {
         let mut pending = HashMap::new();
 
         handle_multiplex_ack(
-            &PendingEventAck {
-                job_id: "encode-stale".into(),
-                name: "job_active",
-            },
+            &PendingEventAck::new("encode-stale", "job_active"),
             &serde_json::json!({
                 "accepted": false,
                 "discarded": true,
@@ -5937,6 +6048,42 @@ mod tests {
 
         assert!(!connection_is_lost);
         assert_eq!(completed_pulls, 0);
+        coordinator.finish().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multiplexed_channel_error_requests_reconnect() -> Result<()> {
+        let coordinator = FakeCoordinator::with_no_work_replies(0).await?;
+        let connected =
+            ConnectedWorker::connect(&coordinator.worker_config(WorkerTestConfig::continuous()))
+                .await?;
+        let mut worker = MultiplexedWorker::from_connected(connected);
+        let mut jobs = HashMap::new();
+        let mut pending = HashMap::new();
+        let mut no_work = HashMap::new();
+        let mut pending_acks = HashMap::new();
+        let mut scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(1).unwrap());
+        let (output, _outputs) = mpsc::unbounded_channel();
+        let mut completed_pulls = 0;
+        let frame =
+            Message::Text(json!([null, null, CRF_SEARCH_TOPIC, "phx_error", {}]).to_string());
+
+        let connection_is_alive = handle_multiplex_frame(
+            &mut worker,
+            Some(Ok(frame)),
+            &mut jobs,
+            &mut pending,
+            &mut no_work,
+            &mut pending_acks,
+            &mut scheduler,
+            &output,
+            &mut completed_pulls,
+            None,
+        )
+        .await?;
+
+        assert!(!connection_is_alive);
         coordinator.finish().await;
         Ok(())
     }
