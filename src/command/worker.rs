@@ -3873,6 +3873,8 @@ fn handle_multiplex_ack(
                 }))
                 .map_err(|_| anyhow!("worker job command channel closed"))?;
         }
+        jobs.remove(&ack.job_id);
+        pending.retain(|_, (_, resend)| resend.as_deref() != Some(&ack.job_id));
         return Ok(());
     }
 
@@ -5061,7 +5063,7 @@ mod tests {
             Ok(JobCommand::Cancel(CancelPayload { ref job_id, .. }))
                 if job_id == "encode-stale"
         ));
-        assert!(jobs.contains_key("encode-stale"));
+        assert!(!jobs.contains_key("encode-stale"));
         Ok(())
     }
 
