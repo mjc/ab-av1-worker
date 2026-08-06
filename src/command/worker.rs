@@ -2471,7 +2471,7 @@ impl ConnectedWorker {
                     | WorkerFrame::Ping(_) => {}
                 },
                 _ = tokio::time::sleep(idle_delay) => {
-                    self.send_event(ClientEvent::Heartbeat(heartbeat_payload(Path::new("."), None))).await?;
+                    self.send_event(ClientEvent::Heartbeat(heartbeat_payload(&std::env::temp_dir(), None))).await?;
                 }
             }
         }
