@@ -551,6 +551,26 @@ impl WorkerJob {
             .find_map(|cause| cause.downcast_ref::<ProcessExitError>())
             .and_then(ProcessExitError::code)
             .unwrap_or(crate::FAILURE_EXIT_CODE);
+        let no_good_crf =
+            error
+                .chain()
+                .find_map(|cause| match cause.downcast_ref::<crf_search::Error>() {
+                    Some(crf_search::Error::NoGoodCrf { last }) => Some(last),
+                    Some(crf_search::Error::Other(_)) | None => None,
+                });
+        let max_encoded_percent = self
+            .crf_search_config()
+            .ok()
+            .map(|config| config.max_encoded_percent.get());
+        let category = match (no_good_crf, max_encoded_percent) {
+            (Some(last), Some(max)) if last.enc.encode_percent > max => "size_limits",
+            (Some(_), _) => "crf_optimization",
+            (None, _) => "process_failure",
+        };
+        let argv = match self.assignment.job_type {
+            JobKind::CrfSearch => &self.assignment.crf_search_args,
+            JobKind::Encode => &self.assignment.encode_args,
+        };
 
         FailureReportPayload {
             job_id: self.assignment.job_id.clone(),
@@ -560,7 +580,7 @@ impl WorkerJob {
                 JobKind::Encode => "encoding",
             }
             .into(),
-            category: "process_failure".into(),
+            category: category.into(),
             message: error.to_string(),
             code: format!("EXIT_{exit_code}"),
             context: json!({
@@ -568,6 +588,9 @@ impl WorkerJob {
                 "source_name": self.assignment.source_name,
                 "exit_code": exit_code,
                 "error_chain": format!("{error:#}"),
+                "argv": argv,
+                "encode_percent": no_good_crf.map(|last| last.enc.encode_percent),
+                "max_encoded_percent": max_encoded_percent,
             }),
             retriable: false,
             stderr_excerpt: Some(format!("{error:#}")),
@@ -4762,6 +4785,58 @@ mod tests {
         assert_eq!(payload.category, "process_failure");
         assert_eq!(payload.code, "EXIT_254");
         assert_eq!(payload.context["exit_code"], json!(254));
+        assert_eq!(payload.context["argv"], json!(["crf-search", "movie.mkv"]));
+    }
+
+    #[test]
+    fn worker_crf_failure_reports_why_no_crf_was_acceptable() {
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::CrfSearch,
+                job_id: "crf-search-123".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 1_000,
+                chunk_size_bytes: 256,
+                target_vmaf: 95.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: vec![
+                    "crf-search".into(),
+                    "--max-encoded-percent".into(),
+                    "80".into(),
+                    "--input".into(),
+                    "movie.mkv".into(),
+                ],
+            },
+            PathBuf::from("/tmp/crf-search-123"),
+            PathBuf::from("/tmp/crf-search-123/movie.mkv"),
+        );
+        let sample = crf_search::Sample::new(
+            30.0,
+            30,
+            sample_encode::Output {
+                vmaf_score: Some(95.0),
+                xpsnr_score: None,
+                predicted_encode_size: 1_000,
+                encode_percent: 81.0,
+                predicted_encode_time: Duration::from_secs(60),
+                from_cache: false,
+            },
+        );
+
+        let error = anyhow!(crf_search::Error::Other(anyhow!(
+            crf_search::Error::NoGoodCrf { last: sample }
+        )))
+        .context("worker CRF search failed");
+        let payload = job.failure_payload(&error);
+
+        assert_eq!(payload.category, "size_limits");
+        assert_eq!(payload.context["encode_percent"], json!(81.0));
+        assert_eq!(payload.context["max_encoded_percent"], json!(80.0));
     }
 
     #[test]

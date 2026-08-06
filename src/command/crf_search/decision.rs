@@ -88,7 +88,7 @@ pub fn decide_next_transition(
             if lower_score >= min_score {
                 Error::ensure_or_no_good_crf(
                     lower.enc.encode_percent <= max_encoded_percent.get(),
-                    sample,
+                    lower,
                 )?;
                 Ok(SearchTransition::RunResultThenDone {
                     run_result: sample.clone(),
@@ -146,4 +146,51 @@ pub fn guess_progress(run: usize, sample_progress: f32, thorough: bool) -> f64 {
     };
     let sample_progress = sample_progress.clamp(0.0, 1.0) as f64;
     (((run - 1) as f64 + sample_progress) * BAR_LEN as f64 / total_runs_guess).min(BAR_LEN as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::sample_encode;
+    use std::time::Duration;
+
+    fn sample(q: i64, score: f32, encode_percent: f64) -> Sample {
+        Sample::new(
+            q as f32,
+            q,
+            sample_encode::Output {
+                vmaf_score: Some(score),
+                xpsnr_score: None,
+                predicted_encode_size: 1_000,
+                encode_percent,
+                predicted_encode_time: Duration::from_secs(60),
+                from_cache: false,
+            },
+        )
+    }
+
+    #[test]
+    fn adjacent_quality_candidate_reports_the_oversized_candidate() {
+        let lower = sample(30, 96.0, 81.0);
+        let current = sample(31, 94.0, 50.0);
+        let decision = SearchDecision {
+            min_score: 95.0,
+            higher_tolerance: 1.0,
+            thorough: false,
+            cut_on_iter2: false,
+            run: 2,
+            min_q: 5,
+            max_q: 70,
+            use_xpsnr: false,
+            max_encoded_percent: MaxEncodedPercent::new(80.0).expect("valid percentage"),
+        };
+
+        let error = decide_next_transition(&current, 94.0, &[lower], decision)
+            .expect_err("the quality candidate exceeds the size limit");
+
+        assert!(matches!(
+            error,
+            Error::NoGoodCrf { last } if last.enc.encode_percent == 81.0
+        ));
+    }
 }
