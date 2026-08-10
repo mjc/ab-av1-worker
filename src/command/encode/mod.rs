@@ -105,6 +105,34 @@ pub(crate) async fn run_with_spawner(
     Ok(())
 }
 
+pub(crate) async fn run_worker(
+    config: EncodeConfig,
+    probe: Arc<Ffprobe>,
+) -> anyhow::Result<(PathBuf, FinishedEncode)> {
+    run_worker_with_progress(config, probe, |_fps, _time, _output| {}).await
+}
+
+pub(crate) async fn run_worker_with_progress<F>(
+    config: EncodeConfig,
+    probe: Arc<Ffprobe>,
+    on_progress: F,
+) -> anyhow::Result<(PathBuf, FinishedEncode)>
+where
+    F: FnMut(f32, Duration, &Path),
+{
+    let bar = ProgressBar::hidden();
+    #[cfg(test)]
+    let spawner = spawner::ThreadLocalFixtureSpawner;
+    #[cfg(not(test))]
+    let spawner = spawner::FfmpegSpawner;
+
+    let plan = EncodePlan::build(config, probe).map_err(EncodePlanError::into_anyhow)?;
+    let output_path = plan.output_path().to_path_buf();
+    let run = running::run_encode_with_progress(plan, &bar, &spawner, on_progress).await?;
+    let finished = FinishedEncode::load(run.input, run.output, run.stream_sizes).await?;
+    Ok((output_path, finished))
+}
+
 /// * vid.mp4 -> "mp4"
 /// * vid.??? -> "mkv"
 /// * image.??? -> "avif"

@@ -42,9 +42,24 @@ async fn worker_binary_handles_job_assignment() -> Result<()> {
                 .expect("announce message"),
             json!(["1", "2", "workers:crf_search", "announce", {
                 "worker_id": "abav1-dev",
+                "hostname": local_hostname(),
                 "protocol_version": 1,
                 "version": env!("CARGO_PKG_VERSION"),
-                "capabilities": {"crf_search": true}
+                "capabilities": {
+                    "crf_search": true,
+                    "encode": true,
+                    "mode": "both",
+                    "logical_cpus": std::thread::available_parallelism()
+                        .map_or(1, std::num::NonZeroUsize::get),
+                    "max_active_jobs": if std::thread::available_parallelism()
+                        .map_or(1, std::num::NonZeroUsize::get)
+                        <= 8
+                    {
+                        1
+                    } else {
+                        2
+                    }
+                }
             }]),
         );
         send_text_message(
@@ -62,7 +77,9 @@ async fn worker_binary_handles_job_assignment() -> Result<()> {
                 .await
                 .expect("pull_work frame")
                 .expect("pull_work message"),
-            json!(["1", "3", "workers:crf_search", "pull_work", {}]),
+            json!(["1", "3", "workers:crf_search", "pull_work", {
+                "job_type": "crf_search"
+            }]),
         );
         send_text_message(
             &mut writer,
@@ -106,6 +123,15 @@ async fn worker_binary_handles_job_assignment() -> Result<()> {
 
     server.await.expect("server task");
     Ok(())
+}
+
+fn local_hostname() -> Option<String> {
+    std::env::var("HOSTNAME").ok().or_else(|| {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .ok()
+            .map(|hostname| hostname.trim().to_owned())
+            .filter(|hostname| !hostname.is_empty())
+    })
 }
 
 async fn send_text_message<W>(writer: &mut W, value: Value)
