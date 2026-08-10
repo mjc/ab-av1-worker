@@ -392,6 +392,7 @@ impl Encode {
         &self,
         crf: f32,
         probe: &Ffprobe,
+        output_ext: &str,
     ) -> anyhow::Result<FfmpegEncodeArgs<'_>> {
         let vcodec = &self.encoder.0;
         let svtav1 = vcodec.as_ref() == "libsvtav1";
@@ -451,7 +452,7 @@ impl Encode {
             args.push(keyint.to_string().into());
         }
 
-        for (name, val) in self.encoder.default_ffmpeg_args() {
+        for (name, val) in self.encoder.default_ffmpeg_args(output_ext) {
             if !args.iter().any(|arg| &**arg == name) {
                 args.push(name.to_string().into());
                 args.push(val.to_string().into());
@@ -587,7 +588,7 @@ impl Encoder {
     }
 
     /// Additional encoder specific ffmpeg arg defaults.
-    fn default_ffmpeg_args(&self) -> &[(&'static str, &'static str)] {
+    fn default_ffmpeg_args(&self, output_ext: &str) -> &[(&'static str, &'static str)] {
         match self.as_str() {
             // add `-b:v 0` for aom & vp9 to use "constant quality" mode
             "libaom-av1" | "libvpx-vp9" => &[("-b:v", "0")],
@@ -597,6 +598,12 @@ impl Encoder {
                 ("-extbrc", "1"),
                 ("-look_ahead_depth", "40"),
             ],
+            "libx265"
+                if output_ext.eq_ignore_ascii_case("mp4")
+                    || output_ext.eq_ignore_ascii_case("mov") =>
+            {
+                &[("-tag:v", "hvc1")]
+            }
             _ => &[],
         }
     }
@@ -800,7 +807,9 @@ fn svtav1_to_ffmpeg_args_default_over_3m() {
         output_args,
         input_args,
         video_only,
-    } = enc.to_ffmpeg_args(32.0, &probe).expect("to_ffmpeg_args");
+    } = enc
+        .to_ffmpeg_args(32.0, &probe, "mkv")
+        .expect("to_ffmpeg_args");
 
     assert_eq!(&*vcodec, "libsvtav1");
     assert_eq!(input, enc.input);
@@ -863,7 +872,9 @@ fn svtav1_to_ffmpeg_args_default_under_3m() {
         output_args,
         input_args,
         video_only,
-    } = enc.to_ffmpeg_args(32.0, &probe).expect("to_ffmpeg_args");
+    } = enc
+        .to_ffmpeg_args(32.0, &probe, "mkv")
+        .expect("to_ffmpeg_args");
 
     assert_eq!(&*vcodec, "libsvtav1");
     assert_eq!(input, enc.input);
@@ -1021,7 +1032,7 @@ fn to_ffmpeg_args_libvpx_vp9_constant_quality_default() {
         enc_input_args: vec![],
     };
     let args = enc
-        .to_ffmpeg_args(32.0, &test_probe(120, 24.0))
+        .to_ffmpeg_args(32.0, &test_probe(120, 24.0), "mkv")
         .expect("to_ffmpeg_args");
     assert!(
         args.output_args
@@ -1030,6 +1041,45 @@ fn to_ffmpeg_args_libvpx_vp9_constant_quality_default() {
         "libvpx-vp9 needs -b:v 0 for CRF mode: {:?}",
         args.output_args
     );
+}
+
+#[test]
+fn libx265_defaults_hvc1_only_for_mp4_and_mov() {
+    let mut enc = Encode {
+        encoder: Encoder("libx265".into()),
+        input: "vid.mkv".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec![],
+        enc_args: vec![],
+        enc_input_args: vec![],
+    };
+    let probe = test_probe(120, 24.0);
+    let has_tag = |ext| {
+        enc.to_ffmpeg_args(32.0, &probe, ext)
+            .expect("to_ffmpeg_args")
+            .output_args
+            .windows(2)
+            .any(|args| args[0].as_str() == "-tag:v" && args[1].as_str() == "hvc1")
+    };
+
+    assert!(has_tag("mp4"));
+    assert!(has_tag("MOV"));
+    assert!(!has_tag("mkv"));
+
+    enc.enc_args.push("tag:v=hev1".parse().unwrap());
+    let args = enc
+        .to_ffmpeg_args(32.0, &probe, "mp4")
+        .expect("to_ffmpeg_args")
+        .output_args;
+    assert!(
+        args.windows(2)
+            .any(|args| args[0].as_str() == "-tag:v" && args[1].as_str() == "hev1")
+    );
+    assert!(!args.iter().any(|arg| arg.as_str() == "hvc1"));
 }
 
 #[cfg(test)]
@@ -1182,7 +1232,7 @@ fn to_ffmpeg_args_rejects_svt_on_non_svtav1() {
     };
     // execute
     let err = enc
-        .to_ffmpeg_args(32.0, &test_probe(120, 24.0))
+        .to_ffmpeg_args(32.0, &test_probe(120, 24.0), "mkv")
         .expect_err("svt on x264");
     // assert
     assert!(
@@ -1208,7 +1258,7 @@ fn to_ffmpeg_args_libaom_defaults() {
     };
     // execute
     let args = enc
-        .to_ffmpeg_args(30.0, &test_probe(120, 24.0))
+        .to_ffmpeg_args(30.0, &test_probe(120, 24.0), "mkv")
         .expect("to_ffmpeg_args");
     // assert
     assert_eq!(args.pix_fmt, Some(PixelFormat::Yuv420p10le));
@@ -1241,7 +1291,7 @@ fn to_ffmpeg_args_qsv_defaults() {
     };
     // execute
     let args = enc
-        .to_ffmpeg_args(28.0, &test_probe(120, 24.0))
+        .to_ffmpeg_args(28.0, &test_probe(120, 24.0), "mkv")
         .expect("to_ffmpeg_args");
     // assert
     for (flag, val) in [
@@ -1276,7 +1326,7 @@ fn to_ffmpeg_args_vaapi_input_defaults() {
     };
     // execute
     let args = enc
-        .to_ffmpeg_args(28.0, &test_probe(120, 24.0))
+        .to_ffmpeg_args(28.0, &test_probe(120, 24.0), "mkv")
         .expect("to_ffmpeg_args");
     // assert
     assert!(
@@ -1308,7 +1358,7 @@ fn to_ffmpeg_args_vulkan_input_defaults() {
     };
     // execute
     let args = enc
-        .to_ffmpeg_args(28.0, &test_probe(120, 24.0))
+        .to_ffmpeg_args(28.0, &test_probe(120, 24.0), "mkv")
         .expect("to_ffmpeg_args");
     // assert
     assert!(
@@ -1335,7 +1385,7 @@ fn to_ffmpeg_args_merges_enc_svtav1_params() {
     };
     // execute
     let args = enc
-        .to_ffmpeg_args(32.0, &test_probe(60, 24.0))
+        .to_ffmpeg_args(32.0, &test_probe(60, 24.0), "mkv")
         .expect("to_ffmpeg_args");
     // assert
     let svt = args
@@ -1368,7 +1418,10 @@ fn to_ffmpeg_args_rejects_svtav1_params_for_non_svt_encoder() {
     };
 
     // execute / assert
-    assert!(enc.to_ffmpeg_args(32.0, &test_probe(60, 24.0)).is_err());
+    assert!(
+        enc.to_ffmpeg_args(32.0, &test_probe(60, 24.0), "mkv")
+            .is_err()
+    );
 }
 
 #[test]
@@ -1388,7 +1441,7 @@ fn to_ffmpeg_args_enc_input_none_disables_vaapi_defaults() {
     };
     // execute
     let args = enc
-        .to_ffmpeg_args(28.0, &test_probe(120, 24.0))
+        .to_ffmpeg_args(28.0, &test_probe(120, 24.0), "mkv")
         .expect("to_ffmpeg_args");
     // assert
     assert!(
@@ -1419,10 +1472,10 @@ fn to_ffmpeg_args_rejects_reserved_output_and_input_args() {
 
     // execute
     let output_err = enc_output
-        .to_ffmpeg_args(32.0, &test_probe(120, 24.0))
+        .to_ffmpeg_args(32.0, &test_probe(120, 24.0), "mkv")
         .expect_err("reserved -crf");
     let input_err = enc_input
-        .to_ffmpeg_args(32.0, &test_probe(120, 24.0))
+        .to_ffmpeg_args(32.0, &test_probe(120, 24.0), "mkv")
         .expect_err("reserved -preset");
 
     // assert
@@ -1447,7 +1500,7 @@ fn to_ffmpeg_args_explicit_keyint_with_vfilter_fps() {
     };
     // execute
     let args = enc
-        .to_ffmpeg_args(32.0, &test_probe(60, 30.0))
+        .to_ffmpeg_args(32.0, &test_probe(60, 30.0), "mkv")
         .expect("to_ffmpeg_args");
     // assert: vfilter fps=24 wins over probe fps=30 → 5s * 24 = 120
     assert!(
@@ -1474,7 +1527,7 @@ fn to_ffmpeg_args_scd_explicit_true_without_default_keyint() {
     };
     // execute
     let args = enc
-        .to_ffmpeg_args(32.0, &test_probe(60, 24.0))
+        .to_ffmpeg_args(32.0, &test_probe(60, 24.0), "mkv")
         .expect("to_ffmpeg_args");
     // assert
     let svt = args
