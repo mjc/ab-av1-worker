@@ -114,14 +114,14 @@ impl EncodePlan {
         &self.spawn
     }
 
-    pub fn begin(self) -> (PartialOutput, EncodeSession) {
-        let partial = self.planned.begin();
+    pub fn begin(self) -> anyhow::Result<(PartialOutput, EncodeSession)> {
+        let partial = self.planned.begin()?;
         let session = EncodeSession {
             input: self.input,
             probe: self.probe,
             spawn: self.spawn,
         };
-        (partial, session)
+        Ok((partial, session))
     }
 }
 
@@ -227,7 +227,7 @@ mod tests {
         assert!(plan.spawn_config().video_only);
         assert!(plan.spawn_config().stereo_downmix);
         assert!(plan.spawn_config().has_audio);
-        let (_partial, session) = plan.begin();
+        let (_partial, session) = plan.begin().expect("begin encode");
         assert!(session.ffmpeg_args().expect("ffmpeg args").video_only);
         let _ = fs::remove_file(input);
     }
