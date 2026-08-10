@@ -1,3 +1,14 @@
+# Unreleased (0.11.6)
+* libx265: Default `--enc tag:v=hvc1` for better compatibility. The ffmpeg default can be explicitly set with `--enc tag:v=hev1`.
+
+# v0.11.5
+* Encode to a temporary file before renaming to the final destination to ensure atomicity and prevent partially encoded files.
+* Fix auto-encode `--keep` function.
+* Add crf-search `--stdout-format json` outputting newline delimited json messages,
+  see [stdout-format-json.md](stdout-format-json.md).
+* Add `type`, `crf` & `from_cache` keys to the sample-encode `--stdout-format json` output.
+* Improve error handling when temp dirs have insufficient permissions.
+
 # v0.11.4
 * Fix "sample x/n ..." log formatting.
 * Fix graceful shutdown of ffmpeg child processes.
