@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const CRF_SEARCH_TOPIC: &str = "workers:crf_search";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ClientFrame(String, String, String, String, ClientPayload);
 
 impl ClientFrame {
@@ -18,11 +18,17 @@ impl ClientFrame {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ClientEvent {
     Join,
     Announce(AnnouncePayload),
-    PullWork,
+    PullWork(PullWorkPayload),
+    Heartbeat(HeartbeatPayload),
+    TransferProgress(TransferProgressPayload),
+    TransferFailure(TransferFailurePayload),
+    CrfSearchProgress(CrfSearchProgressPayload),
+    CrfSearchResult(CrfSearchResultPayload),
+    VideoFailed(FailureReportPayload),
 }
 
 impl ClientEvent {
@@ -30,20 +36,58 @@ impl ClientEvent {
         match self {
             Self::Join => ("phx_join", ClientPayload::Empty(EmptyPayload {})),
             Self::Announce(payload) => ("announce", ClientPayload::Announce(payload)),
-            Self::PullWork => ("pull_work", ClientPayload::Empty(EmptyPayload {})),
+            Self::PullWork(payload) => ("pull_work", ClientPayload::PullWork(payload)),
+            Self::Heartbeat(payload) => ("heartbeat", ClientPayload::Heartbeat(payload)),
+            Self::TransferProgress(payload) => (
+                "transfer_progress",
+                ClientPayload::TransferProgress(payload),
+            ),
+            Self::TransferFailure(payload) => {
+                ("transfer_failed", ClientPayload::TransferFailure(payload))
+            }
+            Self::CrfSearchProgress(payload) => {
+                ("crf_search_progress", ClientPayload::Progress(payload))
+            }
+            Self::CrfSearchResult(payload) => ("crf_search_result", ClientPayload::Result(payload)),
+            Self::VideoFailed(payload) => ("video_failed", ClientPayload::Failure(payload)),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 enum ClientPayload {
     Empty(EmptyPayload),
     Announce(AnnouncePayload),
+    PullWork(PullWorkPayload),
+    Heartbeat(HeartbeatPayload),
+    TransferProgress(TransferProgressPayload),
+    TransferFailure(TransferFailurePayload),
+    Progress(CrfSearchProgressPayload),
+    Result(CrfSearchResultPayload),
+    Failure(FailureReportPayload),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct EmptyPayload {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PullWorkPayload {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) input_missing: bool,
+}
+
+impl PullWorkPayload {
+    pub(crate) fn input_missing() -> Self {
+        Self {
+            input_missing: true,
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AnnouncePayload {
@@ -56,6 +100,64 @@ pub(crate) struct AnnouncePayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Capabilities {
     pub(crate) crf_search: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct HeartbeatPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cpu_percent: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) memory_rss_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) memory_total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) disk_free_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) disk_total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) active_video_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CrfSearchProgressPayload {
+    pub(crate) video_id: u64,
+    pub(crate) percent: f32,
+    pub(crate) filename: String,
+    pub(crate) eta: Option<f64>,
+    pub(crate) fps: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CrfSearchResultPayload {
+    pub(crate) job_id: String,
+    pub(crate) video_id: u64,
+    pub(crate) source_name: String,
+    pub(crate) crf: f32,
+    pub(crate) vmaf_score: Option<f32>,
+    pub(crate) xpsnr_score: Option<f32>,
+    pub(crate) predicted_encode_size: u64,
+    pub(crate) encode_percent: f64,
+    pub(crate) predicted_encode_time_secs: f64,
+    pub(crate) from_cache: bool,
+    pub(crate) score: f32,
+    pub(crate) percent: f64,
+    pub(crate) size: u64,
+    pub(crate) time: f64,
+    pub(crate) params: serde_json::Value,
+    pub(crate) target: f32,
+    pub(crate) chosen: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FailureReportPayload {
+    pub(crate) video_id: u64,
+    pub(crate) stage: String,
+    pub(crate) category: String,
+    pub(crate) message: String,
+    pub(crate) code: String,
+    pub(crate) context: serde_json::Value,
+    pub(crate) retriable: bool,
+    pub(crate) stderr_excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,11 +229,12 @@ pub(crate) enum ServerReply {
     NoWork(NoWorkPayload),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkStatus {
     NoWork,
     JobAssigned,
+    JobInProgress,
 }
 
 impl WorkStatus {
@@ -139,13 +242,53 @@ impl WorkStatus {
         match self {
             Self::NoWork => "no_work",
             Self::JobAssigned => "job_assigned",
+            Self::JobInProgress => "job_in_progress",
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for WorkStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let status = String::deserialize(deserializer)?;
+        match status.as_str() {
+            "no_work" => Ok(Self::NoWork),
+            "job_assigned" => Ok(Self::JobAssigned),
+            "job_in_progress" => Ok(Self::JobInProgress),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["no_work", "job_assigned", "job_in_progress"],
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct NoWorkPayload {
     pub(crate) status: WorkStatus,
+}
+
+impl<'de> Deserialize<'de> for NoWorkPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum NoWorkRepr {
+            Null(()),
+            Explicit { status: WorkStatus },
+        }
+
+        match NoWorkRepr::deserialize(deserializer)? {
+            NoWorkRepr::Null(()) => Ok(NoWorkPayload {
+                status: WorkStatus::NoWork,
+            }),
+            NoWorkRepr::Explicit { status } => Ok(NoWorkPayload { status }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,8 +298,11 @@ pub(crate) struct JobAssignedPayload {
     pub(crate) video_id: u64,
     pub(crate) source_name: String,
     pub(crate) size_bytes: u64,
+    #[serde(default)]
     pub(crate) chunk_size_bytes: u64,
     pub(crate) target_vmaf: f32,
+    #[serde(default)]
+    pub(crate) crf_search_args: Vec<String>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -188,24 +334,47 @@ pub(crate) struct CancelPayload {
     pub(crate) reason: String,
 }
 
-/// Chunk bytes travel in binary websocket frames.
-/// These metadata messages stay on the text side channel.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TransferStartedPayload {
+    pub(crate) chunk_size_bytes: u64,
+    pub(crate) size_bytes: u64,
+    pub(crate) source_name: String,
+    pub(crate) status: String,
+    pub(crate) total_bytes: u64,
+    pub(crate) total_chunks: u64,
+    pub(crate) transfer_id: String,
+    pub(crate) video_id: u64,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChunkTransferPayload {
-    pub(crate) job_id: String,
-    pub(crate) index: u64,
-    pub(crate) offset: u64,
-    pub(crate) size_bytes: u64,
-    pub(crate) checksum: String,
+    pub(crate) bytes_sent: u64,
+    pub(crate) chunk_index: u64,
+    pub(crate) crc32: u64,
+    pub(crate) data: String,
+    pub(crate) status: String,
+    pub(crate) total_bytes: u64,
+    pub(crate) total_chunks: u64,
+    pub(crate) transfer_id: String,
+    pub(crate) video_id: u64,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TransferProgressPayload {
     pub(crate) job_id: String,
+    pub(crate) transfer_id: String,
+    pub(crate) video_id: u64,
+    pub(crate) filename: String,
     pub(crate) received_bytes: u64,
     pub(crate) expected_bytes: Option<u64>,
+    pub(crate) percent: f64,
+    pub(crate) bytes_per_second: f64,
+    pub(crate) eta: Option<f64>,
+    pub(crate) chunk_index: u64,
+    pub(crate) total_chunks: u64,
 }
 
 #[allow(dead_code)]
@@ -287,6 +456,168 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_serializes_worker_telemetry_event() {
+        let frame = ClientFrame::new(
+            4,
+            ClientEvent::Heartbeat(HeartbeatPayload {
+                cpu_percent: Some(12.5),
+                memory_rss_bytes: Some(1234),
+                memory_total_bytes: Some(8192),
+                disk_free_bytes: Some(4096),
+                disk_total_bytes: Some(16_384),
+                active_video_id: Some(123),
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(frame).expect("serialize heartbeat"),
+            json!([
+                "1",
+                "4",
+                "workers:crf_search",
+                "heartbeat",
+                {
+                    "cpu_percent": 12.5,
+                    "memory_rss_bytes": 1234,
+                    "memory_total_bytes": 8192,
+                    "disk_free_bytes": 4096,
+                    "disk_total_bytes": 16_384,
+                    "active_video_id": 123,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn transfer_progress_serializes_transfer_stats_event() {
+        let frame = ClientFrame::new(
+            5,
+            ClientEvent::TransferProgress(TransferProgressPayload {
+                job_id: "job-123".into(),
+                transfer_id: "job-123".into(),
+                video_id: 123,
+                filename: "movie.mkv".into(),
+                received_bytes: 512,
+                expected_bytes: Some(1024),
+                percent: 50.0,
+                bytes_per_second: 256.0,
+                eta: Some(2.0),
+                chunk_index: 3,
+                total_chunks: 8,
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(frame).expect("serialize transfer progress"),
+            json!([
+                "1",
+                "5",
+                "workers:crf_search",
+                "transfer_progress",
+                {
+                    "job_id": "job-123",
+                    "transfer_id": "job-123",
+                    "video_id": 123,
+                    "filename": "movie.mkv",
+                    "received_bytes": 512,
+                    "expected_bytes": 1024,
+                    "percent": 50.0,
+                    "bytes_per_second": 256.0,
+                    "eta": 2.0,
+                    "chunk_index": 3,
+                    "total_chunks": 8,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn crf_search_progress_serializes_reencodarr_progress_event() {
+        let frame = ClientFrame::new(
+            5,
+            ClientEvent::CrfSearchProgress(CrfSearchProgressPayload {
+                video_id: 123,
+                percent: 42.5,
+                filename: "movie.mkv".into(),
+                eta: None,
+                fps: 27.25,
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(frame).expect("serialize crf progress"),
+            json!([
+                "1",
+                "5",
+                "workers:crf_search",
+                "crf_search_progress",
+                {
+                    "video_id": 123,
+                    "percent": 42.5,
+                    "filename": "movie.mkv",
+                    "eta": null,
+                    "fps": 27.25,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn crf_search_result_serializes_reencodarr_vmaf_model_event() {
+        let frame = ClientFrame::new(
+            6,
+            ClientEvent::CrfSearchResult(CrfSearchResultPayload {
+                job_id: "job-123".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                crf: 31.5,
+                vmaf_score: Some(96.2),
+                xpsnr_score: None,
+                predicted_encode_size: 123_456,
+                encode_percent: 42.5,
+                predicted_encode_time_secs: 87.5,
+                from_cache: true,
+                score: 96.2,
+                percent: 42.5,
+                size: 123_456,
+                time: 87.5,
+                params: json!({ "encoder": "libsvtav1", "preset": 8 }),
+                target: 95.0,
+                chosen: true,
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(frame).expect("serialize crf result"),
+            json!([
+                "1",
+                "6",
+                "workers:crf_search",
+                "crf_search_result",
+                {
+                    "job_id": "job-123",
+                    "video_id": 123,
+                    "source_name": "movie.mkv",
+                    "crf": 31.5,
+                    "vmaf_score": 96.19999694824219,
+                    "xpsnr_score": null,
+                    "predicted_encode_size": 123456,
+                    "encode_percent": 42.5,
+                    "predicted_encode_time_secs": 87.5,
+                    "from_cache": true,
+                    "score": 96.19999694824219,
+                    "percent": 42.5,
+                    "size": 123456,
+                    "time": 87.5,
+                    "params": { "encoder": "libsvtav1", "preset": 8 },
+                    "target": 95.0,
+                    "chosen": true,
+                }
+            ])
+        );
+    }
+
+    #[test]
     fn server_reply_parses_current_no_work_payload() {
         let reply: ServerFrame<ServerReply> = serde_json::from_value(json!([
             null,
@@ -299,6 +630,31 @@ mod tests {
             }
         ]))
         .expect("parse no_work reply");
+
+        assert_eq!(
+            reply,
+            ServerFrame::reply(
+                3,
+                ReplyBody::ok(ServerReply::NoWork(NoWorkPayload {
+                    status: WorkStatus::NoWork,
+                })),
+            )
+        );
+    }
+
+    #[test]
+    fn server_reply_parses_null_no_work_payload() {
+        let reply: ServerFrame<ServerReply> = serde_json::from_value(json!([
+            null,
+            "3",
+            "workers:crf_search",
+            "phx_reply",
+            {
+                "status": "ok",
+                "response": null
+            }
+        ]))
+        .expect("parse null no_work reply");
 
         assert_eq!(
             reply,
@@ -327,7 +683,14 @@ mod tests {
                     "source_name": "movie.mkv",
                     "size_bytes": 1024,
                     "chunk_size_bytes": 256,
-                    "target_vmaf": 96.5
+                    "target_vmaf": 96.5,
+                    "crf_search_args": [
+                        "crf-search",
+                        "--input",
+                        "/server/movie.mkv",
+                        "--min-vmaf",
+                        "96.5"
+                    ]
                 }
             }
         ]))
@@ -345,6 +708,65 @@ mod tests {
                     size_bytes: 1024,
                     chunk_size_bytes: 256,
                     target_vmaf: 96.5,
+                    crf_search_args: vec![
+                        "crf-search".into(),
+                        "--input".into(),
+                        "/server/movie.mkv".into(),
+                        "--min-vmaf".into(),
+                        "96.5".into(),
+                    ],
+                })),
+            )
+        );
+    }
+
+    #[test]
+    fn server_reply_parses_in_progress_assignment_without_chunk_size() {
+        let reply: ServerFrame<ServerReply> = serde_json::from_value(json!([
+            null,
+            "3",
+            "workers:crf_search",
+            "phx_reply",
+            {
+                "status": "ok",
+                "response": {
+                    "status": "job_in_progress",
+                    "source_name": "movie.mkv",
+                    "video_id": 123,
+                    "job_id": "job-123",
+                    "size_bytes": 1024,
+                    "target_vmaf": 95,
+                    "crf_search_args": [
+                        "crf-search",
+                        "--input",
+                        "/server/movie.mkv",
+                        "--min-vmaf",
+                        "95"
+                    ]
+                }
+            }
+        ]))
+        .expect("parse job_in_progress reply without chunk size");
+
+        assert_eq!(
+            reply,
+            ServerFrame::reply(
+                3,
+                ReplyBody::ok(ServerReply::JobAssigned(JobAssignedPayload {
+                    status: WorkStatus::JobInProgress,
+                    job_id: "job-123".into(),
+                    video_id: 123,
+                    source_name: "movie.mkv".into(),
+                    size_bytes: 1024,
+                    chunk_size_bytes: 0,
+                    target_vmaf: 95.0,
+                    crf_search_args: vec![
+                        "crf-search".into(),
+                        "--input".into(),
+                        "/server/movie.mkv".into(),
+                        "--min-vmaf".into(),
+                        "95".into(),
+                    ],
                 })),
             )
         );
@@ -438,24 +860,72 @@ mod tests {
     }
 
     #[test]
+    fn transfer_started_payload_serializes_metadata_side_channel() {
+        let payload = TransferStartedPayload {
+            chunk_size_bytes: 1_048_576,
+            size_bytes: 9_560_739_312,
+            source_name: "movie.mkv".into(),
+            status: "transfer_started".into(),
+            total_bytes: 9_560_739_312,
+            total_chunks: 9_118,
+            transfer_id: "job-123".into(),
+            video_id: 123,
+        };
+
+        assert_eq!(
+            serde_json::to_value(payload).expect("serialize transfer started"),
+            json!({
+                "chunk_size_bytes": 1_048_576,
+                "size_bytes": 9_560_739_312u64,
+                "source_name": "movie.mkv",
+                "status": "transfer_started",
+                "total_bytes": 9_560_739_312u64,
+                "total_chunks": 9_118,
+                "transfer_id": "job-123",
+                "video_id": 123,
+            })
+        );
+    }
+
+    #[test]
     fn chunk_transfer_payload_serializes_metadata_side_channel() {
         let payload = ChunkTransferPayload {
-            job_id: "job-123".into(),
-            index: 7,
-            offset: 8192,
-            size_bytes: 4096,
-            checksum: "deadbeef".into(),
+            bytes_sent: 4096,
+            chunk_index: 7,
+            crc32: 0xdead_beef,
+            data: "deadbeef".into(),
+            status: "transfer_chunk".into(),
+            total_bytes: 9_560_739_312,
+            total_chunks: 9_118,
+            transfer_id: "job-123".into(),
+            video_id: 123,
         };
 
         assert_eq!(
             serde_json::to_value(payload).expect("serialize chunk transfer"),
             json!({
-                "job_id": "job-123",
-                "index": 7,
-                "offset": 8192,
-                "size_bytes": 4096,
-                "checksum": "deadbeef",
+                "bytes_sent": 4096,
+                "chunk_index": 7,
+                "crc32": 3735928559u64,
+                "data": "deadbeef",
+                "status": "transfer_chunk",
+                "total_bytes": 9_560_739_312u64,
+                "total_chunks": 9_118,
+                "transfer_id": "job-123",
+                "video_id": 123,
             })
+        );
+    }
+
+    #[test]
+    fn pull_work_payload_omits_default_and_reports_missing_input() {
+        assert_eq!(
+            serde_json::to_value(PullWorkPayload::default()).expect("serialize pull_work"),
+            json!({})
+        );
+        assert_eq!(
+            serde_json::to_value(PullWorkPayload::input_missing()).expect("serialize pull_work"),
+            json!({"input_missing": true})
         );
     }
 
