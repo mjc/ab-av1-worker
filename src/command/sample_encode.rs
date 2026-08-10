@@ -24,7 +24,7 @@ use crate::{
     vmaf::{self, VmafOut},
     xpsnr::{self, XpsnrOut},
 };
-use anyhow::ensure;
+use anyhow::{Context, ensure};
 use clap::{ArgAction, Parser};
 use console::style;
 use futures_util::Stream;
@@ -246,7 +246,7 @@ pub fn run(
         let (tx, mut sample_tasks) = tokio::sync::mpsc::unbounded_channel();
         let sample_temp = temp_dir.clone();
         let sample_in = input.clone();
-        tokio::task::spawn_local(async move {
+        let sample_task = tokio::task::spawn_local(async move {
             if full_pass {
                 // Use the entire video as a single sample
                 let _ = tx.send((0, Ok((sample_in.clone(), input_len))));
@@ -484,6 +484,7 @@ pub fn run(
             results.push(result.clone());
             yield Update::SampleResult { sample: sample_n, result };
         }
+        await_sample_task(sample_task).await?;
 
         let output = Output {
             vmaf_score: results.mean_vmaf_score(),
@@ -513,6 +514,11 @@ pub fn run(
 
         yield Update::Done(output);
     }
+}
+
+async fn await_sample_task(task: tokio::task::JoinHandle<()>) -> anyhow::Result<()> {
+    task.await.context("sample copy task")?;
+    Ok(())
 }
 
 /// Copy a sample from the input to the temp_dir (or input dir).
@@ -611,6 +617,20 @@ mod tests {
     use rstest::rstest;
     use serial_test::serial;
     use std::{env, path::Path, time::Duration};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sample_copy_task_panic_is_an_error() {
+        let error = tokio::task::LocalSet::new()
+            .run_until(async {
+                let task = tokio::task::spawn_local(async { panic!("sample task panic") });
+                await_sample_task(task)
+                    .await
+                    .expect_err("panic must be reported")
+            })
+            .await;
+
+        assert!(error.to_string().contains("sample copy task"));
+    }
 
     mod helpers {
         use super::*;

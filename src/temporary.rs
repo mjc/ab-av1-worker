@@ -1,5 +1,6 @@
 //! temp file logic
 use crate::command::rules::choose_temp_parent;
+use anyhow::Context;
 use std::{
     collections::HashMap,
     env, iter,
@@ -107,26 +108,28 @@ async fn clean_non_keepables() {
 /// Configured `--temp-dir` is used as a parent. When unset, `default_parent`
 /// (typically the input file's directory) is used. Only when both are unavailable
 /// does this fall back to the current working directory.
-pub fn process_dir(conf_parent: Option<PathBuf>, default_parent: Option<PathBuf>) -> PathBuf {
+pub fn process_dir(
+    conf_parent: Option<PathBuf>,
+    default_parent: Option<PathBuf>,
+) -> anyhow::Result<PathBuf> {
     static SUBDIR: LazyLock<String> = LazyLock::new(|| {
         let mut subdir = String::from(".ab-av1-");
         subdir.extend(iter::repeat_with(fastrand::alphanumeric).take(12));
         subdir
     });
 
-    let mut temp_dir = choose_temp_parent(conf_parent.as_deref(), default_parent.as_deref())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| env::current_dir().expect("current working directory"));
+    let mut temp_dir = match choose_temp_parent(conf_parent.as_deref(), default_parent.as_deref()) {
+        Some(parent) => parent.to_path_buf(),
+        None => env::current_dir().context("current working directory")?,
+    };
     temp_dir.push(&*SUBDIR);
 
     if !temp_dir.exists() {
-        add(&temp_dir, TempKind::Keepable);
-        std::fs::create_dir_all(&temp_dir).expect("failed to create temp-dir");
-    } else {
-        add(&temp_dir, TempKind::Keepable);
+        std::fs::create_dir_all(&temp_dir).context("create temp-dir")?;
     }
+    add(&temp_dir, TempKind::Keepable);
 
-    temp_dir
+    Ok(temp_dir)
 }
 
 #[cfg(test)]
@@ -244,7 +247,8 @@ mod tests {
         let cwd = env::current_dir().expect("cwd");
 
         // execute
-        let temp_dir = process_dir(None, input.parent().map(Path::to_path_buf));
+        let temp_dir =
+            process_dir(None, input.parent().map(Path::to_path_buf)).expect("create process dir");
 
         // assert
         assert!(
@@ -272,12 +276,12 @@ mod tests {
         // setup — simulate a previous run leaving the per-process temp dir on disk
         let parent = temp_path("preexist-parent");
         fs::create_dir_all(&parent).expect("create parent");
-        let run_dir = process_dir(Some(parent.clone()), None);
+        let run_dir = process_dir(Some(parent.clone()), None).expect("create process dir");
         clean_all().await;
         fs::create_dir_all(&run_dir).expect("recreate leftover process dir");
 
         // execute — new run reuses the same process dir path
-        let run_dir_again = process_dir(Some(parent.clone()), None);
+        let run_dir_again = process_dir(Some(parent.clone()), None).expect("reuse process dir");
         assert_eq!(run_dir, run_dir_again);
 
         // assert — full cleanup must remove the pre-existing directory
@@ -322,7 +326,8 @@ mod tests {
         let temp_dir = process_dir(
             Some(explicit.clone()),
             input.parent().map(Path::to_path_buf),
-        );
+        )
+        .expect("create process dir");
 
         // assert
         assert!(
@@ -330,5 +335,17 @@ mod tests {
             "explicit --temp-dir should win, got {}",
             temp_dir.display()
         );
+    }
+
+    #[test]
+    fn invalid_temp_parent_returns_contextual_error() {
+        let parent_file = temp_path("parent-file");
+        fs::write(&parent_file, b"not a directory").expect("write parent file");
+
+        let error = process_dir(Some(parent_file.clone()), None)
+            .expect_err("a file cannot contain a process directory");
+
+        assert!(error.to_string().contains("create temp-dir"));
+        let _ = fs::remove_file(parent_file);
     }
 }
