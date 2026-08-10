@@ -340,10 +340,13 @@ impl ManagedProcess {
             .wait_for_completion(options.wait_timeout)
             .with_raw_output(
                 DEFAULT_OUTPUT_EOF_TIMEOUT,
-                RawOutputOptions::symmetric(RawCollectionOptions::Bounded {
-                    max_bytes: options.stderr_limit.bytes(),
-                    overflow_behavior: CollectionOverflowBehavior::DropOldestData,
-                }),
+                RawOutputOptions {
+                    stdout_collection_options: RawCollectionOptions::TrustedUnbounded,
+                    stderr_collection_options: RawCollectionOptions::Bounded {
+                        max_bytes: options.stderr_limit.bytes(),
+                        overflow_behavior: CollectionOverflowBehavior::DropOldestData,
+                    },
+                },
             )
             .or_terminate(shutdown)
             .await?;
@@ -859,6 +862,20 @@ mod tests {
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("stdout-noise"));
         assert!(String::from_utf8_lossy(&output.stderr).contains("frame="));
+    }
+
+    #[tokio::test]
+    async fn managed_process_output_keeps_complete_stdout_when_stderr_is_bounded() {
+        let cmd = fixture_command("stdout-noise-stderr-ffmpeg-progress");
+        let options = ManagedProcessOptions::default().with_stderr_limit(4);
+
+        let output = ManagedProcess::spawn_with_options("output fixture", cmd, options)
+            .expect("spawn shell fixture")
+            .output()
+            .await
+            .expect("collect output");
+
+        assert!(String::from_utf8_lossy(&output.stdout).contains("stdout-noise"));
     }
 
     #[tokio::test]

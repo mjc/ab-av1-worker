@@ -508,11 +508,11 @@ pub fn run(
                 }
             }
 
-            let sample = Sample {
-                crf: args.crf,
+            let sample = Sample::new(
+                args.crf,
                 q,
-                enc: sample_enc_output.context("no sample output?")?,
-            };
+                sample_enc_output.context("no sample output?")?,
+            );
             let score = output_search_score(&sample.enc, use_xpsnr);
             crf_attempts.push(sample.clone());
 
@@ -559,6 +559,10 @@ pub struct Sample {
 }
 
 impl Sample {
+    pub(crate) fn new(crf: f32, q: i64, enc: sample_encode::Output) -> Self {
+        Self { enc, crf, q }
+    }
+
     pub fn print_attempt(
         &self,
         bar: &ProgressBar,
