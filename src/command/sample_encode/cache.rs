@@ -20,10 +20,7 @@ pub async fn cached_encode(
     full_pass: bool,
     dest_ext: &str,
     enc_args: &FfmpegEncodeArgs<'_>,
-    score: &impl Hash,
-    vmaf: &impl Hash,
-    use_xpsnr: bool,
-    xpsnr_opts: &impl Hash,
+    scoring: &impl Hash,
 ) -> (Option<super::EncodeResult>, Option<Key>) {
     if !cache {
         return (None, None);
@@ -38,7 +35,7 @@ pub async fn cached_encode(
         full_pass,
         dest_ext,
         enc_args,
-        (score, vmaf, use_xpsnr, xpsnr_opts),
+        scoring,
     );
 
     let cached = tokio::task::spawn_blocking::<_, anyhow::Result<_>>(move || {
@@ -75,7 +72,7 @@ pub async fn cache_result(key: Key, result: &super::EncodeResult) -> anyhow::Res
     })
     .await
     .context("db.insert task failed")
-    .and_then(|r| Ok(r?));
+    .and_then(|r| r);
 
     if let Err(err) = insert {
         eprintln!("cache error: {err}")
@@ -110,7 +107,7 @@ pub(crate) fn sample_encode_cache_path(cache_dir: Option<PathBuf>) -> anyhow::Re
 pub struct Key(blake3::Hash);
 
 /// Source file identity for sample-encode cache keys.
-#[derive(Hash)]
+#[derive(Clone, Copy, Hash)]
 struct SourceIdentity<'a> {
     sample: &'a Path,
     source_input: &'a Path,
@@ -141,27 +138,9 @@ struct CacheKeyBuilder<'a, S> {
 }
 
 impl<'a, S: Hash> CacheKeyBuilder<'a, S> {
-    fn new(
-        sample: &'a Path,
-        source_input: &'a Path,
-        input_duration: Duration,
-        input_extension: Option<&'a OsStr>,
-        input_size: u64,
-        full_pass: bool,
-        dest_ext: &'a str,
-        enc_args: &'a FfmpegEncodeArgs<'a>,
-        scoring: S,
-    ) -> Self {
+    fn new(source: SourceIdentity<'a>, enc_args: &'a FfmpegEncodeArgs<'a>, scoring: S) -> Self {
         Self {
-            source: SourceIdentity {
-                sample,
-                source_input,
-                input_duration,
-                input_extension,
-                input_size,
-                full_pass,
-                dest_ext,
-            },
+            source,
             encode_scoring: EncodeScoringIdentity { enc_args, scoring },
         }
     }
@@ -185,13 +164,15 @@ pub(crate) fn encode_cache_key(
     scoring: impl Hash,
 ) -> Key {
     CacheKeyBuilder::new(
-        sample,
-        source_input,
-        input_duration,
-        input_extension,
-        input_size,
-        full_pass,
-        dest_ext,
+        SourceIdentity {
+            sample,
+            source_input,
+            input_duration,
+            input_extension,
+            input_size,
+            full_pass,
+            dest_ext,
+        },
         enc_args,
         scoring,
     )
@@ -221,7 +202,7 @@ impl std::hash::Hasher for BlakeStdHasher<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::args::{PixelFormat, ScoreArgs, Vmaf, Xpsnr};
+    use crate::command::args::{FrameRateOverride, PixelFormat, ScoreArgs, Vmaf, Xpsnr};
     use crate::ffmpeg::FfmpegEncodeArgs;
     use std::{path::Path, sync::Arc, time::Duration};
 
@@ -229,6 +210,15 @@ mod tests {
         use super::*;
 
         use std::ffi::OsStr;
+
+        pub type StandardKeyInputs = (
+            &'static Path,
+            &'static Path,
+            Option<&'static OsStr>,
+            u64,
+            Duration,
+            (ScoreArgs, Vmaf, bool, Xpsnr),
+        );
 
         pub fn minimal_enc_args(input: &Path) -> FfmpegEncodeArgs<'_> {
             FfmpegEncodeArgs {
@@ -251,21 +241,11 @@ mod tests {
                 },
                 Vmaf::default(),
                 use_xpsnr,
-                Xpsnr {
-                    xpsnr_fps: 60.0,
-                    xpsnr_pix_format: None,
-                },
+                Xpsnr::default(),
             )
         }
 
-        pub fn standard_key_inputs() -> (
-            &'static Path,
-            &'static Path,
-            Option<&'static OsStr>,
-            u64,
-            Duration,
-            (ScoreArgs, Vmaf, bool, Xpsnr),
-        ) {
+        pub fn standard_key_inputs() -> StandardKeyInputs {
             (
                 Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv"),
                 Path::new("/movies/a/clip.mkv"),
@@ -275,21 +255,36 @@ mod tests {
                 default_scoring(false),
             )
         }
+
+        pub fn source_identity<'a>(
+            sample: &'a Path,
+            input: &'a Path,
+            duration: Duration,
+            extension: Option<&'a OsStr>,
+            size: u64,
+        ) -> SourceIdentity<'a> {
+            SourceIdentity {
+                sample,
+                source_input: input,
+                input_duration: duration,
+                input_extension: extension,
+                input_size: size,
+                full_pass: false,
+                dest_ext: "mkv",
+            }
+        }
     }
 
-    use helpers::{default_scoring, minimal_enc_args, standard_key_inputs};
+    use helpers::{default_scoring, minimal_enc_args, source_identity, standard_key_inputs};
 
     #[test]
     fn cache_key_builder_stable_for_equal_inputs() {
         // setup
         let (sample, input, extension, size, duration, scoring) = standard_key_inputs();
         let enc = minimal_enc_args(input);
-        let builder_a = CacheKeyBuilder::new(
-            sample, input, duration, extension, size, false, "mkv", &enc, &scoring,
-        );
-        let builder_b = CacheKeyBuilder::new(
-            sample, input, duration, extension, size, false, "mkv", &enc, &scoring,
-        );
+        let source = source_identity(sample, input, duration, extension, size);
+        let builder_a = CacheKeyBuilder::new(source, &enc, &scoring);
+        let builder_b = CacheKeyBuilder::new(source, &enc, &scoring);
 
         // execute / assert
         assert_eq!(builder_a.build(), builder_b.build());
@@ -309,11 +304,15 @@ mod tests {
 
         // execute
         let key_a = CacheKeyBuilder::new(
-            sample, input_a, duration, extension, size, false, "mkv", &enc, &scoring,
+            source_identity(sample, input_a, duration, extension, size),
+            &enc,
+            &scoring,
         )
         .build();
         let key_b = CacheKeyBuilder::new(
-            sample, input_b, duration, extension, size, false, "mkv", &enc, &scoring,
+            source_identity(sample, input_b, duration, extension, size),
+            &enc,
+            &scoring,
         )
         .build();
 
@@ -327,32 +326,11 @@ mod tests {
         let (sample, input, extension, size, duration, scoring_vmaf) = standard_key_inputs();
         let enc = minimal_enc_args(input);
         let scoring_xpsnr = default_scoring(true);
+        let source = source_identity(sample, input, duration, extension, size);
 
         // execute
-        let key_vmaf = CacheKeyBuilder::new(
-            sample,
-            input,
-            duration,
-            extension,
-            size,
-            false,
-            "mkv",
-            &enc,
-            &scoring_vmaf,
-        )
-        .build();
-        let key_xpsnr = CacheKeyBuilder::new(
-            sample,
-            input,
-            duration,
-            extension,
-            size,
-            false,
-            "mkv",
-            &enc,
-            &scoring_xpsnr,
-        )
-        .build();
+        let key_vmaf = CacheKeyBuilder::new(source, &enc, &scoring_vmaf).build();
+        let key_xpsnr = CacheKeyBuilder::new(source, &enc, &scoring_xpsnr).build();
 
         // assert
         assert_ne!(key_vmaf, key_xpsnr);
@@ -516,8 +494,8 @@ mod tests {
             Vmaf::default(),
             true,
             Xpsnr {
-                xpsnr_fps: 60.0,
                 xpsnr_pix_format: Some(PixelFormat::Yuv420p),
+                ..Default::default()
             },
         );
         let scoring_420p10 = (
@@ -527,8 +505,8 @@ mod tests {
             Vmaf::default(),
             true,
             Xpsnr {
-                xpsnr_fps: 60.0,
                 xpsnr_pix_format: Some(PixelFormat::Yuv420p10le),
+                ..Default::default()
             },
         );
 
@@ -570,7 +548,7 @@ mod tests {
             sample: &Path,
             input: &Path,
             enc: &FfmpegEncodeArgs<'_>,
-            xpsnr_fps: f32,
+            xpsnr_fps: FrameRateOverride,
         ) -> Key {
             let scoring = (
                 ScoreArgs {
@@ -580,7 +558,7 @@ mod tests {
                 true,
                 Xpsnr {
                     xpsnr_fps,
-                    xpsnr_pix_format: None,
+                    ..Default::default()
                 },
             );
             encode_cache_key(
@@ -602,8 +580,8 @@ mod tests {
         let enc = minimal_enc_args(input);
 
         // execute
-        let key_fps_60 = cache_key_for_xpsnr_fps(sample, input, &enc, 60.0);
-        let key_fps_30 = cache_key_for_xpsnr_fps(sample, input, &enc, 30.0);
+        let key_fps_60 = cache_key_for_xpsnr_fps(sample, input, &enc, FrameRateOverride::new(60.0));
+        let key_fps_30 = cache_key_for_xpsnr_fps(sample, input, &enc, FrameRateOverride::new(30.0));
 
         // assert
         assert_ne!(
@@ -683,10 +661,7 @@ mod tests {
         let score = ScoreArgs {
             reference_vfilter: None,
         };
-        let xpsnr_opts = Xpsnr {
-            xpsnr_fps: 60.0,
-            xpsnr_pix_format: None,
-        };
+        let xpsnr_opts = Xpsnr::default();
 
         // execute — ab-kgc.46: vmaf-only vs xpsnr-only
         let vmaf = Vmaf::default();

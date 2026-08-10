@@ -8,14 +8,12 @@ use crate::{
     ffprobe::{self, Ffprobe},
 };
 use clap::Parser;
-use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
-use tokio_stream::StreamExt;
 
 mod error;
 mod lifecycle;
@@ -34,13 +32,11 @@ mod test_support;
 pub(crate) use test_support::test_hooks;
 
 pub use error::EncodePlanError;
-pub use lifecycle::{CompletedOutput, PartialOutput, PlannedOutput};
 pub use plan::EncodePlan;
 pub use preflight::{audio_config, resolve_output};
-pub use progress::StreamSizes;
-pub use report::{EncodeMetrics, FinishedEncode};
+pub use report::FinishedEncode;
 pub use sink::ProgressSink;
-pub use spawner::{EncodeSpawner, FfmpegSpawner};
+pub use spawner::EncodeSpawner;
 
 /// Invoke ffmpeg to encode a video or image.
 #[derive(Parser)]
@@ -76,7 +72,7 @@ pub async fn run(args: Args, probe: Arc<Ffprobe>, bar: &ProgressBar) -> anyhow::
     }
     #[cfg(not(test))]
     {
-        run_with_spawner(args, probe, bar, &FfmpegSpawner).await
+        run_with_spawner(args, probe, bar, &spawner::FfmpegSpawner).await
     }
 }
 
@@ -86,7 +82,7 @@ pub(crate) async fn run_with_spawner(
     bar: &ProgressBar,
     spawner: &impl EncodeSpawner,
 ) -> anyhow::Result<()> {
-    let plan = EncodePlan::build(args, probe).map_err(EncodePlanError::into_anyhow)?;
+    let plan = EncodePlan::build(args.into(), probe).map_err(EncodePlanError::into_anyhow)?;
 
     if plan.defaulting_output() {
         let out = shell_escape::escape(plan.output_path().display().to_string().into());
@@ -129,11 +125,11 @@ pub fn default_output_name(input: &Path, encoder: &Encoder, is_image: bool) -> P
 mod tests {
     use super::*;
     use crate::temporary;
+    use serial_test::serial;
+    use spawner::FixtureSpawner;
     use std::{env, fs};
     use test_case::test_case;
     use test_support::{arc_probe, encode_args, temp_input};
-    use serial_test::serial;
-    use spawner::FixtureSpawner;
 
     // ab-kgc.89: default output extension must preserve input container for webm/mov
     #[test_case("clip.mp4", false, "mp4"; "video mp4 keeps mp4")]
@@ -254,7 +250,9 @@ mod tests {
         let spawner = FixtureSpawner::new("stderr-ffmpeg-progress");
 
         // execute
-        run_with_spawner(args, arc_probe(Some(6)), &bar, &spawner).await.expect("encode run");
+        run_with_spawner(args, arc_probe(Some(6)), &bar, &spawner)
+            .await
+            .expect("encode run");
 
         // assert
         assert!(output.exists());
@@ -279,7 +277,9 @@ mod tests {
         let spawner = FixtureSpawner::new("stderr-ffmpeg-progress");
 
         // execute
-        run_with_spawner(args, arc_probe(Some(6)), &bar, &spawner).await.expect("encode run");
+        run_with_spawner(args, arc_probe(Some(6)), &bar, &spawner)
+            .await
+            .expect("encode run");
 
         // assert
         assert!(output.exists());

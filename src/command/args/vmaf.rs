@@ -1,3 +1,4 @@
+use crate::command::args::FrameRateOverride;
 use crate::command::args::PixelFormat;
 use anyhow::Context;
 use clap::Parser;
@@ -44,8 +45,8 @@ pub struct Vmaf {
     /// Maps to ffmpeg `-r` input arg.
     ///
     /// Setting to 0 disables use.
-    #[arg(long, default_value_t = DEFAULT_VMAF_FPS)]
-    pub vmaf_fps: f32,
+    #[arg(long, default_value_t = FrameRateOverride::new(DEFAULT_VMAF_FPS))]
+    pub vmaf_fps: FrameRateOverride,
 }
 
 impl Default for Vmaf {
@@ -54,27 +55,22 @@ impl Default for Vmaf {
             and_vmaf: None,
             vmaf_args: <_>::default(),
             vmaf_scale: <_>::default(),
-            vmaf_fps: DEFAULT_VMAF_FPS,
+            vmaf_fps: FrameRateOverride::new(DEFAULT_VMAF_FPS),
         }
     }
 }
 
-impl std::hash::Hash for Vmaf {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.and_vmaf.hash(state);
-        self.vmaf_args.hash(state);
-        self.vmaf_scale.hash(state);
-        self.vmaf_fps.to_ne_bytes().hash(state);
-    }
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct VmafConfig {
+    pub and_vmaf: Option<bool>,
+    pub vmaf_args: Vec<Arc<str>>,
+    pub vmaf_scale: VmafScale,
+    pub vmaf_fps: FrameRateOverride,
 }
 
-fn parse_vmaf_arg(arg: &str) -> anyhow::Result<Arc<str>> {
-    Ok(arg.to_owned().into())
-}
-
-impl Vmaf {
+impl VmafConfig {
     pub fn fps(&self) -> Option<f32> {
-        Some(self.vmaf_fps).filter(|r| *r > 0.0)
+        self.vmaf_fps.fps()
     }
 
     /// Returns ffmpeg `filter_complex`/`lavfi` value for calculating vmaf.
@@ -146,12 +142,86 @@ impl Vmaf {
                 }
                 _ => None,
             },
-            (VmafScale::Custom { width, height }, Some((w, h))) => {
-                Some(minimally_scale((w, h), (width, height)))
+            (VmafScale::Custom(resolution), Some((w, h))) => Some(minimally_scale(
+                (w, h),
+                (resolution.width(), resolution.height()),
+            )),
+            (VmafScale::Custom(resolution), None) => {
+                Some((resolution.width() as _, resolution.height() as _))
             }
-            (VmafScale::Custom { width, height }, None) => Some((width as _, height as _)),
             _ => None,
         }
+    }
+}
+
+impl From<Vmaf> for VmafConfig {
+    fn from(vmaf: Vmaf) -> Self {
+        Self {
+            and_vmaf: vmaf.and_vmaf,
+            vmaf_args: vmaf.vmaf_args,
+            vmaf_scale: vmaf.vmaf_scale,
+            vmaf_fps: vmaf.vmaf_fps,
+        }
+    }
+}
+
+impl std::hash::Hash for Vmaf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.and_vmaf.hash(state);
+        self.vmaf_args.hash(state);
+        self.vmaf_scale.hash(state);
+        self.vmaf_fps.hash(state);
+    }
+}
+
+fn parse_vmaf_arg(arg: &str) -> anyhow::Result<Arc<str>> {
+    Ok(arg.to_owned().into())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Resolution {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ResolutionError {
+    #[error("resolution width and height must be positive")]
+    Invalid,
+}
+
+impl Resolution {
+    pub fn try_new(width: u32, height: u32) -> Result<Self, ResolutionError> {
+        if width == 0 || height == 0 {
+            Err(ResolutionError::Invalid)
+        } else {
+            Ok(Self { width, height })
+        }
+    }
+
+    pub fn width(self) -> u32 {
+        self.width
+    }
+
+    pub fn height(self) -> u32 {
+        self.height
+    }
+}
+
+#[cfg(test)]
+impl Vmaf {
+    pub fn fps(&self) -> Option<f32> {
+        self.vmaf_fps.fps()
+    }
+
+    /// Returns ffmpeg `filter_complex`/`lavfi` value for calculating vmaf.
+    pub fn ffmpeg_lavfi(
+        &self,
+        distorted_res: Option<(u32, u32)>,
+        pix_fmt: Option<PixelFormat>,
+        ref_vfilter: Option<&str>,
+    ) -> String {
+        VmafConfig::from(self.clone()).ffmpeg_lavfi(distorted_res, pix_fmt, ref_vfilter)
     }
 }
 
@@ -172,10 +242,7 @@ pub enum VmafScale {
     None,
     #[default]
     Auto,
-    Custom {
-        width: u32,
-        height: u32,
-    },
+    Custom(Resolution),
 }
 
 fn parse_vmaf_scale(vs: &str) -> anyhow::Result<VmafScale> {
@@ -186,10 +253,9 @@ fn parse_vmaf_scale(vs: &str) -> anyhow::Result<VmafScale> {
         _ => {
             let (w, h) = vs.split_once('x').context(ERR)?;
             let (width, height) = (w.parse().context(ERR)?, h.parse().context(ERR)?);
-            if width == 0 || height == 0 {
-                anyhow::bail!("{ERR}");
-            }
-            Ok(VmafScale::Custom { width, height })
+            Ok(VmafScale::Custom(
+                Resolution::try_new(width, height).context(ERR)?,
+            ))
         }
     }
 }
@@ -199,7 +265,9 @@ impl Display for VmafScale {
         match self {
             Self::None => "none".fmt(f),
             Self::Auto => "auto".fmt(f),
-            Self::Custom { width, height } => write!(f, "{width}x{height}"),
+            Self::Custom(resolution) => {
+                write!(f, "{}x{}", resolution.width(), resolution.height())
+            }
         }
     }
 }
@@ -373,10 +441,7 @@ fn vmaf_lavfi_custom_model_and_width() {
             "n_subsample=4".into(),
         ],
         // if specified just do it
-        vmaf_scale: VmafScale::Custom {
-            width: 123,
-            height: 720,
-        },
+        vmaf_scale: VmafScale::Custom(Resolution::try_new(123, 720).unwrap()),
         ..<_>::default()
     };
     assert_eq!(
@@ -426,7 +491,7 @@ fn vmaf_lavfi_ultrawide_3840x1440_selects_4k_model() {
 #[test]
 fn vmaf_fps_zero_disables_override() {
     let vmaf = Vmaf {
-        vmaf_fps: 0.0,
+        vmaf_fps: FrameRateOverride::new(0.0),
         ..Default::default()
     };
     assert_eq!(vmaf.fps(), None);
@@ -469,7 +534,7 @@ fn vmaf_lavfi_portrait_720x1280_auto_upscales_height() {
 #[test]
 fn vmaf_fps_negative_disables_use() {
     let vmaf = Vmaf {
-        vmaf_fps: -1.0,
+        vmaf_fps: FrameRateOverride::new(-1.0),
         ..Default::default()
     };
     assert_eq!(vmaf.fps(), None);
@@ -480,10 +545,14 @@ fn vmaf_hash_distinguishes_and_vmaf_flag() {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let mut off = Vmaf::default();
-    off.and_vmaf = None;
-    let mut on = Vmaf::default();
-    on.and_vmaf = Some(true);
+    let off = Vmaf {
+        and_vmaf: None,
+        ..Default::default()
+    };
+    let on = Vmaf {
+        and_vmaf: Some(true),
+        ..Default::default()
+    };
 
     let hash = |v: &Vmaf| {
         let mut h = DefaultHasher::new();
@@ -500,6 +569,16 @@ fn parse_vmaf_scale_rejects_zero_dimensions() {
     assert!(err.to_string().contains("vmaf-scale"));
     let err = parse_vmaf_scale("1920x0").expect_err("zero height");
     assert!(err.to_string().contains("vmaf-scale"));
+}
+
+#[test]
+fn resolution_is_a_checked_newtype() {
+    let res = Resolution::try_new(1920, 1080).expect("valid resolution");
+
+    assert_eq!(res.width(), 1920);
+    assert_eq!(res.height(), 1080);
+    assert!(Resolution::try_new(0, 1080).is_err());
+    assert!(Resolution::try_new(1920, 0).is_err());
 }
 
 #[test]

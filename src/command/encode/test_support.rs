@@ -3,13 +3,7 @@ use crate::{
     command::args::{Encode, EncodeToOutput},
     ffprobe::Ffprobe,
 };
-use std::{
-    env,
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
 
 pub(crate) mod test_hooks {
     use std::cell::RefCell;
@@ -51,21 +45,6 @@ pub(crate) fn test_ffmpeg_stream(
         "ffmpeg encode fixture",
         fixture.into(),
     ))
-}
-
-pub struct FixtureGuard;
-
-impl FixtureGuard {
-    pub fn set(name: &'static str) -> Self {
-        test_hooks::set_fixture(name);
-        Self
-    }
-}
-
-impl Drop for FixtureGuard {
-    fn drop(&mut self) {
-        test_hooks::clear();
-    }
 }
 
 pub fn test_probe(max_audio_channels: Option<i64>) -> Ffprobe {

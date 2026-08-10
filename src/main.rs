@@ -8,6 +8,8 @@ mod process;
 mod sample;
 mod score_stream;
 mod temporary;
+#[cfg(test)]
+mod test_support;
 mod vmaf;
 mod xpsnr;
 
@@ -49,8 +51,8 @@ async fn main() {
     let local = tokio::task::LocalSet::new();
     let command = local.run_until(match action {
         Command::SampleEncode(args) => command::sample_encode(args).boxed_local(),
-        Command::Vmaf(args) => command::vmaf(args).boxed_local(),
-        Command::Xpsnr(args) => command::xpsnr(args).boxed_local(),
+        Command::Vmaf(args) => command::vmaf(args.into()).boxed_local(),
+        Command::Xpsnr(args) => command::xpsnr(args.into()).boxed_local(),
         Command::Encode(args) => command::encode(args).boxed_local(),
         Command::CrfSearch(args) => command::crf_search(args).boxed_local(),
         Command::AutoEncode(args) => command::auto_encode(args).boxed_local(),
@@ -85,6 +87,43 @@ impl Command {
             Self::CrfSearch(args) => args.sample.keep,
             Self::AutoEncode(args) => args.search.sample.keep,
             _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_parse_routes_sample_encode_subcommand() {
+        let command = Command::try_parse_from([
+            "ab-av1",
+            "sample-encode",
+            "--input",
+            "input.mkv",
+            "--crf",
+            "30",
+        ])
+        .expect("parse sample-encode command");
+
+        match command {
+            Command::SampleEncode(args) => {
+                assert!(!args.sample.keep);
+                assert_eq!(args.args.input, std::path::Path::new("input.mkv"));
+            }
+            _ => panic!("expected sample-encode command"),
+        }
+    }
+
+    #[test]
+    fn command_parse_routes_print_completions_subcommand() {
+        let command = Command::try_parse_from(["ab-av1", "print-completions", "bash"])
+            .expect("parse print-completions command");
+
+        match command {
+            Command::PrintCompletions(_) => {}
+            _ => panic!("expected print-completions command"),
         }
     }
 }

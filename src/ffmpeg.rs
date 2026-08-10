@@ -64,6 +64,20 @@ impl FfmpegEncodeArgs<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FfmpegArgValues<'a> {
+    args: &'a [Arc<String>],
+}
+
+impl<'a> FfmpegArgValues<'a> {
+    fn new(args: &'a [Arc<String>]) -> Self {
+        Self { args }
+    }
+    fn iter(self) -> impl ExactSizeIterator<Item = &'a str> {
+        self.args.iter().map(|arg| arg.as_str())
+    }
+}
+
 /// Encode a sample.
 pub fn encode_sample(
     FfmpegEncodeArgs {
@@ -95,10 +109,10 @@ pub fn encode_sample(
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-nostdin")
         .arg("-y")
-        .args(input_args.iter().map(|a| &**a))
+        .args(FfmpegArgValues::new(&input_args).iter())
         .arg2("-i", input)
         .arg2("-c:v", &*vcodec)
-        .args(output_args.iter().map(|a| &**a))
+        .args(FfmpegArgValues::new(&output_args).iter())
         // Avoid dropping or duplicating frames as this may negatively affect input/output analysis
         .arg2("-fps_mode", "passthrough")
         .arg2(vcodec.crf_arg(), vcodec.crf(crf))
@@ -165,7 +179,7 @@ pub fn encode(
 
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-nostdin")
-        .args(input_args.iter().map(|a| &**a))
+        .args(FfmpegArgValues::new(&input_args).iter())
         .arg("-y")
         .arg2("-i", input)
         .arg2("-map", map)
@@ -174,7 +188,7 @@ pub fn encode(
         .arg2("-metadata", metadata)
         .arg2("-c:a", audio_codec)
         .arg2("-c:s", "copy")
-        .args(output_args.iter().map(|a| &**a))
+        .args(FfmpegArgValues::new(&output_args).iter())
         .arg2(vcodec.crf_arg(), vcodec.crf(crf))
         .arg2_opt("-pix_fmt", pix_fmt.map(|v| v.as_str()))
         .arg2_opt(vcodec.preset_arg(), preset)
@@ -460,6 +474,37 @@ mod tests {
         // assert
         assert_ne!(base_hash.finish(), output_hash.finish());
         assert_ne!(base_hash.finish(), input_hash.finish());
+    }
+
+    #[test]
+    fn ffmpeg_arg_values_iterates_borrowed_arg_views() {
+        let first = Arc::new(String::from("-threads"));
+        let second = Arc::new(String::from("4"));
+        let args = vec![Arc::clone(&first), Arc::clone(&second)];
+        let spec = FfmpegArgValues::new(&args);
+
+        let borrowed = spec.iter().collect::<Vec<_>>();
+
+        assert_eq!(borrowed, vec!["-threads", "4"]);
+        assert_eq!(spec.iter().len(), 2);
+        assert!(
+            std::ptr::eq(borrowed[0].as_ptr(), first.as_str().as_ptr()),
+            "argument iteration must borrow existing storage"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_arg_values_iteration_does_not_allocate() {
+        let args = vec![
+            Arc::new(String::from("-threads")),
+            Arc::new(String::from("4")),
+        ];
+        let spec = FfmpegArgValues::new(&args);
+
+        crate::test_support::assert_no_allocations(|| {
+            let total_len = spec.iter().fold(0usize, |acc, arg| acc + arg.len());
+            std::hint::black_box(total_len);
+        });
     }
 
     #[rstest]

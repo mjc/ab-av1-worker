@@ -1,6 +1,9 @@
 //! vmaf logic
 use crate::process::{Chunks, CommandExt, FfmpegOut, managed::ManagedProcess};
-use crate::score_stream::{Score, ScoreStreamParse, build_score_ffmpeg_command, run_score_stream};
+use crate::score_stream::{
+    ParsedScore, Score, ScoreStreamParse, build_score_ffmpeg_command, parse_score_chunk,
+    run_score_stream,
+};
 use anyhow::Context;
 use log::{debug, info};
 use std::path::Path;
@@ -72,37 +75,39 @@ impl VmafOut {
     }
 
     fn try_from_chunk(chunk: &[u8], chunks: &mut Chunks) -> Option<Self> {
-        const SCORE_PREFIX: &str = "VMAF score: ";
-
-        chunks.push(chunk);
-
-        if let Some(line) = chunks.rfind_line(|l| {
-            l.as_bytes()
-                .windows(SCORE_PREFIX.len())
-                .any(|w| w.eq_ignore_ascii_case(SCORE_PREFIX.as_bytes()))
-        }) {
-            let idx = line
-                .find(SCORE_PREFIX)
-                .or_else(|| {
-                    line.to_ascii_lowercase()
-                        .find(&SCORE_PREFIX.to_ascii_lowercase())
-                })
-                .unwrap();
-            return Some(Self::Done(
-                line[idx + SCORE_PREFIX.len()..].trim().parse().ok()?,
-            ));
+        match parse_score_chunk(chunk, chunks, parse_vmaf_score_line) {
+            Ok(Some(event)) => Some(Self::from_parse(event)),
+            Ok(None) => None,
+            Err(err) => Some(Self::Err(err.into())),
         }
-        if let Some(progress) = FfmpegOut::try_parse(chunks.last_line()) {
-            return Some(Self::Progress(progress));
-        }
-        None
     }
+}
+
+pub(crate) fn parse_vmaf_score_line(line: &str) -> ParsedScore {
+    const SCORE_PREFIX: &str = "VMAF score: ";
+
+    let Some(idx) = find_ascii_case_insensitive(line.as_bytes(), SCORE_PREFIX.as_bytes()) else {
+        return ParsedScore::Miss;
+    };
+    line[idx + SCORE_PREFIX.len()..]
+        .trim()
+        .parse()
+        .map_or(ParsedScore::Miss, |score| {
+            ParsedScore::from_score(Score::try_new(score))
+        })
+}
+
+fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::process::CommandExt;
+    use crate::score_stream::ScoreError;
     use std::env;
     use std::path::Path;
     use std::pin::Pin;
@@ -129,6 +134,47 @@ mod test {
             matches!(out, Some(VmafOut::Done(score)) if (score - 88.125).abs() < 1e-6),
             "expected capitalized VMAF score parse, got {out:?}"
         );
+    }
+
+    #[test]
+    fn parse_vmaf_score_line_returns_typed_score() {
+        assert_eq!(
+            parse_vmaf_score_line("[Parsed_libvmaf_0 @ 0x1] VMAF score: 88.125000"),
+            ParsedScore::Score(Score::new(88.125))
+        );
+    }
+
+    #[test]
+    fn parse_vmaf_score_line_success_does_not_allocate() {
+        crate::test_support::assert_no_allocations(|| {
+            let parsed = parse_vmaf_score_line("[Parsed_libvmaf_0 @ 0x1] VMAF score: 88.125000");
+            std::hint::black_box(parsed);
+        });
+    }
+
+    #[test]
+    fn parse_vmaf_score_line_rejects_nan() {
+        assert_eq!(
+            parse_vmaf_score_line("[Parsed_libvmaf_0 @ 0x1] VMAF score: NaN"),
+            ParsedScore::Invalid(ScoreError::Nan)
+        );
+    }
+
+    #[test]
+    fn parse_vmaf_score_line_misses_malformed_score() {
+        assert_eq!(
+            parse_vmaf_score_line("[Parsed_libvmaf_0 @ 0x1] VMAF score: nope"),
+            ParsedScore::Miss
+        );
+    }
+
+    #[test]
+    fn vmaf_chunk_parser_reports_malformed_utf8() {
+        let mut chunks = Chunks::default();
+        let out =
+            VmafOut::try_from_chunk(b"[Parsed_libvmaf_0 @ 0x1] VMAF score: \xff\n", &mut chunks);
+
+        assert!(matches!(out, Some(VmafOut::Err(_))));
     }
 
     #[test]
