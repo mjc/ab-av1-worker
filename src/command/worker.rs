@@ -1,15 +1,16 @@
 use crate::command::worker_protocol::{
-    AnnouncePayload, CRF_SEARCH_TOPIC, CancelPayload, Capabilities, ClientEvent, ClientFrame,
-    ControlAction, ControlPayload, ControlState, ControlStatePayload, CrfSearchCompletedPayload,
-    CrfSearchProgressPayload, CrfSearchResultPayload, EncodeCompletedPayload,
-    EncodeProgressPayload, ErrorReplyPayload, FailureReportPayload, HeartbeatPayload, JobKind,
-    PullWorkPayload, ReplyBody, ServerPushFrame, ServerReply, TransferFailurePayload,
-    TransferProgressPayload, TransferStage, TransferStartedPayload, WorkStatus,
+    ActiveJobPayload, AnnouncePayload, CRF_SEARCH_TOPIC, CancelPayload, Capabilities, ClientEvent,
+    ClientFrame, ControlAction, ControlPayload, ControlState, ControlStatePayload,
+    CrfSearchCompletedPayload, CrfSearchProgressPayload, CrfSearchResultPayload,
+    EncodeCompletedPayload, EncodeProgressPayload, ErrorReplyPayload, FailureReportPayload,
+    HeartbeatPayload, JobKind, PullWorkPayload, ReplyBody, ServerPushFrame, ServerReply,
+    TransferFailurePayload, TransferProgressPayload, TransferStage, TransferStartedPayload,
+    WorkStatus,
 };
 use crate::command::worker_transfer::{Chunk, ChunkReceiver};
 use crate::command::{crf_search, encode, sample_encode};
 use crate::ffprobe::Ffprobe;
-use crate::process::managed::ProcessScope;
+use crate::process::{ProcessExitError, managed::ProcessScope};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -17,13 +18,13 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs, io,
     io::Read,
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -47,7 +48,61 @@ const TRANSFER_CHUNK_HEADER_LEN: usize = 52;
 const MAX_TRANSFER_FRAME_BYTES: usize = 640 * 1024 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HTTP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
+const HTTP_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 static HEARTBEAT_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+
+#[derive(Debug)]
+struct TransferGate {
+    state: Mutex<ControlState>,
+    changed: Condvar,
+}
+
+impl TransferGate {
+    fn running() -> Self {
+        Self {
+            state: Mutex::new(ControlState::Running),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn set(&self, state: ControlState) {
+        *self.state.lock().expect("transfer gate lock") = state;
+        self.changed.notify_all();
+    }
+
+    fn wait_until_running(&self) -> io::Result<()> {
+        let mut state = self.state.lock().expect("transfer gate lock");
+        while *state == ControlState::Paused {
+            state = self.changed.wait(state).expect("transfer gate wait");
+        }
+        if *state == ControlState::Stopped {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "worker transfer stopped",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct ControlledReader<R> {
+    inner: R,
+    gate: Arc<TransferGate>,
+}
+
+fn worker_http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_read(HTTP_TRANSFER_IDLE_TIMEOUT)
+        .timeout_write(HTTP_TRANSFER_IDLE_TIMEOUT)
+        .build()
+}
+
+impl<R: Read> Read for ControlledReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.gate.wait_until_running()?;
+        self.inner.read(buffer)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BytesPerSecond(Option<NonZeroU64>);
@@ -422,7 +477,11 @@ impl WorkerJob {
     }
 
     fn failure_payload(&self, error: &anyhow::Error) -> FailureReportPayload {
-        let exit_code = 1;
+        let exit_code = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ProcessExitError>())
+            .and_then(ProcessExitError::code)
+            .unwrap_or(crate::FAILURE_EXIT_CODE);
 
         FailureReportPayload {
             job_id: self.assignment.job_id.clone(),
@@ -445,10 +504,25 @@ impl WorkerJob {
             stderr_excerpt: Some(format!("{error:#}")),
         }
     }
+
+    fn control_state_payload(
+        &self,
+        control: &ControlPayload,
+        state: ControlState,
+    ) -> ControlStatePayload {
+        ControlStatePayload {
+            state,
+            active_video_id: Some(self.assignment.video_id),
+            job_id: Some(self.assignment.job_id.clone()),
+            command_id: control.command_id.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct WorkerJobReportState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control_state: Option<ControlStatePayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     heartbeat: Option<HeartbeatPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1073,6 +1147,7 @@ struct WorkerRuntime {
     idle_delay: Duration,
     reconnect_base_delay: Duration,
     reconnect_max_delay: Duration,
+    offline_job_timeout: Duration,
     max_pulls: Option<usize>,
 }
 
@@ -1082,6 +1157,7 @@ impl Default for WorkerRuntime {
             idle_delay: Duration::from_secs(5),
             reconnect_base_delay: Duration::from_secs(1),
             reconnect_max_delay: Duration::from_secs(30),
+            offline_job_timeout: Duration::from_secs(90),
             max_pulls: None,
         }
     }
@@ -1320,6 +1396,10 @@ fn cleanup_multiplex_worker_input(
     job: &WorkerJob,
     outcome: &Result<WorkerJobOutcome>,
 ) -> Result<()> {
+    if outcome.is_err() || matches!(outcome, Ok(WorkerJobOutcome::Stopped)) {
+        return remove_worker_input(job);
+    }
+
     if matches!(outcome, Ok(WorkerJobOutcome::Completed)) {
         let retain_local_output = job.assignment.job_type == JobKind::Encode
             && job.assignment.output_transfer.is_none()
@@ -1341,6 +1421,60 @@ fn cleanup_multiplex_worker_input(
     Ok(())
 }
 
+fn apply_job_control(
+    job: &WorkerJob,
+    control: &ControlPayload,
+    output: &UnboundedSender<MultiplexOutput>,
+    process_scope: Option<&ProcessScope>,
+    paused: &mut bool,
+) -> Result<Option<WorkerJobOutcome>> {
+    let (state, outcome) = match control.action {
+        ControlAction::Pause => {
+            if let Some(scope) = process_scope {
+                scope.pause()?;
+            }
+            *paused = true;
+            (ControlState::Paused, None)
+        }
+        ControlAction::Resume | ControlAction::Start => {
+            if let Some(scope) = process_scope {
+                scope.resume()?;
+            }
+            *paused = false;
+            (ControlState::Running, None)
+        }
+        ControlAction::Stop => {
+            if let Some(scope) = process_scope {
+                scope.stop()?;
+            }
+            (ControlState::Stopped, Some(WorkerJobOutcome::Stopped))
+        }
+    };
+    let _ = multiplex_event(
+        output,
+        &job.assignment.job_id,
+        ClientEvent::ControlState(job.control_state_payload(control, state)),
+        "control_state",
+    );
+    Ok(outcome)
+}
+
+fn apply_transfer_control(
+    job: &WorkerJob,
+    control: &ControlPayload,
+    output: &UnboundedSender<MultiplexOutput>,
+    gate: &TransferGate,
+    paused: &mut bool,
+) -> Result<Option<WorkerJobOutcome>> {
+    let outcome = apply_job_control(job, control, output, None, paused)?;
+    gate.set(match control.action {
+        ControlAction::Pause => ControlState::Paused,
+        ControlAction::Resume | ControlAction::Start => ControlState::Running,
+        ControlAction::Stop => ControlState::Stopped,
+    });
+    Ok(outcome)
+}
+
 async fn run_multiplex_job_inner(
     job: &WorkerJob,
     commands: &mut UnboundedReceiver<JobCommand>,
@@ -1354,22 +1488,80 @@ async fn run_multiplex_job_inner(
     }
 
     if matches!(phase, WorkerJobPhase::AwaitingInput(InputDelivery::Http)) {
-        download_multiplex_input(job, output).await?;
-    } else if matches!(phase, WorkerJobPhase::AwaitingInput(_)) {
-        receive_multiplex_input(job, commands, output).await?;
+        if let Some(outcome) = download_multiplex_input(job, commands, output).await? {
+            return Ok(outcome);
+        }
+    } else if matches!(phase, WorkerJobPhase::AwaitingInput(_))
+        && let Some(outcome) = receive_multiplex_input(job, commands, output).await?
+    {
+        return Ok(outcome);
     }
 
-    let probe = Arc::new(crate::ffprobe::probe(job.input_path()));
+    let probe = match probe_multiplex_input(job, commands, output).await? {
+        Ok(probe) => probe,
+        Err(outcome) => return Ok(outcome),
+    };
     match job.assignment.job_type {
         JobKind::CrfSearch => run_multiplex_crf(job, probe, commands, output).await,
         JobKind::Encode => run_multiplex_encode(job, probe, commands, output).await,
     }
 }
 
+async fn probe_multiplex_input(
+    job: &WorkerJob,
+    commands: &mut UnboundedReceiver<JobCommand>,
+    output: &UnboundedSender<MultiplexOutput>,
+) -> Result<std::result::Result<Arc<Ffprobe>, WorkerJobOutcome>> {
+    let input = job.input_path().to_path_buf();
+    let probe = async move { Arc::new(crate::ffprobe::probe_managed(&input).await) };
+    drive_multiplex_probe(job, commands, output, probe).await
+}
+
+async fn drive_multiplex_probe<F>(
+    job: &WorkerJob,
+    commands: &mut UnboundedReceiver<JobCommand>,
+    output: &UnboundedSender<MultiplexOutput>,
+    probe: F,
+) -> Result<std::result::Result<Arc<Ffprobe>, WorkerJobOutcome>>
+where
+    F: std::future::Future<Output = Arc<Ffprobe>>,
+{
+    let process_scope = ProcessScope::new(job.assignment.job_id.clone());
+    let probe = process_scope.run(probe);
+    tokio::pin!(probe);
+    let mut paused = false;
+    loop {
+        tokio::select! {
+            result = &mut probe, if !paused => {
+                return Ok(Ok(result));
+            }
+            command = commands.recv() => match command {
+                Some(JobCommand::Control(control)) => {
+                    if let Some(outcome) =
+                        apply_job_control(job, &control, output, Some(&process_scope), &mut paused)?
+                    {
+                        return Ok(Err(outcome));
+                    }
+                }
+                Some(JobCommand::Cancel(cancel)) => {
+                    process_scope.stop()?;
+                    bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
+                }
+                Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
+                None => {
+                    process_scope.stop()?;
+                    bail!("worker command channel closed while probing input");
+                }
+            }
+        }
+    }
+}
+
 async fn download_multiplex_input(
     job: &WorkerJob,
+    commands: &mut UnboundedReceiver<JobCommand>,
     output: &UnboundedSender<MultiplexOutput>,
-) -> Result<()> {
+) -> Result<Option<WorkerJobOutcome>> {
     let transfer = job
         .assignment
         .transfer
@@ -1385,18 +1577,24 @@ async fn download_multiplex_input(
     let job_id = job.assignment.job_id.clone();
     let expected_size = job.assignment.size_bytes;
     let received = Arc::new(AtomicU64::new(0));
+    let gate = Arc::new(TransferGate::running());
     let copy_received = Arc::clone(&received);
+    let copy_gate = Arc::clone(&gate);
     let copy_job_id = job_id.clone();
     let copy = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let response = ureq::get(&transfer.url)
+        let response = worker_http_agent()
+            .get(&transfer.url)
             .set(&transfer.auth.header, &transfer.auth.value)
             .call()
             .map_err(|error| {
                 anyhow!("HTTP input download failed for job {copy_job_id}: {error}")
             })?;
-        let reader = CountingReader {
-            inner: response.into_reader(),
-            received: copy_received,
+        let reader = ControlledReader {
+            inner: CountingReader {
+                inner: response.into_reader(),
+                received: copy_received,
+            },
+            gate: copy_gate,
         };
         let mut output_file =
             fs::File::create(&part_path).context("create HTTP worker input part file")?;
@@ -1414,6 +1612,7 @@ async fn download_multiplex_input(
     let mut progress = tokio::time::interval(HTTP_TRANSFER_PROGRESS_INTERVAL);
     progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tokio::pin!(copy);
+    let mut paused = false;
     loop {
         tokio::select! {
             _ = progress.tick() => {
@@ -1434,7 +1633,28 @@ async fn download_multiplex_input(
             }
             result = &mut copy => {
                 result.context("join HTTP worker input download task")??;
-                return Ok(());
+                return Ok(None);
+            }
+            command = commands.recv() => match command {
+                Some(JobCommand::Control(control)) => {
+                    if let Some(outcome) =
+                        apply_transfer_control(job, &control, output, &gate, &mut paused)?
+                    {
+                        let _ = (&mut copy).await;
+                        return Ok(Some(outcome));
+                    }
+                }
+                Some(JobCommand::Cancel(cancel)) => {
+                    gate.set(ControlState::Stopped);
+                    let _ = (&mut copy).await;
+                    bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
+                }
+                Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
+                None => {
+                    gate.set(ControlState::Stopped);
+                    let _ = (&mut copy).await;
+                    bail!("worker command channel closed while downloading input");
+                }
             }
         }
     }
@@ -1444,12 +1664,22 @@ async fn receive_multiplex_input(
     job: &WorkerJob,
     commands: &mut UnboundedReceiver<JobCommand>,
     output: &UnboundedSender<MultiplexOutput>,
-) -> Result<()> {
+) -> Result<Option<WorkerJobOutcome>> {
     let mut pending = PendingJob::waiting(job.clone());
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut paused = false;
+    let mut deferred = VecDeque::new();
 
     loop {
+        let deferred_command = (!paused).then(|| deferred.pop_front()).flatten();
+        if let Some(command) = deferred_command {
+            if apply_input_command(&mut pending, command, output)? {
+                return Ok(None);
+            }
+            continue;
+        }
+
         tokio::select! {
             _ = heartbeat.tick() => {
                 let _ = multiplex_event(
@@ -1460,39 +1690,64 @@ async fn receive_multiplex_input(
                 );
             }
             command = commands.recv() => match command {
-                Some(JobCommand::TransferStarted(started)) => {
-                    pending.ensure_receiver(started.chunk_size_bytes)?;
+                Some(command @ (JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)))
+                    if paused =>
+                {
+                    deferred.push_back(command);
                 }
-                Some(JobCommand::TransferChunk(chunk)) => {
-                    let chunk_index = chunk.chunk_index;
-                    let total_chunks = chunk.total_chunks;
-                    pending.apply_raw_chunk(chunk)?;
-                    let progress = pending.transfer_progress_payload(chunk_index, total_chunks);
-                    let _ = multiplex_event(
-                        output,
-                        &job.assignment.job_id,
-                        ClientEvent::TransferProgress(progress),
-                        "transfer_progress",
-                    );
-                    if pending.receiver.as_ref().is_some_and(|receiver| {
-                        receiver.received_bytes() == pending.job.assignment.size_bytes
-                    }) {
-                        pending.finish()?;
-                        return Ok(());
+                Some(command @ (JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_))) => {
+                    if apply_input_command(&mut pending, command, output)? {
+                        return Ok(None);
                     }
                 }
                 Some(JobCommand::Cancel(cancel)) => {
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
                 Some(JobCommand::Control(control)) => {
-                    if control.action == ControlAction::Stop {
-                        return Ok(());
+                    if let Some(outcome) =
+                        apply_job_control(job, &control, output, None, &mut paused)?
+                    {
+                        return Ok(Some(outcome));
                     }
                 }
                 None => bail!("worker command channel closed while receiving input"),
             }
         }
     }
+}
+
+fn apply_input_command(
+    pending: &mut PendingJob,
+    command: JobCommand,
+    output: &UnboundedSender<MultiplexOutput>,
+) -> Result<bool> {
+    match command {
+        JobCommand::TransferStarted(started) => {
+            pending.ensure_receiver(started.chunk_size_bytes)?;
+        }
+        JobCommand::TransferChunk(chunk) => {
+            let chunk_index = chunk.chunk_index;
+            let total_chunks = chunk.total_chunks;
+            pending.apply_raw_chunk(chunk)?;
+            let progress = pending.transfer_progress_payload(chunk_index, total_chunks);
+            let _ = multiplex_event(
+                output,
+                &pending.job.assignment.job_id,
+                ClientEvent::TransferProgress(progress),
+                "transfer_progress",
+            );
+            if pending.receiver.as_ref().is_some_and(|receiver| {
+                receiver.received_bytes() == pending.job.assignment.size_bytes
+            }) {
+                pending.finish()?;
+                return Ok(true);
+            }
+        }
+        JobCommand::Cancel(_) | JobCommand::Control(_) => {
+            unreachable!("only input transfer commands are deferred")
+        }
+    }
+    Ok(false)
 }
 
 async fn run_multiplex_crf(
@@ -1523,49 +1778,10 @@ async fn run_multiplex_crf(
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
                 Some(JobCommand::Control(control)) => {
-                    match control.action {
-                        ControlAction::Pause => {
-                            process_scope.pause()?;
-                            paused = true;
-                            let _ = multiplex_event(
-                                output,
-                                &job.assignment.job_id,
-                                ClientEvent::ControlState(ControlStatePayload {
-                                    state: ControlState::Paused,
-                                    active_video_id: Some(job.assignment.video_id),
-                                    job_id: None,
-                                }),
-                                "control_state",
-                            );
-                        }
-                        ControlAction::Resume | ControlAction::Start => {
-                            process_scope.resume()?;
-                            paused = false;
-                            let _ = multiplex_event(
-                                output,
-                                &job.assignment.job_id,
-                                ClientEvent::ControlState(ControlStatePayload {
-                                    state: ControlState::Running,
-                                    active_video_id: Some(job.assignment.video_id),
-                                    job_id: None,
-                                }),
-                                "control_state",
-                            );
-                        }
-                        ControlAction::Stop => {
-                            process_scope.stop()?;
-                            let _ = multiplex_event(
-                                output,
-                                &job.assignment.job_id,
-                                ClientEvent::ControlState(ControlStatePayload {
-                                    state: ControlState::Stopped,
-                                    active_video_id: None,
-                                    job_id: None,
-                                }),
-                                "control_state",
-                            );
-                            return Ok(WorkerJobOutcome::Stopped);
-                        }
+                    if let Some(outcome) =
+                        apply_job_control(job, &control, output, Some(&process_scope), &mut paused)?
+                    {
+                        return Ok(outcome);
                     }
                 }
                 Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
@@ -1695,6 +1911,7 @@ async fn run_multiplex_encode_with_heartbeat_interval(
     tokio::pin!(run);
     let mut heartbeat = tokio::time::interval(heartbeat_interval);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut paused = false;
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
@@ -1719,10 +1936,19 @@ async fn run_multiplex_encode_with_heartbeat_interval(
                     output_percent,
                     throughput: None,
                 };
-                if let Some(transfer) = &job.assignment.output_transfer {
-                    upload_multiplex_output(&output_path, transfer, output_bytes, &job.assignment.job_id)
-                        .await?;
-                }
+                if let Some(transfer) = &job.assignment.output_transfer
+                    && let Some(outcome) = upload_multiplex_output(
+                        job,
+                        &output_path,
+                        transfer,
+                        output_bytes,
+                        commands,
+                        output,
+                    )
+                    .await?
+                    {
+                        return Ok(outcome);
+                    }
                 let _ = multiplex_event(
                     output,
                     &job.assignment.job_id,
@@ -1748,48 +1974,13 @@ async fn run_multiplex_encode_with_heartbeat_interval(
                 Some(JobCommand::Cancel(cancel)) => {
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
-                Some(JobCommand::Control(control)) => match control.action {
-                    ControlAction::Pause => {
-                        process_scope.pause()?;
-                        let _ = multiplex_event(
-                            output,
-                            &job.assignment.job_id,
-                            ClientEvent::ControlState(ControlStatePayload {
-                                state: ControlState::Paused,
-                                active_video_id: Some(job.assignment.video_id),
-                                job_id: Some(job.assignment.job_id.clone()),
-                            }),
-                            "control_state",
-                        );
+                Some(JobCommand::Control(control)) => {
+                    if let Some(outcome) =
+                        apply_job_control(job, &control, output, Some(&process_scope), &mut paused)?
+                    {
+                        return Ok(outcome);
                     }
-                    ControlAction::Resume | ControlAction::Start => {
-                        process_scope.resume()?;
-                        let _ = multiplex_event(
-                            output,
-                            &job.assignment.job_id,
-                            ClientEvent::ControlState(ControlStatePayload {
-                                state: ControlState::Running,
-                                active_video_id: Some(job.assignment.video_id),
-                                job_id: Some(job.assignment.job_id.clone()),
-                            }),
-                            "control_state",
-                        );
-                    }
-                    ControlAction::Stop => {
-                        process_scope.stop()?;
-                        let _ = multiplex_event(
-                            output,
-                            &job.assignment.job_id,
-                            ClientEvent::ControlState(ControlStatePayload {
-                                state: ControlState::Stopped,
-                                active_video_id: None,
-                                job_id: Some(job.assignment.job_id.clone()),
-                            }),
-                            "control_state",
-                        );
-                        return Ok(WorkerJobOutcome::Stopped);
-                    }
-                },
+                }
                 Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
                 None => bail!("worker command channel closed while running encode"),
             }
@@ -1798,31 +1989,68 @@ async fn run_multiplex_encode_with_heartbeat_interval(
 }
 
 async fn upload_multiplex_output(
+    job: &WorkerJob,
     output_path: &Path,
     transfer: &crate::command::worker_protocol::TransferSpec,
     output_bytes: u64,
-    job_id: &str,
-) -> Result<()> {
+    commands: &mut UnboundedReceiver<JobCommand>,
+    output: &UnboundedSender<MultiplexOutput>,
+) -> Result<Option<WorkerJobOutcome>> {
     let output_path = output_path.to_path_buf();
     let transfer = transfer.clone();
-    let job_id = job_id.to_owned();
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let job_id = job.assignment.job_id.clone();
+    let gate = Arc::new(TransferGate::running());
+    let copy_gate = Arc::clone(&gate);
+    let upload = tokio::task::spawn_blocking(move || -> Result<()> {
         let file = fs::File::open(&output_path).with_context(|| {
             format!(
                 "open encoded output for upload for job {job_id}: {}",
                 output_path.display()
             )
         })?;
-        ureq::put(&transfer.url)
+        let reader = ControlledReader {
+            inner: file,
+            gate: copy_gate,
+        };
+        worker_http_agent()
+            .put(&transfer.url)
             .set(&transfer.auth.header, &transfer.auth.value)
             .set("Content-Length", &output_bytes.to_string())
-            .send(file)
+            .send(reader)
             .map_err(|error| anyhow!("HTTP output upload failed for job {job_id}: {error}"))?;
         Ok(())
-    })
-    .await
-    .context("join HTTP output upload task")??;
-    Ok(())
+    });
+    tokio::pin!(upload);
+    let mut paused = false;
+    loop {
+        tokio::select! {
+            result = &mut upload => {
+                result.context("join HTTP output upload task")??;
+                return Ok(None);
+            }
+            command = commands.recv() => match command {
+                Some(JobCommand::Control(control)) => {
+                    if let Some(outcome) =
+                        apply_transfer_control(job, &control, output, &gate, &mut paused)?
+                    {
+                        let _ = (&mut upload).await;
+                        return Ok(Some(outcome));
+                    }
+                }
+                Some(JobCommand::Cancel(cancel)) => {
+                    gate.set(ControlState::Stopped);
+                    let _ = (&mut upload).await;
+                    bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
+                }
+                Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
+                None => {
+                    gate.set(ControlState::Stopped);
+                    let _ = (&mut upload).await;
+                    bail!("worker command channel closed while uploading output");
+                }
+            }
+        }
+    }
 }
 
 type WorkerSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -1968,6 +2196,7 @@ impl ConnectedWorker {
             state,
             active_video_id,
             job_id: None,
+            command_id: None,
         }))
         .await
     }
@@ -2255,7 +2484,7 @@ async fn run_worker_encode(
 }
 
 fn remove_worker_input(job: &WorkerJob) -> Result<()> {
-    if job.input_dir != worker_job_input_dir(&job.assignment.job_id) {
+    if job.input_dir != worker_job_input_dir(&job.assignment.job_id) || !job.input_dir.exists() {
         return Ok(());
     }
 
@@ -2441,7 +2670,8 @@ async fn download_worker_input(worker: &mut ConnectedWorker, job: &WorkerJob) ->
     let copy_received = Arc::clone(&received);
 
     let mut copy = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let response = ureq::get(&transfer.url)
+        let response = worker_http_agent()
+            .get(&transfer.url)
             .set(&transfer.auth.header, &transfer.auth.value)
             .call()
             .map_err(|error| anyhow!("HTTP input download failed for job {job_id}: {error}"))?;
@@ -2931,6 +3161,7 @@ async fn run_multiplexed_worker(
     let mut no_work = HashMap::new();
     let mut reconnect = tokio::time::interval(runtime.reconnect_base_delay);
     reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut offline_deadline = None;
 
     loop {
         if let Some(worker) = connection.as_mut() {
@@ -2997,6 +3228,7 @@ async fn run_multiplexed_worker(
                                     "worker reconnected"
                                 );
                                 connection = Some(candidate);
+                                offline_deadline = None;
                                 reconnect = tokio::time::interval(runtime.reconnect_base_delay);
                                 reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                             }
@@ -3006,11 +3238,18 @@ async fn run_multiplexed_worker(
                         }
                     }
                 }
+                _ = wait_for_offline_deadline(offline_deadline) => {
+                    expire_offline_jobs(&mut jobs, &mut pending, &mut outputs).await?;
+                    bail!("coordinator unavailable until worker job lease expired");
+                }
             }
         }
 
         if connection_lost {
             connection = None;
+            if !jobs.is_empty() {
+                offline_deadline = Some(Instant::now() + runtime.offline_job_timeout);
+            }
             pending.clear();
             no_work.clear();
             pending_acks.clear();
@@ -3020,6 +3259,47 @@ async fn run_multiplexed_worker(
             return Ok(());
         }
     }
+}
+
+async fn wait_for_offline_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn expire_offline_jobs(
+    jobs: &mut HashMap<String, MultiplexJob>,
+    pending: &mut HashMap<String, (JobKind, Option<String>)>,
+    outputs: &mut UnboundedReceiver<MultiplexOutput>,
+) -> Result<()> {
+    for (job_id, job) in &*jobs {
+        if !job.finished {
+            job.command
+                .send(JobCommand::Cancel(CancelPayload {
+                    job_id: job_id.clone(),
+                    reason: "worker job lease expired while coordinator was unavailable".into(),
+                }))
+                .map_err(|_| anyhow!("worker job {job_id} command channel closed"))?;
+        }
+    }
+
+    while jobs.values().any(|job| !job.finished) {
+        let item = outputs
+            .recv()
+            .await
+            .context("worker output channel closed while expiring offline jobs")?;
+        handle_multiplex_output_offline(item, jobs, pending)?;
+    }
+
+    for job in jobs.values() {
+        remove_worker_input(&job.job)?;
+    }
+    jobs.clear();
+    pending.clear();
+    Ok(())
 }
 
 fn handle_multiplex_output_offline(
@@ -3208,7 +3488,14 @@ async fn send_multiplex_event(
 }
 
 fn event_requires_ack(name: &str) -> bool {
-    matches!(name, "encode_completed" | "video_failed")
+    matches!(
+        name,
+        "job_active"
+            | "crf_search_completed"
+            | "encode_completed"
+            | "video_failed"
+            | "control_state"
+    )
 }
 
 fn record_multiplex_event(state: &mut WorkerJobReportState, event: &ClientEvent) {
@@ -3221,10 +3508,11 @@ fn record_multiplex_event(state: &mut WorkerJobReportState, event: &ClientEvent)
         ClientEvent::EncodeProgress(payload) => state.encode_progress = Some(payload.clone()),
         ClientEvent::EncodeCompleted(payload) => state.encode_completed = Some(payload.clone()),
         ClientEvent::VideoFailed(payload) => state.failure = Some(payload.clone()),
+        ClientEvent::ControlState(payload) => state.control_state = Some(payload.clone()),
         ClientEvent::Join
         | ClientEvent::Announce(_)
+        | ClientEvent::JobActive(_)
         | ClientEvent::PullWork(_)
-        | ClientEvent::ControlState(_)
         | ClientEvent::TransferFailure(_) => {}
     }
 }
@@ -3278,17 +3566,21 @@ async fn handle_multiplex_frame(
             }
             if let Some((reference, ack, decoded)) = event_ack {
                 pending_acks.remove(&reference);
-                if let Err(error) = decoded {
-                    debug!(
-                        job_id = %ack.job_id,
-                        event = ack.name,
-                        error = %error,
-                        "multiplexed worker event was rejected"
-                    );
-                    return Ok(false);
+                match decoded {
+                    Ok(response) => {
+                        handle_multiplex_ack(&ack, &response, jobs, pending)?;
+                        return Ok(true);
+                    }
+                    Err(error) => {
+                        debug!(
+                            job_id = %ack.job_id,
+                            event = ack.name,
+                            error = %error,
+                            "multiplexed worker event was rejected"
+                        );
+                        return Ok(false);
+                    }
                 }
-                acknowledge_multiplex_event(&ack, jobs, pending);
-                return Ok(true);
             }
 
             let mut reply = None;
@@ -3423,13 +3715,58 @@ fn acknowledge_multiplex_event(
     jobs: &mut HashMap<String, MultiplexJob>,
     pending: &mut HashMap<String, (JobKind, Option<String>)>,
 ) {
-    if !event_requires_ack(ack.name) {
-        return;
-    }
-
-    if jobs.get(&ack.job_id).is_some_and(|job| job.finished) {
+    if jobs
+        .get(&ack.job_id)
+        .is_some_and(|job| job.finished && terminal_event_name(job) == Some(ack.name))
+    {
         jobs.remove(&ack.job_id);
         pending.retain(|_, (_, resend)| resend.as_deref() != Some(&ack.job_id));
+    }
+}
+
+fn handle_multiplex_ack(
+    ack: &PendingEventAck,
+    response: &Value,
+    jobs: &mut HashMap<String, MultiplexJob>,
+    pending: &mut HashMap<String, (JobKind, Option<String>)>,
+) -> Result<()> {
+    if ack.name == "job_active"
+        && response
+            .get("discarded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        if let Some(job) = jobs.get(&ack.job_id) {
+            job.command
+                .send(JobCommand::Cancel(CancelPayload {
+                    job_id: ack.job_id.clone(),
+                    reason: "coordinator discarded stale worker attempt".into(),
+                }))
+                .map_err(|_| anyhow!("worker job command channel closed"))?;
+        }
+        return Ok(());
+    }
+
+    acknowledge_multiplex_event(ack, jobs, pending);
+    Ok(())
+}
+
+fn terminal_event_name(job: &MultiplexJob) -> Option<&'static str> {
+    if job.state.failure.is_some() {
+        Some("video_failed")
+    } else if job.state.encode_completed.is_some() {
+        Some("encode_completed")
+    } else if job.state.crf_completed.is_some() {
+        Some("crf_search_completed")
+    } else if job
+        .state
+        .control_state
+        .as_ref()
+        .is_some_and(|control| control.state == ControlState::Stopped)
+    {
+        Some("control_state")
+    } else {
+        None
     }
 }
 
@@ -3445,10 +3782,8 @@ fn remove_finished_job_if_acknowledged(
     if !job.finished {
         return;
     }
-    if job.state.encode_completed.is_some() || job.state.failure.is_some() {
-        if pending_acks.values().any(|ack| ack.job_id == job_id) {
-            return;
-        }
+    if pending_acks.values().any(|ack| ack.job_id == job_id) {
+        return;
     }
     jobs.remove(job_id);
     pending.retain(|_, (_, resend)| resend.as_deref() != Some(job_id));
@@ -3460,18 +3795,31 @@ async fn replay_multiplex_jobs(
     pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> bool {
     for (job_id, job) in jobs {
-        if !send_multiplex_event(
-            worker,
-            ClientEvent::ControlState(ControlStatePayload {
-                state: ControlState::Running,
-                active_video_id: Some(job.job.assignment.video_id),
-                job_id: Some(job_id.clone()),
-            }),
-            job_id,
-            "control_state",
-            pending_acks,
-        )
-        .await
+        if !job.finished
+            && !send_multiplex_event(
+                worker,
+                ClientEvent::JobActive(ActiveJobPayload {
+                    job_id: job_id.clone(),
+                    video_id: job.job.assignment.video_id,
+                    job_type: job.job.assignment.job_type,
+                }),
+                job_id,
+                "job_active",
+                pending_acks,
+            )
+            .await
+        {
+            return false;
+        }
+        if let Some(control_state) = &job.state.control_state
+            && !send_multiplex_event(
+                worker,
+                ClientEvent::ControlState(control_state.clone()),
+                job_id,
+                "control_state",
+                pending_acks,
+            )
+            .await
         {
             return false;
         }
@@ -4179,12 +4527,14 @@ mod tests {
             PathBuf::from("/tmp/crf-search-123/movie.mkv"),
         );
 
-        let payload = job.failure_payload(&anyhow!("ab-av1 failed"));
+        let payload = job.failure_payload(&anyhow!(crf_search::Error::Other(anyhow!(
+            ProcessExitError::new(Some(254), "ffmpeg exited unsuccessfully",)
+        ))));
 
         assert_eq!(payload.stage, "crf_search");
         assert_eq!(payload.category, "process_failure");
-        assert_eq!(payload.code, "EXIT_1");
-        assert_eq!(payload.context["exit_code"], json!(1));
+        assert_eq!(payload.code, "EXIT_254");
+        assert_eq!(payload.context["exit_code"], json!(254));
     }
 
     #[test]
@@ -4285,9 +4635,141 @@ mod tests {
         remove_finished_job_if_acknowledged("encode-123", &mut jobs, &mut pending, &pending_acks);
         assert!(jobs.contains_key("encode-123"));
 
+        acknowledge_multiplex_event(
+            &PendingEventAck {
+                job_id: "encode-123".into(),
+                name: "control_state",
+            },
+            &mut jobs,
+            &mut pending,
+        );
+        assert!(
+            jobs.contains_key("encode-123"),
+            "an unrelated control acknowledgement must not retire the completion"
+        );
+
         let ack = pending_acks.remove("7").expect("pending ack");
         acknowledge_multiplex_event(&ack, &mut jobs, &mut pending);
         assert!(!jobs.contains_key("encode-123"));
+    }
+
+    #[test]
+    fn every_terminal_worker_event_requires_acknowledgement() {
+        assert!(event_requires_ack("crf_search_completed"));
+        assert!(event_requires_ack("encode_completed"));
+        assert!(event_requires_ack("video_failed"));
+        assert!(event_requires_ack("control_state"));
+        assert!(!event_requires_ack("encode_progress"));
+    }
+
+    #[test]
+    fn discarded_active_attempt_is_cancelled() -> Result<()> {
+        let (command, mut commands) = mpsc::unbounded_channel();
+        let mut jobs = HashMap::from([(
+            "encode-stale".into(),
+            MultiplexJob {
+                job: probe_phase_job("encode-stale"),
+                command,
+                state: WorkerJobReportState::default(),
+                finished: false,
+            },
+        )]);
+        let mut pending = HashMap::new();
+
+        handle_multiplex_ack(
+            &PendingEventAck {
+                job_id: "encode-stale".into(),
+                name: "job_active",
+            },
+            &serde_json::json!({
+                "accepted": false,
+                "discarded": true,
+                "reason": "stale_worker_attempt"
+            }),
+            &mut jobs,
+            &mut pending,
+        )?;
+
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(JobCommand::Cancel(CancelPayload { ref job_id, .. }))
+                if job_id == "encode-stale"
+        ));
+        assert!(jobs.contains_key("encode-stale"));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_ack_identity_covers_every_terminal_outcome() {
+        let states = [
+            (
+                WorkerJobReportState {
+                    crf_completed: Some(CrfSearchCompletedPayload {
+                        job_id: "crf-123".into(),
+                        video_id: 123,
+                        result: "ok".into(),
+                        chosen_crf: 30.0,
+                        results: Vec::new(),
+                    }),
+                    ..WorkerJobReportState::default()
+                },
+                "crf_search_completed",
+            ),
+            (
+                WorkerJobReportState {
+                    encode_completed: Some(EncodeCompletedPayload {
+                        job_id: "encode-123".into(),
+                        video_id: 123,
+                        source_name: "movie.mkv".into(),
+                        output_path: "movie.av1.mkv".into(),
+                        output_bytes: 500,
+                        output_percent: 50.0,
+                    }),
+                    ..WorkerJobReportState::default()
+                },
+                "encode_completed",
+            ),
+            (
+                WorkerJobReportState {
+                    failure: Some(FailureReportPayload {
+                        job_id: "failed-123".into(),
+                        video_id: 123,
+                        stage: "encode".into(),
+                        category: "process_failure".into(),
+                        code: "EXIT_254".into(),
+                        message: "failed".into(),
+                        context: json!({"exit_code": 254}),
+                        retriable: false,
+                        stderr_excerpt: None,
+                    }),
+                    ..WorkerJobReportState::default()
+                },
+                "video_failed",
+            ),
+            (
+                WorkerJobReportState {
+                    control_state: Some(ControlStatePayload {
+                        state: ControlState::Stopped,
+                        active_video_id: Some(123),
+                        job_id: Some("stopped-123".into()),
+                        command_id: Some("stop-123".into()),
+                    }),
+                    ..WorkerJobReportState::default()
+                },
+                "control_state",
+            ),
+        ];
+
+        for (state, event_name) in states {
+            let (commands, _) = mpsc::unbounded_channel();
+            let job = MultiplexJob {
+                job: probe_phase_job("terminal-123"),
+                command: commands,
+                state,
+                finished: true,
+            };
+            assert_eq!(terminal_event_name(&job), Some(event_name));
+        }
     }
 
     #[test]
@@ -4321,6 +4803,21 @@ mod tests {
                 ..
             }) if job_id == "encode-123"
         ));
+    }
+
+    #[test]
+    fn multiplex_reconnect_retains_job_control_state() {
+        let mut state = WorkerJobReportState::default();
+        let paused = ControlStatePayload {
+            state: ControlState::Paused,
+            active_video_id: Some(123),
+            job_id: Some("crf-123".into()),
+            command_id: Some("pause-123".into()),
+        };
+
+        record_multiplex_event(&mut state, &ClientEvent::ControlState(paused.clone()));
+
+        assert_eq!(state.control_state, Some(paused));
     }
 
     #[test]
@@ -4485,6 +4982,173 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn stop_during_http_input_does_not_fall_through_to_execution() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request)?;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")?;
+            std::thread::sleep(Duration::from_millis(25));
+            let _ = stream.write_all(b"data");
+            Ok(())
+        });
+        let job_id = format!("stop-http-input-{}", std::process::id());
+        let input_dir = worker_job_input_dir(&job_id);
+        let _ = fs::remove_dir_all(&input_dir);
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::CrfSearch,
+                job_id: job_id.clone(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: Some(TransferSpec {
+                    url: format!("http://{address}"),
+                    auth: TransferAuth {
+                        scheme: "Bearer".into(),
+                        header: "Authorization".into(),
+                        value: "token".into(),
+                    },
+                }),
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: Vec::new(),
+            },
+            input_dir.clone(),
+            input_dir.join("movie.mkv"),
+        );
+        let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Stop,
+            video_id: Some(123),
+            job_id: Some(job_id),
+            command_id: Some("stop-http-input".into()),
+        }))?;
+
+        assert_eq!(
+            download_multiplex_input(&job, &mut command_receiver, &output).await?,
+            Some(WorkerJobOutcome::Stopped)
+        );
+        assert!(matches!(
+            outputs.recv().await,
+            Some(MultiplexOutput::Event {
+                event: ClientEvent::ControlState(ControlStatePayload {
+                    state: ControlState::Stopped,
+                    ..
+                }),
+                ..
+            })
+        ));
+        assert!(!job.input_path().exists());
+        server.join().expect("HTTP input server")?;
+        let _ = fs::remove_dir_all(input_dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_during_http_output_does_not_report_completion() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    return Ok(());
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .context("missing HTTP request header terminator")?
+                + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .context("missing output content length")?
+                .parse::<usize>()?;
+            std::thread::sleep(Duration::from_millis(25));
+            while request.len() < header_end + content_length {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&buffer[..read]),
+                }
+            }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            Ok(())
+        });
+        let job = probe_phase_job("stop-http-output");
+        let output_path = std::env::temp_dir().join(format!(
+            "ab-av1-stop-http-output-{}.mkv",
+            std::process::id()
+        ));
+        let output_file = fs::File::create(&output_path)?;
+        output_file.set_len(4 * 1024 * 1024)?;
+        let transfer = TransferSpec {
+            url: format!("http://{address}"),
+            auth: TransferAuth {
+                scheme: "Bearer".into(),
+                header: "Authorization".into(),
+                value: "token".into(),
+            },
+        };
+        let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Stop,
+            video_id: Some(123),
+            job_id: Some("stop-http-output".into()),
+            command_id: Some("stop-http-output".into()),
+        }))?;
+
+        assert_eq!(
+            upload_multiplex_output(
+                &job,
+                &output_path,
+                &transfer,
+                4 * 1024 * 1024,
+                &mut command_receiver,
+                &output,
+            )
+            .await?,
+            Some(WorkerJobOutcome::Stopped)
+        );
+        assert!(matches!(
+            outputs.recv().await,
+            Some(MultiplexOutput::Event {
+                event: ClientEvent::ControlState(ControlStatePayload {
+                    state: ControlState::Stopped,
+                    ..
+                }),
+                ..
+            })
+        ));
+        while let Ok(event) = outputs.try_recv() {
+            assert!(!matches!(
+                event,
+                MultiplexOutput::Event {
+                    event: ClientEvent::EncodeCompleted(_),
+                    ..
+                }
+            ));
+        }
+        server.join().expect("HTTP output server")?;
+        fs::remove_file(output_path)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn multiplex_encode_sends_heartbeat_without_ffmpeg_progress() -> Result<()> {
         let input_dir =
             std::env::temp_dir().join(format!("ab-av1-multiplex-heartbeat-{}", std::process::id()));
@@ -4569,8 +5233,26 @@ mod tests {
             action: ControlAction::Stop,
             video_id: Some(123),
             job_id: Some("heartbeat-job".into()),
+            command_id: Some("stop-heartbeat-job".into()),
         }))?;
         assert!(matches!(run.await?, WorkerJobOutcome::Stopped));
+        let mut stopped = false;
+        while let Ok(item) = outputs.try_recv() {
+            stopped |= matches!(
+                item,
+                MultiplexOutput::Event {
+                    event: ClientEvent::ControlState(ControlStatePayload {
+                        state: ControlState::Stopped,
+                        active_video_id: Some(123),
+                        ref job_id,
+                        ref command_id,
+                    }),
+                    ..
+                } if job_id.as_deref() == Some("heartbeat-job")
+                    && command_id.as_deref() == Some("stop-heartbeat-job")
+            );
+        }
+        assert!(stopped);
         crate::command::encode::test_hooks::clear();
         let _ = fs::remove_dir_all(input_dir);
         assert!(heartbeat);
@@ -4578,7 +5260,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn worker_accepts_and_completes_encode_assignment() -> Result<()> {
+    async fn worker_replays_finished_encode_until_acknowledged() -> Result<()> {
         let (listener, address) = FakeCoordinator::bind("127.0.0.1:0").await?;
         let input = std::env::temp_dir().join(format!(
             "ab-av1-multiplex-client-input-{}.mkv",
@@ -4648,7 +5330,29 @@ mod tests {
                 let frame: Value = serde_json::from_str(&text).expect("worker event json");
                 if frame[3] == "encode_completed" {
                     assert_eq!(frame[4]["output_path"], expected_output);
-                    let request_ref = frame[1].as_str().expect("encode_completed ref");
+                    break;
+                }
+            }
+            drop(writer);
+            drop(reader);
+
+            let (stream, _) = listener.accept().await.expect("accept reconnect");
+            let socket = accept_async(stream)
+                .await
+                .expect("accept reconnect websocket");
+            let (mut writer, mut reader) = socket.split();
+            expect_join(&mut reader).await;
+            send_join_reply(&mut writer).await;
+            expect_announce_for_mode(&mut reader, 1, WorkerMode::Encode).await;
+            send_announce_reply(&mut writer).await;
+            loop {
+                let Some(Ok(Message::Text(text))) = reader.next().await else {
+                    panic!("worker disconnected before replaying encode completion");
+                };
+                let frame: Value = serde_json::from_str(&text).expect("worker replay event json");
+                if frame[3] == "encode_completed" {
+                    assert_eq!(frame[4]["output_path"], expected_output);
+                    let request_ref = frame[1].as_str().expect("encode_completed replay ref");
                     writer
                         .send(Message::Text(
                             json!(["1", request_ref, CRF_SEARCH_TOPIC, "phx_reply", {
@@ -4658,7 +5362,7 @@ mod tests {
                             .to_string(),
                         ))
                         .await
-                        .expect("send encode_completed ack");
+                        .expect("send replayed encode_completed ack");
                     break;
                 }
             }
@@ -4683,6 +5387,7 @@ mod tests {
                     idle_delay: Duration::from_millis(10),
                     reconnect_base_delay: Duration::from_millis(10),
                     reconnect_max_delay: Duration::from_millis(10),
+                    offline_job_timeout: Duration::from_secs(1),
                     max_pulls: Some(1),
                 },
             ))
@@ -4758,6 +5463,7 @@ mod tests {
                 idle_delay: Duration::from_millis(1),
                 reconnect_base_delay: Duration::from_millis(1),
                 reconnect_max_delay: Duration::from_millis(1),
+                offline_job_timeout: Duration::from_secs(1),
                 max_pulls: Some(2),
             },
         )
@@ -4805,6 +5511,7 @@ mod tests {
                 idle_delay: Duration::from_secs(30),
                 reconnect_base_delay: Duration::from_millis(1),
                 reconnect_max_delay: Duration::from_millis(1),
+                offline_job_timeout: Duration::from_secs(1),
                 max_pulls: Some(1),
             },
         )
@@ -4851,6 +5558,7 @@ mod tests {
                 idle_delay: Duration::from_secs(30),
                 reconnect_base_delay: Duration::from_millis(1),
                 reconnect_max_delay: Duration::from_millis(1),
+                offline_job_timeout: Duration::from_secs(1),
                 max_pulls: Some(1),
             },
         )
@@ -4871,6 +5579,7 @@ mod tests {
                     idle_delay: Duration::from_millis(1),
                     reconnect_base_delay: Duration::from_millis(1),
                     reconnect_max_delay: Duration::from_millis(2),
+                    offline_job_timeout: Duration::from_secs(1),
                     max_pulls: Some(2),
                 },
             )
@@ -4971,6 +5680,7 @@ mod tests {
                 idle_delay: Duration::from_millis(50),
                 reconnect_base_delay: Duration::from_millis(1),
                 reconnect_max_delay: Duration::from_millis(1),
+                offline_job_timeout: Duration::from_secs(1),
                 max_pulls: None,
             },
             &mut completed_pulls,
@@ -5074,6 +5784,7 @@ mod tests {
                 action: crate::command::worker_protocol::ControlAction::Pause,
                 video_id: Some(123),
                 job_id: None,
+                command_id: None,
             },
         ))?;
 
@@ -5084,6 +5795,7 @@ mod tests {
                     action: crate::command::worker_protocol::ControlAction::Pause,
                     video_id: Some(123),
                     job_id: None,
+                    command_id: None,
                 }
             ))
         ));
@@ -5096,6 +5808,7 @@ mod tests {
             action: crate::command::worker_protocol::ControlAction::Resume,
             video_id: None,
             job_id: None,
+            command_id: None,
         };
 
         assert!(control_targets_job(&control, "crf-1", 1, false));
@@ -5420,6 +6133,39 @@ mod tests {
     }
 
     #[test]
+    fn controlled_transfer_reader_pauses_resumes_and_stops() -> Result<()> {
+        let gate = Arc::new(TransferGate::running());
+        gate.set(ControlState::Paused);
+        let read_gate = Arc::clone(&gate);
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut reader = ControlledReader {
+                inner: io::Cursor::new(b"data"),
+                gate: read_gate,
+            };
+            let mut buffer = Vec::new();
+            sent.send(reader.read_to_end(&mut buffer).map(|_| buffer))
+                .expect("send read result");
+        });
+
+        assert!(received.recv_timeout(Duration::from_millis(10)).is_err());
+        gate.set(ControlState::Running);
+        assert_eq!(received.recv_timeout(Duration::from_secs(1))??, b"data");
+        reader.join().expect("controlled reader thread");
+
+        gate.set(ControlState::Stopped);
+        let mut stopped = ControlledReader {
+            inner: io::Cursor::new(b"more"),
+            gate,
+        };
+        assert_eq!(
+            stopped.read(&mut [0; 4]).expect_err("stopped read").kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        Ok(())
+    }
+
+    #[test]
     fn worker_input_cleanup_removes_owned_directory_only() -> Result<()> {
         let root = worker_job_input_dir("cleanup-job");
         let _ = fs::remove_dir_all(&root);
@@ -5457,7 +6203,7 @@ mod tests {
     }
 
     #[test]
-    fn multiplex_worker_input_cleanup_is_success_only() -> Result<()> {
+    fn multiplex_worker_input_cleanup_removes_stopped_and_failed_jobs() -> Result<()> {
         let job_id = format!("cleanup-outcome-{}", std::process::id());
         let root = worker_job_input_dir(&job_id);
         let _ = fs::remove_dir_all(&root);
@@ -5485,10 +6231,68 @@ mod tests {
         );
 
         cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Stopped))?;
-        assert!(root.exists());
-        cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Completed))?;
+        assert!(!root.exists());
+
+        fs::create_dir_all(&root)?;
+        fs::write(job.input_path(), b"data")?;
+        cleanup_multiplex_worker_input(&job, &Err(anyhow!("encode failed")))?;
         assert!(!root.exists());
         Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_offline_lease_cancels_jobs_and_removes_owned_files() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let job_id = format!("offline-expired-{}", std::process::id());
+                let root = worker_job_input_dir(&job_id);
+                let _ = fs::remove_dir_all(&root);
+                fs::create_dir_all(&root)?;
+                let input_path = root.join("movie.mkv");
+                let job = WorkerJob::new(
+                    JobAssignedPayload {
+                        status: WorkStatus::JobAssigned,
+                        job_type: JobKind::CrfSearch,
+                        job_id: job_id.clone(),
+                        video_id: 123,
+                        source_name: "movie.mkv".into(),
+                        size_bytes: 4,
+                        chunk_size_bytes: 4,
+                        target_vmaf: 95.0,
+                        transfer: None,
+                        output_transfer: None,
+                        output_shared_path: None,
+                        encode_args: Vec::new(),
+                        crf_search_args: vec![
+                            "crf-search".into(),
+                            "--input".into(),
+                            "movie.mkv".into(),
+                        ],
+                    },
+                    root.clone(),
+                    input_path,
+                );
+                let (output, mut outputs) = mpsc::unbounded_channel();
+                let (command, commands) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(run_multiplex_job(job.clone(), commands, output));
+                let mut jobs = HashMap::from([(
+                    job_id,
+                    MultiplexJob {
+                        job,
+                        command,
+                        state: WorkerJobReportState::default(),
+                        finished: false,
+                    },
+                )]);
+                let mut pending = HashMap::new();
+
+                expire_offline_jobs(&mut jobs, &mut pending, &mut outputs).await?;
+
+                assert!(jobs.is_empty());
+                assert!(!root.exists());
+                Ok(())
+            })
+            .await
     }
 
     #[test]
@@ -5650,6 +6454,237 @@ mod tests {
         );
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_during_input_transfer_acks_and_does_not_start_job() -> Result<()> {
+        let root = worker_job_input_dir("stop-during-input");
+        let _ = fs::remove_dir_all(&root);
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::CrfSearch,
+                job_id: "stop-during-input".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: Vec::new(),
+            },
+            root.clone(),
+            root.join("movie.mkv"),
+        );
+        let (command, mut commands) = mpsc::unbounded_channel();
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        command.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Stop,
+            video_id: Some(123),
+            job_id: Some("stop-during-input".into()),
+            command_id: Some("stop-command".into()),
+        }))?;
+
+        assert_eq!(
+            receive_multiplex_input(&job, &mut commands, &output).await?,
+            Some(WorkerJobOutcome::Stopped)
+        );
+        assert!(matches!(
+            outputs.recv().await,
+            Some(MultiplexOutput::Event {
+                event: ClientEvent::ControlState(ControlStatePayload {
+                    state: ControlState::Stopped,
+                    command_id: Some(command_id),
+                    ..
+                }),
+                ..
+            }) if command_id == "stop-command"
+        ));
+        assert!(!job.input_path().exists());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pause_during_input_transfer_defers_chunks_until_resume() -> Result<()> {
+        let job_id = format!("pause-during-input-{}", std::process::id());
+        let root = worker_job_input_dir(&job_id);
+        let _ = fs::remove_dir_all(&root);
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::CrfSearch,
+                job_id: job_id.clone(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: Vec::new(),
+            },
+            root.clone(),
+            root.join("movie.mkv"),
+        );
+        let (command, mut commands) = mpsc::unbounded_channel();
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        command.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Pause,
+            video_id: Some(123),
+            job_id: Some(job_id.clone()),
+            command_id: Some("pause-command".into()),
+        }))?;
+        command.send(JobCommand::TransferChunk(TransferChunk {
+            transfer_id: job_id.clone(),
+            video_id: 123,
+            chunk_index: 0,
+            total_chunks: 1,
+            bytes_sent: 4,
+            total_bytes: 4,
+            crc32: crc32fast::hash(b"data") as u64,
+            bytes: b"data".to_vec(),
+        }))?;
+
+        let mut receive = std::pin::pin!(receive_multiplex_input(&job, &mut commands, &output));
+        assert!(matches!(
+            tokio::select! {
+                item = outputs.recv() => item,
+                result = &mut receive => panic!("input transfer ended while paused: {result:?}"),
+            },
+            Some(MultiplexOutput::Event {
+                event: ClientEvent::ControlState(ControlStatePayload {
+                    state: ControlState::Paused,
+                    ..
+                }),
+                ..
+            })
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut receive)
+                .await
+                .is_err()
+        );
+        assert!(!job.input_path().exists());
+
+        command.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Resume,
+            video_id: Some(123),
+            job_id: Some(job_id),
+            command_id: Some("resume-command".into()),
+        }))?;
+        assert_eq!(receive.await?, None);
+        assert_eq!(fs::read(job.input_path())?, b"data");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_pause_defers_completion_and_stop_prevents_execution() -> Result<()> {
+        let job = probe_phase_job("probe-control");
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let probe = async move {
+            released.await.expect("release probe");
+            test_worker_probe()
+        };
+        let mut run = std::pin::pin!(drive_multiplex_probe(
+            &job,
+            &mut command_receiver,
+            &output,
+            probe,
+        ));
+
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Pause,
+            video_id: Some(123),
+            job_id: Some("probe-control".into()),
+            command_id: Some("pause-probe".into()),
+        }))?;
+        let paused = tokio::select! {
+            event = outputs.recv() => event,
+            _ = &mut run => panic!("probe advanced before pause acknowledgement"),
+        };
+        assert!(matches!(
+            paused,
+            Some(MultiplexOutput::Event {
+                event: ClientEvent::ControlState(ControlStatePayload {
+                    state: ControlState::Paused,
+                    ..
+                }),
+                ..
+            })
+        ));
+        release.send(()).expect("release probe sender");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut run)
+                .await
+                .is_err(),
+            "a completed probe must not advance while paused"
+        );
+
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Resume,
+            video_id: Some(123),
+            job_id: Some("probe-control".into()),
+            command_id: Some("resume-probe".into()),
+        }))?;
+        assert!(run.await?.is_ok());
+
+        let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let stopped = std::pin::pin!(drive_multiplex_probe(
+            &job,
+            &mut command_receiver,
+            &output,
+            std::future::pending(),
+        ));
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Stop,
+            video_id: Some(123),
+            job_id: Some("probe-control".into()),
+            command_id: Some("stop-probe".into()),
+        }))?;
+        assert!(matches!(stopped.await?, Err(WorkerJobOutcome::Stopped)));
+        Ok(())
+    }
+
+    fn probe_phase_job(job_id: &str) -> WorkerJob {
+        WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobInProgress,
+                job_type: JobKind::CrfSearch,
+                job_id: job_id.into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: vec!["crf-search".into(), "--input".into(), "movie.mkv".into()],
+            },
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/movie.mkv"),
+        )
+    }
+
+    fn test_worker_probe() -> Arc<Ffprobe> {
+        Arc::new(Ffprobe {
+            duration: Ok(Duration::from_secs(120)),
+            has_audio: false,
+            max_audio_channels: None,
+            fps: Ok(24.0),
+            resolution: Some((1920, 1080)),
+            is_image: false,
+            pix_fmt: Some("yuv420p".into()),
+        })
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6144,6 +7179,7 @@ mod tests {
                         action,
                         video_id,
                         job_id: None,
+                        command_id: None,
                     },
                 ))
                 .expect("control push json"),

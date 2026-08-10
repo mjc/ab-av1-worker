@@ -31,6 +31,7 @@ impl ClientFrame {
 pub(crate) enum ClientEvent {
     Join,
     Announce(AnnouncePayload),
+    JobActive(ActiveJobPayload),
     PullWork(PullWorkPayload),
     Heartbeat(HeartbeatPayload),
     ControlState(ControlStatePayload),
@@ -50,6 +51,7 @@ impl ClientEvent {
         match self {
             Self::Join => ("phx_join", ClientPayload::Empty(EmptyPayload {})),
             Self::Announce(payload) => ("announce", ClientPayload::Announce(payload)),
+            Self::JobActive(payload) => ("job_active", ClientPayload::JobActive(payload)),
             Self::PullWork(payload) => ("pull_work", ClientPayload::PullWork(payload)),
             Self::Heartbeat(payload) => ("heartbeat", ClientPayload::Heartbeat(payload)),
             Self::ControlState(payload) => ("control_state", ClientPayload::ControlState(payload)),
@@ -84,6 +86,7 @@ impl ClientEvent {
 enum ClientPayload {
     Empty(EmptyPayload),
     Announce(AnnouncePayload),
+    JobActive(ActiveJobPayload),
     PullWork(PullWorkPayload),
     Heartbeat(HeartbeatPayload),
     ControlState(ControlStatePayload),
@@ -99,6 +102,13 @@ enum ClientPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct EmptyPayload {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveJobPayload {
+    pub(crate) job_id: String,
+    pub(crate) video_id: u64,
+    pub(crate) job_type: JobKind,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PullWorkPayload {
@@ -452,6 +462,8 @@ pub(crate) struct ControlPayload {
     pub(crate) video_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) command_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,6 +473,8 @@ pub(crate) struct ControlStatePayload {
     pub(crate) active_video_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) command_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -650,7 +664,8 @@ mod tests {
             ClientEvent::ControlState(ControlStatePayload {
                 state: ControlState::Paused,
                 active_video_id: Some(123),
-                job_id: None,
+                job_id: Some("job-123".into()),
+                command_id: Some("command-456".into()),
             }),
         );
 
@@ -661,7 +676,12 @@ mod tests {
                 "5",
                 "workers:crf_search",
                 "control_state",
-                {"state": "paused", "active_video_id": 123}
+                {
+                    "state": "paused",
+                    "active_video_id": 123,
+                    "job_id": "job-123",
+                    "command_id": "command-456"
+                }
             ])
         );
     }
@@ -1192,7 +1212,9 @@ mod tests {
             "control",
             {
                 "action": "pause",
-                "video_id": 123
+                "video_id": 123,
+                "job_id": "job-123",
+                "command_id": "command-456"
             }
         ]))
         .expect("parse worker control push");
@@ -1204,7 +1226,8 @@ mod tests {
                 ControlPayload {
                     action: ControlAction::Pause,
                     video_id: Some(123),
-                    job_id: None,
+                    job_id: Some("job-123".into()),
+                    command_id: Some("command-456".into()),
                 },
             )
         );
@@ -1247,6 +1270,29 @@ mod tests {
         assert_eq!(
             serde_json::to_value(PullWorkPayload::input_missing()).expect("serialize pull_work"),
             json!({"input_missing": true})
+        );
+    }
+
+    #[test]
+    fn active_job_payload_preserves_attempt_identity() {
+        let frame = ClientFrame::new(
+            7,
+            ClientEvent::JobActive(ActiveJobPayload {
+                job_id: "encode-attempt".into(),
+                video_id: 42,
+                job_type: JobKind::Encode,
+            }),
+        );
+
+        let value = serde_json::to_value(frame).expect("serialize active job");
+        assert_eq!(value[3], "job_active");
+        assert_eq!(
+            value[4],
+            serde_json::json!({
+                "job_id": "encode-attempt",
+                "video_id": 42,
+                "job_type": "encode"
+            })
         );
     }
 

@@ -1,7 +1,11 @@
 //! ffprobe logic
-use crate::command::args::PixelFormat;
+use crate::{
+    command::args::PixelFormat,
+    process::{ensure_success, managed::ManagedProcess},
+};
 use anyhow::{Context, anyhow};
 use std::{fmt, fs::File, io::Read, path::Path, time::Duration};
+use tokio::process::Command;
 
 pub struct Ffprobe {
     /// Duration of video.
@@ -55,6 +59,36 @@ pub fn probe(input: &Path) -> Ffprobe {
         Err(err) => return ffprobe_error_fallback(is_image, err),
     };
 
+    probe_from_data(probe, is_image)
+}
+
+pub async fn probe_managed(input: &Path) -> Ffprobe {
+    let is_image = is_image(input).unwrap_or(false);
+    let mut command = Command::new("ffprobe");
+    command.args([
+        "-v",
+        "quiet",
+        "-show_format",
+        "-show_streams",
+        "-print_format",
+        "json",
+    ]);
+    command.arg(input);
+
+    let result = async {
+        let output = ManagedProcess::spawn("ffprobe", command)?.output().await?;
+        ensure_success("ffprobe", &output)?;
+        Ok::<_, anyhow::Error>(serde_json::from_slice::<ffprobe::FfProbe>(&output.stdout)?)
+    }
+    .await;
+
+    match result {
+        Ok(probe) => probe_from_data(probe, is_image),
+        Err(error) => ffprobe_error_fallback(is_image, error),
+    }
+}
+
+fn probe_from_data(probe: ffprobe::FfProbe, is_image: bool) -> Ffprobe {
     let fps = read_fps(&probe);
     let duration = read_duration(&probe, is_image);
     let has_audio = probe
