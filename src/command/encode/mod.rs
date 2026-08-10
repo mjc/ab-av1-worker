@@ -2,6 +2,7 @@ use crate::{
     command::{
         PROGRESS_CHARS, SmallDuration,
         args::{self, Encoder},
+        crf_search::Crf,
     },
     console_ext::style,
     ffmpeg,
@@ -32,6 +33,7 @@ mod test_support;
 pub(crate) use test_support::test_hooks;
 
 pub use error::EncodePlanError;
+pub(crate) use plan::EncodeConfig;
 pub use plan::EncodePlan;
 pub use preflight::{audio_config, resolve_output};
 pub use report::FinishedEncode;
@@ -47,13 +49,13 @@ pub struct Args {
 
     /// Encoder constant rate factor (1-63). Lower means better quality.
     #[arg(long)]
-    pub crf: f32,
+    pub crf: Crf,
 
     #[clap(flatten)]
     pub encode: args::EncodeToOutput,
 }
 
-pub async fn encode(args: Args) -> anyhow::Result<()> {
+pub async fn encode(config: plan::EncodeConfig) -> anyhow::Result<()> {
     let bar = ProgressBar::new(1).with_style(
         ProgressStyle::default_bar()
             .template("{spinner:.cyan.bold} {elapsed_precise:.bold} {wide_bar:.cyan/blue} ({msg}eta {eta})")?
@@ -61,28 +63,32 @@ pub async fn encode(args: Args) -> anyhow::Result<()> {
     );
     bar.enable_steady_tick(Duration::from_millis(100));
 
-    let probe = ffprobe::probe(&args.args.input);
-    run(args, probe.into(), &bar).await
+    let probe = ffprobe::probe(&config.encode.input);
+    run(config, probe.into(), &bar).await
 }
 
-pub async fn run(args: Args, probe: Arc<Ffprobe>, bar: &ProgressBar) -> anyhow::Result<()> {
+pub async fn run(
+    config: plan::EncodeConfig,
+    probe: Arc<Ffprobe>,
+    bar: &ProgressBar,
+) -> anyhow::Result<()> {
     #[cfg(test)]
     {
-        run_with_spawner(args, probe, bar, &spawner::ThreadLocalFixtureSpawner).await
+        run_with_spawner(config, probe, bar, &spawner::ThreadLocalFixtureSpawner).await
     }
     #[cfg(not(test))]
     {
-        run_with_spawner(args, probe, bar, &spawner::FfmpegSpawner).await
+        run_with_spawner(config, probe, bar, &spawner::FfmpegSpawner).await
     }
 }
 
 pub(crate) async fn run_with_spawner(
-    args: Args,
+    config: plan::EncodeConfig,
     probe: Arc<Ffprobe>,
     bar: &ProgressBar,
     spawner: &impl EncodeSpawner,
 ) -> anyhow::Result<()> {
-    let plan = EncodePlan::build(args.into(), probe).map_err(EncodePlanError::into_anyhow)?;
+    let plan = EncodePlan::build(config, probe).map_err(EncodePlanError::into_anyhow)?;
 
     if plan.defaulting_output() {
         let out = shell_escape::escape(plan.output_path().display().to_string().into());
@@ -131,6 +137,14 @@ mod tests {
     use test_case::test_case;
     use test_support::{arc_probe, encode_args, temp_input};
 
+    #[test]
+    fn parse_crf_uses_checked_newtype() {
+        let args = Args::try_parse_from(["ab-av1", "--input", "input.mkv", "--crf", "30"]);
+
+        assert!(matches!(args.as_ref().map(|args| args.crf.get()), Ok(30.0)));
+        assert!(Args::try_parse_from(["ab-av1", "--input", "input.mkv", "--crf", "NaN"]).is_err());
+    }
+
     // ab-kgc.89: default output extension must preserve input container for webm/mov
     #[test_case("clip.mp4", false, "mp4"; "video mp4 keeps mp4")]
     #[test_case("clip.mkv", false, "mkv"; "video mkv keeps mkv")]
@@ -174,7 +188,7 @@ mod tests {
         let spawner = FixtureSpawner::new("stderr-badness-exit-7");
 
         // execute
-        let err = run_with_spawner(args, arc_probe(Some(6)), &bar, &spawner)
+        let err = run_with_spawner(EncodeConfig::from(args), arc_probe(Some(6)), &bar, &spawner)
             .await
             .expect_err("expected encode failure");
 
@@ -198,7 +212,7 @@ mod tests {
         let bar = ProgressBar::new(1);
 
         // execute
-        let err = run(args, arc_probe(Some(6)), &bar)
+        let err = run(EncodeConfig::from(args), arc_probe(Some(6)), &bar)
             .await
             .expect_err("expected same-file error");
 
@@ -221,7 +235,7 @@ mod tests {
         let bar = ProgressBar::new(1);
 
         // execute
-        let err = run(args, arc_probe(Some(6)), &bar)
+        let err = run(EncodeConfig::from(args), arc_probe(Some(6)), &bar)
             .await
             .expect_err("expected downmix/copy error");
 
@@ -250,7 +264,7 @@ mod tests {
         let spawner = FixtureSpawner::new("stderr-ffmpeg-progress");
 
         // execute
-        run_with_spawner(args, arc_probe(Some(6)), &bar, &spawner)
+        run_with_spawner(EncodeConfig::from(args), arc_probe(Some(6)), &bar, &spawner)
             .await
             .expect("encode run");
 
@@ -277,7 +291,7 @@ mod tests {
         let spawner = FixtureSpawner::new("stderr-ffmpeg-progress");
 
         // execute
-        run_with_spawner(args, arc_probe(Some(6)), &bar, &spawner)
+        run_with_spawner(EncodeConfig::from(args), arc_probe(Some(6)), &bar, &spawner)
             .await
             .expect("encode run");
 

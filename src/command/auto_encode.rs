@@ -36,7 +36,23 @@ pub struct Args {
     pub encode: args::EncodeToOutput,
 }
 
-pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()> {
+#[derive(Clone)]
+pub(crate) struct AutoEncodeConfig {
+    search: crf_search::CrfSearchConfig,
+    encode: args::EncodeToOutput,
+}
+
+impl From<Args> for AutoEncodeConfig {
+    fn from(Args { search, encode }: Args) -> Self {
+        Self {
+            search: crf_search::CrfSearchConfig::from(search),
+            encode,
+        }
+    }
+}
+
+pub async fn auto_encode(config: AutoEncodeConfig) -> anyhow::Result<()> {
+    let AutoEncodeConfig { mut search, encode } = config;
     const SPINNER_RUNNING: &str = "{spinner:.cyan.bold} {elapsed_precise:.bold} {prefix} {wide_bar:.cyan/blue} ({msg}eta {eta})";
     const SPINNER_FINISHED: &str =
         "{spinner:.cyan.bold} {elapsed_precise:.bold} {prefix} {wide_bar:.cyan/blue} ({msg})";
@@ -56,8 +72,6 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
 
     search.sample.set_extension_from_output(&output);
     search.validate()?;
-    let search = crf_search::CrfSearchConfig::from(search);
-    search.validate()?;
 
     let bar = ProgressBar::new(BAR_LEN).with_style(
         ProgressStyle::default_bar()
@@ -72,6 +86,7 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
     }
 
     let min_score = search.min_score();
+    let use_xpsnr = search.min_xpsnr.is_some();
     let max_encoded_percent = search.max_encoded_percent;
     let enc_args = search.args.clone();
     let thorough = search.thorough;
@@ -147,7 +162,7 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
                     .log_level()
                     .is_some_and(|lvl| lvl > log::Level::Error)
                 {
-                    result.print_attempt(&bar, min_score, max_encoded_percent)
+                    result.print_attempt(&bar, min_score, max_encoded_percent, use_xpsnr)
                 }
             }
             Ok(crf_search::Update::Done(result)) => best = Some(result),
@@ -179,12 +194,13 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
     encode::run(
         encode::Args {
             args: enc_args,
-            crf: best.crf,
+            crf: crf_search::Crf::try_new(best.crf).context("crf-search returned invalid CRF")?,
             encode: args::EncodeToOutput {
                 output: Some(output),
                 ..encode
             },
-        },
+        }
+        .into(),
         input_probe,
         &bar,
     )
@@ -203,10 +219,77 @@ mod tests {
         },
         temporary::{self, TempKind},
     };
-    use std::{env, fs, path::PathBuf, time::Duration};
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
     use tokio::sync::Mutex;
 
     static AUTO_ENCODE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    #[test]
+    fn args_lower_to_auto_encode_config() {
+        let args = Args {
+            search: crf_search::Args {
+                args: Encode {
+                    encoder: "libsvtav1".parse().unwrap(),
+                    input: PathBuf::from("input.mkv"),
+                    vfilter: None,
+                    pix_format: None,
+                    preset: None,
+                    keyint: None,
+                    scd: None,
+                    svt_args: vec![],
+                    enc_args: vec![],
+                    enc_input_args: vec![],
+                },
+                min_vmaf: crate::command::crf_search::MinScore::new(95.0).ok(),
+                min_xpsnr: None,
+                max_encoded_percent: crate::command::crf_search::MaxEncodedPercent::new(80.0)
+                    .unwrap(),
+                min_crf: crate::command::crf_search::Crf::try_new(20.0).ok(),
+                max_crf: crate::command::crf_search::Crf::try_new(40.0).ok(),
+                crf_increment: Some(crate::command::crf_search::CrfStep::try_new(1.0).unwrap()),
+                high_crf_means_hq: Some(false),
+                thorough: true,
+                cache: false,
+                sample: SampleArgs {
+                    samples: Some(args::SampleCountOverride::new(1)),
+                    sample_every: match args::SampleDuration::new(Duration::from_secs(720)) {
+                        Ok(duration) => duration,
+                        Err(err) => panic!("invalid test sample_every: {err}"),
+                    },
+                    min_samples: None,
+                    sample_duration: match args::SampleDuration::new(Duration::from_secs(20)) {
+                        Ok(duration) => duration,
+                        Err(err) => panic!("invalid test sample_duration: {err}"),
+                    },
+                    keep: false,
+                    temp_dir: None,
+                    extension: None,
+                },
+                vmaf: Vmaf::default(),
+                score: args::ScoreArgs {
+                    reference_vfilter: None,
+                },
+                xpsnr: args::Xpsnr::default(),
+                verbose: clap_verbosity_flag::Verbosity::new(0, 0),
+            },
+            encode: args::EncodeToOutput {
+                output: Some(PathBuf::from("out.mkv")),
+                audio_codec: None,
+                downmix_to_stereo: false,
+                video_only: false,
+                overwrite_input: false,
+            },
+        };
+
+        let config = AutoEncodeConfig::from(args);
+
+        assert_eq!(config.search.args.input, PathBuf::from("input.mkv"));
+        assert_eq!(config.encode.output.as_deref(), Some(Path::new("out.mkv")));
+    }
 
     mod helpers {
         use super::*;
@@ -244,21 +327,27 @@ mod tests {
                         enc_args: vec![],
                         enc_input_args: vec![],
                     },
-                    min_vmaf: Some(95.0),
+                    min_vmaf: crate::command::crf_search::MinScore::new(95.0).ok(),
                     min_xpsnr: None,
                     max_encoded_percent: crate::command::crf_search::MaxEncodedPercent::new(80.0)
                         .unwrap(),
-                    min_crf: Some(20.0),
-                    max_crf: Some(40.0),
+                    min_crf: crate::command::crf_search::Crf::try_new(20.0).ok(),
+                    max_crf: crate::command::crf_search::Crf::try_new(40.0).ok(),
                     crf_increment: Some(crate::command::crf_search::CrfStep::try_new(1.0).unwrap()),
                     high_crf_means_hq: Some(false),
                     thorough: true,
                     cache: false,
                     sample: SampleArgs {
-                        samples: Some(1),
-                        sample_every: Duration::from_secs(720),
+                        samples: Some(args::SampleCountOverride::new(1)),
+                        sample_every: match args::SampleDuration::new(Duration::from_secs(720)) {
+                            Ok(duration) => duration,
+                            Err(err) => panic!("invalid test sample_every: {err}"),
+                        },
                         min_samples: None,
-                        sample_duration: Duration::from_secs(20),
+                        sample_duration: match args::SampleDuration::new(Duration::from_secs(20)) {
+                            Ok(duration) => duration,
+                            Err(err) => panic!("invalid test sample_duration: {err}"),
+                        },
                         keep,
                         temp_dir: None,
                         extension: None,
@@ -350,7 +439,7 @@ mod tests {
         let _guard = MockGuard::crf(|_crf| mock_output(96.0));
 
         // execute
-        let err = auto_encode(args)
+        let err = auto_encode(args.into())
             .await
             .expect_err("expected downmix/copy rejection before crf search");
 
@@ -373,7 +462,7 @@ mod tests {
         let args = auto_args(input.clone(), Some(input.clone()), false);
 
         // execute
-        let err = auto_encode(args)
+        let err = auto_encode(args.into())
             .await
             .expect_err("expected same-file error");
 
@@ -399,7 +488,9 @@ mod tests {
         let _guard = MockGuard::crf(|_crf| mock_output(80.0));
 
         // execute
-        let err = auto_encode(args).await.expect_err("expected NoGoodCrf");
+        let err = auto_encode(args.into())
+            .await
+            .expect_err("expected NoGoodCrf");
 
         // assert
         assert!(err.to_string().contains("Failed to find a suitable crf"));
@@ -430,7 +521,7 @@ mod tests {
         let _guard = MockGuard::both(|_crf| mock_output(96.0), "stderr-ffmpeg-progress");
 
         // execute
-        auto_encode(args).await.expect("auto encode");
+        auto_encode(args.into()).await.expect("auto encode");
 
         // assert
         assert!(
@@ -467,7 +558,7 @@ mod tests {
         let _guard = MockGuard::both(|_crf| mock_output(96.0), "stderr-ffmpeg-progress");
 
         // execute
-        auto_encode(args).await.expect("auto encode");
+        auto_encode(args.into()).await.expect("auto encode");
 
         // assert
         assert!(

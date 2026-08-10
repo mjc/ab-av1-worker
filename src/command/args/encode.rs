@@ -1,16 +1,17 @@
 use crate::{
+    command::rules::{validate_enc_arg, validate_encoder_passthrough, validate_svt_arg},
     ffmpeg::FfmpegEncodeArgs,
     ffprobe::{Ffprobe, ProbeError},
     float::TerseF32,
 };
-use anyhow::ensure;
 use clap::{Parser, ValueHint};
 #[cfg(test)]
 use rstest::rstest;
 use std::{
-    collections::HashMap,
+    borrow::Cow,
     fmt::{self, Write},
     path::PathBuf,
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -79,7 +80,7 @@ pub struct Encode {
     ///
     /// See https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/svt-av1_encoder_user_guide.md#options
     #[arg(long = "svt", value_parser = parse_svt_arg)]
-    pub svt_args: Vec<Arc<str>>,
+    pub svt_args: Vec<SvtArg>,
 
     /// Additional ffmpeg encoder arg(s). E.g. `--enc x265-params=lossless=1`
     /// These are added as ffmpeg output file options.
@@ -87,7 +88,7 @@ pub struct Encode {
     /// The first '=' symbol will be used to infer that this is an option with a value.
     /// Passed to ffmpeg like "x265-params=lossless=1" -> ['-x265-params', 'lossless=1']
     #[arg(long = "enc", allow_hyphen_values = true, value_parser = parse_enc_arg)]
-    pub enc_args: Vec<String>,
+    pub enc_args: Vec<EncoderArg>,
 
     /// Additional ffmpeg input encoder arg(s). E.g. `--enc-input r=1`
     /// These are added as ffmpeg input file options.
@@ -101,32 +102,123 @@ pub struct Encode {
     ///
     /// Disable defaults by setting them to "none"
     /// e.g. `-enc-input hwaccel=none --enc-input hwaccel_output_format=none`
-    #[arg(long = "enc-input", allow_hyphen_values = true, value_parser = parse_enc_arg)]
-    pub enc_input_args: Vec<String>,
+    #[arg(long = "enc-input", allow_hyphen_values = true, value_parser = parse_enc_input_arg)]
+    pub enc_input_args: Vec<EncoderInputArg>,
 }
 
-fn parse_svt_arg(arg: &str) -> anyhow::Result<Arc<str>> {
+fn parse_svt_arg(arg: &str) -> anyhow::Result<SvtArg> {
     let arg = arg.trim_start_matches('-').to_owned();
 
-    for deny in ["crf", "preset", "keyint", "scd", "input-depth"] {
-        ensure!(!arg.starts_with(deny), "'{deny}' cannot be used here");
-    }
+    validate_svt_arg(arg.as_str()).map_err(anyhow::Error::new)?;
 
     Ok(arg.into())
 }
 
-fn parse_enc_arg(arg: &str) -> anyhow::Result<String> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SvtArg(Arc<str>);
+
+impl SvtArg {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SvtArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+impl From<String> for SvtArg {
+    fn from(arg: String) -> Self {
+        Self(arg.into())
+    }
+}
+
+impl From<&str> for SvtArg {
+    fn from(arg: &str) -> Self {
+        Self(Arc::from(arg))
+    }
+}
+
+fn parse_enc_arg(arg: &str) -> anyhow::Result<EncoderArg> {
     let mut arg = arg.to_owned();
     if !arg.starts_with('-') {
         arg.insert(0, '-');
     }
 
-    ensure!(
-        !arg.starts_with("-svtav1-params"),
-        "'svtav1-params' cannot be set here, use `--svt`"
-    );
+    validate_enc_arg(arg.as_str()).map_err(anyhow::Error::new)?;
 
-    Ok(arg)
+    Ok(arg.into())
+}
+
+fn parse_enc_input_arg(arg: &str) -> anyhow::Result<EncoderInputArg> {
+    let arg = parse_enc_arg(arg)?;
+    Ok(arg.as_str().into())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EncoderArg(Arc<str>);
+
+impl EncoderArg {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for EncoderArg {
+    fn from(arg: String) -> Self {
+        Self(arg.into())
+    }
+}
+
+impl From<&str> for EncoderArg {
+    fn from(arg: &str) -> Self {
+        Self(Arc::from(arg))
+    }
+}
+
+impl FromStr for EncoderArg {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_enc_arg(s)
+    }
+}
+
+impl AsRef<str> for EncoderArg {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EncoderInputArg(Arc<str>);
+
+impl EncoderInputArg {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for EncoderInputArg {
+    fn from(arg: &str) -> Self {
+        Self(Arc::from(arg))
+    }
+}
+
+impl FromStr for EncoderInputArg {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_enc_input_arg(s)
+    }
+}
+
+impl AsRef<str> for EncoderInputArg {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,8 +245,26 @@ impl<'a> PassthroughArg<'a> {
         [Some(self.option), self.value].into_iter().flatten()
     }
 
+    fn hint_value(self) -> Cow<'a, str> {
+        match self.value {
+            Some(value) => Cow::Owned(format!("{}={value}", self.option.trim_start_matches('-'))),
+            None => Cow::Borrowed(self.option.trim_start_matches('-')),
+        }
+    }
+
     fn is_svtav1_params(self) -> bool {
         self.option.trim_start_matches('-') == "svtav1-params"
+    }
+
+    fn omitted_default(self, omit_default_value_for: &[&'static str]) -> Option<&'static str> {
+        (self.value == Some("none"))
+            .then(|| {
+                omit_default_value_for
+                    .iter()
+                    .copied()
+                    .find(|name| *name == self.option)
+            })
+            .flatten()
     }
 }
 
@@ -162,14 +272,60 @@ fn owned_arg(arg: &str) -> Arc<String> {
     arg.to_owned().into()
 }
 
-fn collect_passthrough_args<'a>(args: impl IntoIterator<Item = &'a String>) -> Vec<Arc<String>> {
-    args.into_iter()
-        .flat_map(|arg| PassthroughArg::parse(arg).values())
+struct CollectedPassthroughArgs {
+    args: Vec<Arc<String>>,
+    omitted_defaults: Vec<&'static str>,
+}
+
+fn collect_passthrough_args<'a, T>(
+    args: impl IntoIterator<Item = &'a T>,
+    omit_default_value_for: &'static [&'static str],
+) -> CollectedPassthroughArgs
+where
+    T: AsRef<str> + 'a,
+{
+    let (omitted, args): (Vec<_>, Vec<_>) = args
+        .into_iter()
+        .map(|arg| PassthroughArg::parse(arg.as_ref()))
+        .partition(|arg| arg.omitted_default(omit_default_value_for).is_some());
+
+    let omitted_defaults = omitted
+        .into_iter()
+        .filter_map(|arg| arg.omitted_default(omit_default_value_for))
+        .collect();
+
+    let args = args
+        .into_iter()
+        .flat_map(PassthroughArg::values)
         .map(owned_arg)
-        .collect()
+        .collect();
+
+    CollectedPassthroughArgs {
+        args,
+        omitted_defaults,
+    }
 }
 
 impl Encode {
+    fn default_preset(&self, svtav1: bool) -> Option<Arc<str>> {
+        match &self.preset {
+            Some(preset) => Some(preset.clone()),
+            None if svtav1 => Some("8".into()),
+            None => None,
+        }
+    }
+
+    fn inferred_pix_fmt(&self) -> Option<PixelFormat> {
+        self.pix_format.or_else(|| self.encoder.default_pix_fmt())
+    }
+
+    fn default_input_args(&self) -> CollectedPassthroughArgs {
+        collect_passthrough_args(
+            &self.enc_input_args,
+            &["-hwaccel", "-hwaccel_output_format"],
+        )
+    }
+
     pub fn encode_hint(&self, crf: f32) -> String {
         let Self {
             encoder,
@@ -213,12 +369,20 @@ impl Encode {
             write!(hint, " --svt {arg}").unwrap();
         }
         for arg in enc_input_args {
-            let arg = arg.trim_start_matches('-');
-            write!(hint, " --enc-input {arg}").unwrap();
+            write!(
+                hint,
+                " --enc-input {}",
+                PassthroughArg::parse(arg.as_str()).hint_value()
+            )
+            .unwrap();
         }
         for arg in enc_args {
-            let arg = arg.trim_start_matches('-');
-            write!(hint, " --enc {arg}").unwrap();
+            write!(
+                hint,
+                " --enc {}",
+                PassthroughArg::parse(arg.as_str()).hint_value()
+            )
+            .unwrap();
         }
 
         hint
@@ -231,16 +395,15 @@ impl Encode {
     ) -> anyhow::Result<FfmpegEncodeArgs<'_>> {
         let vcodec = &self.encoder.0;
         let svtav1 = vcodec.as_ref() == "libsvtav1";
-        ensure!(
-            svtav1 || self.svt_args.is_empty(),
-            "--svt may only be used with svt-av1"
-        );
+        validate_encoder_passthrough(
+            svtav1,
+            !self.svt_args.is_empty(),
+            std::iter::empty::<&str>(),
+            std::iter::empty::<&str>(),
+        )
+        .map_err(anyhow::Error::new)?;
 
-        let preset = match &self.preset {
-            Some(n) => Some(n.clone()),
-            None if svtav1 => Some("8".into()),
-            None => None,
-        };
+        let preset = self.default_preset(svtav1);
 
         let keyint = self.keyint(probe)?;
 
@@ -261,9 +424,11 @@ impl Encode {
             .enc_args
             .iter()
             .filter_map(|arg| {
-                let parsed = PassthroughArg::parse(arg);
-                if parsed.is_svtav1_params() {
-                    svtav1_params.push(arg.clone());
+                let parsed = PassthroughArg::parse(arg.as_str());
+                if svtav1 && parsed.is_svtav1_params() {
+                    if let Some(value) = parsed.value {
+                        svtav1_params.push(value.to_owned());
+                    }
                     None
                 } else {
                     Some(parsed)
@@ -293,65 +458,26 @@ impl Encode {
             }
         }
 
-        let pix_fmt = self.pix_format.or_else(|| match &**vcodec {
-            "libsvtav1" | "libaom-av1" | "librav1e" => Some(PixelFormat::Yuv420p10le),
-            _ => None,
-        });
+        let pix_fmt = self.inferred_pix_fmt();
 
-        let mut input_args = collect_passthrough_args(&self.enc_input_args);
+        let mut input_args = self.default_input_args();
 
         for (name, val) in self.encoder.default_ffmpeg_input_args() {
-            if !input_args.iter().any(|arg| &**arg == name) {
-                input_args.push(name.to_string().into());
-                input_args.push(val.to_string().into());
-            }
-        }
-
-        // support setting possibly default args as "none" to omit them
-        for (name, _) in self.encoder.default_ffmpeg_input_args() {
-            if let Some(idx) = input_args
-                .windows(2)
-                .position(|w| *w[0] == *name && *w[1] == "none")
+            if !input_args.omitted_defaults.contains(name)
+                && !input_args.args.iter().any(|arg| &**arg == name)
             {
-                input_args.splice(idx..idx + 2, []);
+                input_args.args.push(name.to_string().into());
+                input_args.args.push(val.to_string().into());
             }
         }
 
-        // ban usage of the bits we already set via other args & logic
-        let input_reserved = HashMap::from([
-            ("-i", ""),
-            ("-y", ""),
-            ("-n", ""),
-            ("-pix_fmt", " use --pix-format"),
-            ("-crf", ""),
-            ("-preset", " use --preset"),
-            ("-vf", " use --vfilter"),
-            ("-filter:v", " use --vfilter"),
-        ]);
-        for arg in &input_args {
-            if let Some(hint) = input_reserved.get(arg.as_str()) {
-                anyhow::bail!("Encoder argument `{arg}` not allowed{hint}");
-            }
-        }
-        let output_reserved = {
-            let mut r = input_reserved;
-            r.extend([
-                ("-c:a", " use --acodec"),
-                ("-codec:a", " use --acodec"),
-                ("-acodec", " use --acodec"),
-                ("-c:v", " use --encoder"),
-                ("-c:v:0", " use --encoder"),
-                ("-codec:v", " use --encoder"),
-                ("-codec:v:0", " use --encoder"),
-                ("-vcodec", " use --encoder"),
-            ]);
-            r
-        };
-        for arg in &args {
-            if let Some(hint) = output_reserved.get(arg.as_str()) {
-                anyhow::bail!("Encoder argument `{arg}` not allowed{hint}");
-            }
-        }
+        validate_encoder_passthrough(
+            svtav1,
+            false,
+            input_args.args.iter().map(|arg| arg.as_str()),
+            args.iter().map(|arg| arg.as_str()),
+        )
+        .map_err(anyhow::Error::new)?;
 
         Ok(FfmpegEncodeArgs {
             input: &self.input,
@@ -361,7 +487,7 @@ impl Encode {
             crf,
             preset,
             output_args: args,
-            input_args,
+            input_args: input_args.args,
             video_only: false,
         })
     }
@@ -450,6 +576,13 @@ impl Encoder {
             "libx265" => "265",
             // otherwise assume av1
             _ => "avif",
+        }
+    }
+
+    fn default_pix_fmt(&self) -> Option<PixelFormat> {
+        match self.as_str() {
+            "libsvtav1" | "libaom-av1" | "librav1e" => Some(PixelFormat::Yuv420p10le),
+            _ => None,
         }
     }
 
@@ -786,12 +919,39 @@ fn parse_svt_arg_rejects_reserved_keys() {
 }
 
 #[test]
+fn parse_svt_arg_returns_typed_svt_arg() {
+    // setup
+    // execute
+    let arg = parse_svt_arg("film-grain=8");
+    // assert
+    assert!(matches!(
+        arg.as_ref().map(SvtArg::as_str),
+        Ok("film-grain=8")
+    ));
+}
+
+#[test]
 fn parse_enc_arg_adds_leading_dash() {
     // setup
     // execute
-    let arg = parse_enc_arg("x265-params=lossless=1").expect("parse");
+    let arg = parse_enc_arg("x265-params=lossless=1");
     // assert
-    assert_eq!(arg, "-x265-params=lossless=1");
+    assert!(matches!(
+        arg.as_ref().map(EncoderArg::as_str),
+        Ok("-x265-params=lossless=1")
+    ));
+}
+
+#[test]
+fn parse_enc_input_arg_returns_typed_input_arg() {
+    // setup
+    // execute
+    let arg = parse_enc_input_arg("hwaccel=none");
+    // assert
+    assert!(matches!(
+        arg.as_ref().map(EncoderInputArg::as_str),
+        Ok("-hwaccel=none")
+    ));
 }
 
 #[test]
@@ -811,6 +971,20 @@ fn passthrough_arg_values_split_once_and_keep_hyphen_values() {
     assert_eq!(
         PassthroughArg::parse("-dn").values().collect::<Vec<_>>(),
         ["-dn"]
+    );
+}
+
+#[test]
+fn collect_passthrough_args_omits_none_for_default_inputs() {
+    let args = [
+        EncoderInputArg::from("-hwaccel=none"),
+        EncoderInputArg::from("-hwaccel_output_format=none"),
+    ];
+
+    assert!(
+        collect_passthrough_args(&args, &["-hwaccel", "-hwaccel_output_format"])
+            .args
+            .is_empty()
     );
 }
 
@@ -1173,6 +1347,28 @@ fn to_ffmpeg_args_merges_enc_svtav1_params() {
     assert!(svt.contains("tune=0"));
     assert!(svt.contains("film-grain=8"));
     assert!(svt.contains("crf=32"));
+    assert!(!svt.contains("-svtav1-params"));
+    assert!(!svt.contains("svtav1-params="));
+}
+
+#[test]
+fn to_ffmpeg_args_rejects_svtav1_params_for_non_svt_encoder() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("libx264".into()),
+        input: "vid.mp4".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec![],
+        enc_args: vec!["svtav1-params=tune=0".into()],
+        enc_input_args: vec![],
+    };
+
+    // execute / assert
+    assert!(enc.to_ffmpeg_args(32.0, &test_probe(60, 24.0)).is_err());
 }
 
 #[test]

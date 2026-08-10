@@ -22,9 +22,9 @@ pub struct SpawnConfig {
 
 /// Validated encode inputs lowered from the raw clap surface.
 pub(crate) struct EncodeConfig {
-    encode: args::Encode,
-    crf: f32,
-    encode_to: args::EncodeToOutput,
+    pub(crate) encode: args::Encode,
+    pub(crate) crf: f32,
+    pub(crate) encode_to: args::EncodeToOutput,
 }
 
 impl From<Args> for EncodeConfig {
@@ -37,7 +37,7 @@ impl From<Args> for EncodeConfig {
 
         Self {
             encode,
-            crf,
+            crf: crf.get(),
             encode_to,
         }
     }
@@ -67,9 +67,7 @@ impl EncodePlan {
         let audio = audio_config(&encode_to, &probe)?;
 
         // Validate ffmpeg arg construction during preflight.
-        let mut enc_args = encode.to_ffmpeg_args(crf, &probe)?;
-        enc_args.video_only = encode_to.video_only;
-        drop(enc_args);
+        encode.to_ffmpeg_args(crf, &probe)?;
 
         Ok(Self {
             input: encode.input.clone(),
@@ -150,6 +148,18 @@ mod tests {
     use super::*;
     use crate::command::encode::test_support::{arc_probe, encode_args, temp_input};
     use std::{env, fs};
+
+    #[test]
+    fn encode_config_from_args_does_not_allocate() {
+        let args = encode_args(
+            PathBuf::from("input.mkv"),
+            Some(PathBuf::from("output.mkv")),
+        );
+
+        crate::test_support::assert_no_allocations(|| {
+            std::hint::black_box(EncodeConfig::from(args));
+        });
+    }
 
     #[test]
     fn build_rejects_same_input_and_output() {
