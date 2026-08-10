@@ -148,6 +148,8 @@ pub(crate) struct Capabilities {
     pub(crate) mode: String,
     pub(crate) logical_cpus: usize,
     pub(crate) max_active_jobs: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) crf_searches_per_encode: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -597,6 +599,7 @@ mod tests {
                     mode: "crf-search".into(),
                     logical_cpus: 8,
                     max_active_jobs: 1,
+                    crf_searches_per_encode: None,
                 },
             }),
         );
@@ -621,6 +624,30 @@ mod tests {
                     }
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn weighted_announce_advertises_crf_search_ratio() {
+        let capabilities = Capabilities {
+            crf_search: true,
+            encode: true,
+            mode: "weighted".into(),
+            logical_cpus: 16,
+            max_active_jobs: 2,
+            crf_searches_per_encode: Some(3),
+        };
+
+        assert_eq!(
+            serde_json::to_value(capabilities).expect("serialize capabilities"),
+            json!({
+                "crf_search": true,
+                "encode": true,
+                "mode": "weighted",
+                "logical_cpus": 16,
+                "max_active_jobs": 2,
+                "crf_searches_per_encode": 3
+            })
         );
     }
 

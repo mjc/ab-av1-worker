@@ -48,7 +48,7 @@ const TRANSFER_CHUNK_HEADER_LEN: usize = 52;
 const MAX_TRANSFER_FRAME_BYTES: usize = 640 * 1024 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HTTP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
-const HTTP_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+const HTTP_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 static HEARTBEAT_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
 #[derive(Debug)]
@@ -164,6 +164,7 @@ pub(crate) enum WorkerMode {
     CrfSearch,
     Encode,
     Both,
+    Weighted,
 }
 
 impl WorkerMode {
@@ -173,6 +174,7 @@ impl WorkerMode {
             Self::CrfSearch => "crf-search",
             Self::Encode => "encode",
             Self::Both => "both",
+            Self::Weighted => "weighted",
         }
     }
 }
@@ -207,12 +209,15 @@ impl WorkerCapacity {
 
     #[must_use]
     const fn max_active_jobs(self) -> usize {
+        if matches!(self.mode, WorkerMode::Weighted) {
+            return 1;
+        }
         if let Some(max_active_jobs) = self.max_active_jobs {
             return max_active_jobs.get();
         }
 
         match self.mode {
-            WorkerMode::CrfSearch | WorkerMode::Encode => 1,
+            WorkerMode::CrfSearch | WorkerMode::Encode | WorkerMode::Weighted => 1,
             WorkerMode::Both => {
                 if self.logical_cpus > 8 {
                     2
@@ -220,6 +225,38 @@ impl WorkerCapacity {
                     1
                 }
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkScheduler {
+    crf_searches_per_encode: std::num::NonZeroUsize,
+    crf_searches_since_encode: usize,
+}
+
+impl WorkScheduler {
+    const fn new(crf_searches_per_encode: std::num::NonZeroUsize) -> Self {
+        Self {
+            crf_searches_per_encode,
+            crf_searches_since_encode: 0,
+        }
+    }
+
+    const fn preferred(self) -> JobKind {
+        if self.crf_searches_since_encode < self.crf_searches_per_encode.get() {
+            JobKind::CrfSearch
+        } else {
+            JobKind::Encode
+        }
+    }
+
+    const fn record_assignment(&mut self, job_type: JobKind) {
+        match job_type {
+            JobKind::CrfSearch => {
+                self.crf_searches_since_encode = self.crf_searches_since_encode.saturating_add(1);
+            }
+            JobKind::Encode => self.crf_searches_since_encode = 0,
         }
     }
 }
@@ -259,9 +296,13 @@ pub struct Args {
     #[arg(long = "worker-mode", alias = "mode", default_value = "both")]
     worker_mode: WorkerMode,
 
-    /// Maximum jobs to run concurrently in worker mode.
+    /// Maximum jobs to run concurrently (not supported in weighted mode).
     #[arg(long, env = "AB_AV1_WORKER_MAX_ACTIVE_JOBS")]
     max_active_jobs: Option<std::num::NonZeroUsize>,
+
+    /// CRF search jobs selected for each encode job in weighted mode.
+    #[arg(long, env = "AB_AV1_WORKER_CRF_SEARCHES_PER_ENCODE")]
+    crf_searches_per_encode: Option<std::num::NonZeroUsize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,10 +316,13 @@ pub struct WorkerConfig {
     local_path: Option<PathBuf>,
     worker_mode: WorkerMode,
     max_active_jobs: Option<std::num::NonZeroUsize>,
+    crf_searches_per_encode: Option<std::num::NonZeroUsize>,
 }
 
-impl From<Args> for WorkerConfig {
-    fn from(
+impl TryFrom<Args> for WorkerConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(
         Args {
             connect,
             token,
@@ -289,9 +333,23 @@ impl From<Args> for WorkerConfig {
             local_path,
             worker_mode,
             max_active_jobs,
+            crf_searches_per_encode,
         }: Args,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        if worker_mode != WorkerMode::Weighted && crf_searches_per_encode.is_some() {
+            bail!("--crf-searches-per-encode requires --worker-mode weighted");
+        }
+        if worker_mode == WorkerMode::Weighted && crf_searches_per_encode.is_none() {
+            bail!("--worker-mode weighted requires --crf-searches-per-encode");
+        }
+        if worker_mode == WorkerMode::Weighted && max_active_jobs.is_some() {
+            bail!(
+                "--max-active-jobs is not supported with --worker-mode weighted; \
+                 run multiple worker processes for parallel weighted workers"
+            );
+        }
+
+        Ok(Self {
             connect,
             token,
             worker_id,
@@ -301,7 +359,15 @@ impl From<Args> for WorkerConfig {
             local_path,
             worker_mode,
             max_active_jobs,
-        }
+            crf_searches_per_encode,
+        })
+    }
+}
+
+impl WorkerConfig {
+    fn crf_searches_per_encode(&self) -> std::num::NonZeroUsize {
+        self.crf_searches_per_encode
+            .unwrap_or(std::num::NonZeroUsize::MIN)
     }
 }
 
@@ -310,7 +376,7 @@ fn initial_pull_work_payload(mode: WorkerMode) -> PullWorkPayload {
     PullWorkPayload {
         input_missing: false,
         job_type: (mode != WorkerMode::CrfSearch).then_some(match mode {
-            WorkerMode::CrfSearch | WorkerMode::Both => JobKind::CrfSearch,
+            WorkerMode::CrfSearch | WorkerMode::Both | WorkerMode::Weighted => JobKind::CrfSearch,
             WorkerMode::Encode => JobKind::Encode,
         }),
     }
@@ -320,9 +386,11 @@ fn initial_pull_work_payload(mode: WorkerMode) -> PullWorkPayload {
 fn next_job_type_after_no_work(mode: WorkerMode, requested: JobKind) -> Option<JobKind> {
     match (mode, requested) {
         (WorkerMode::Both, JobKind::CrfSearch) => Some(JobKind::Encode),
+        (WorkerMode::Weighted, JobKind::CrfSearch) => Some(JobKind::Encode),
         (WorkerMode::Encode, JobKind::Encode) => Some(JobKind::Encode),
         (WorkerMode::CrfSearch, JobKind::CrfSearch) => None,
         (WorkerMode::Both, JobKind::Encode) => Some(JobKind::CrfSearch),
+        (WorkerMode::Weighted, JobKind::Encode) => Some(JobKind::CrfSearch),
         (WorkerMode::CrfSearch, JobKind::Encode) => None,
         (WorkerMode::Encode, JobKind::CrfSearch) => Some(JobKind::Encode),
     }
@@ -2102,12 +2170,18 @@ impl ConnectedWorker {
                     capabilities: Capabilities {
                         crf_search: matches!(
                             config.worker_mode,
-                            WorkerMode::CrfSearch | WorkerMode::Both
+                            WorkerMode::CrfSearch | WorkerMode::Both | WorkerMode::Weighted
                         ),
-                        encode: matches!(config.worker_mode, WorkerMode::Encode | WorkerMode::Both),
+                        encode: matches!(
+                            config.worker_mode,
+                            WorkerMode::Encode | WorkerMode::Both | WorkerMode::Weighted
+                        ),
                         mode: config.worker_mode.as_str().into(),
                         logical_cpus: capacity.logical_cpus,
                         max_active_jobs: capacity.max_active_jobs(),
+                        crf_searches_per_encode: config
+                            .crf_searches_per_encode
+                            .map(std::num::NonZeroUsize::get),
                     },
                 }),
             ),
@@ -3159,6 +3233,8 @@ async fn run_multiplexed_worker(
     let mut pending: HashMap<String, (JobKind, Option<String>)> = HashMap::new();
     let mut pending_acks: HashMap<String, PendingEventAck> = HashMap::new();
     let mut no_work = HashMap::new();
+    // The ratio survives websocket reconnects but intentionally resets when the worker process does.
+    let mut scheduler = WorkScheduler::new(config.crf_searches_per_encode());
     let mut reconnect = tokio::time::interval(runtime.reconnect_base_delay);
     reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut offline_deadline = None;
@@ -3169,6 +3245,7 @@ async fn run_multiplexed_worker(
                 worker,
                 config.worker_mode,
                 capacity.max_active_jobs(),
+                &scheduler,
                 &jobs,
                 &mut pending,
                 &no_work,
@@ -3198,6 +3275,7 @@ async fn run_multiplexed_worker(
                         &mut pending,
                         &mut no_work,
                         &mut pending_acks,
+                        &mut scheduler,
                         &output,
                         completed_pulls,
                         config.local_path.as_deref(),
@@ -3336,6 +3414,7 @@ async fn schedule_multiplex_pulls(
     worker: &mut MultiplexedWorker,
     mode: WorkerMode,
     max_active_jobs: usize,
+    scheduler: &WorkScheduler,
     jobs: &HashMap<String, MultiplexJob>,
     pending: &mut HashMap<String, (JobKind, Option<String>)>,
     no_work: &HashMap<JobKind, bool>,
@@ -3345,7 +3424,11 @@ async fn schedule_multiplex_pulls(
     while jobs.len() + pending.len() < max_active_jobs
         && max_pulls.is_none_or(|max| *completed_pulls + pending.len() < max)
     {
-        let Some(job_type) = next_multiplex_job_type(mode, jobs, pending, no_work) else {
+        if mode == WorkerMode::Weighted && !pending.is_empty() {
+            break;
+        }
+        let Some(job_type) = next_multiplex_job_type(mode, scheduler, jobs, pending, no_work)
+        else {
             break;
         };
         let reference = worker
@@ -3361,10 +3444,15 @@ async fn schedule_multiplex_pulls(
 
 fn next_multiplex_job_type(
     mode: WorkerMode,
+    scheduler: &WorkScheduler,
     jobs: &HashMap<String, MultiplexJob>,
     pending: &HashMap<String, (JobKind, Option<String>)>,
     no_work: &HashMap<JobKind, bool>,
 ) -> Option<JobKind> {
+    if mode == WorkerMode::Weighted && (!jobs.is_empty() || !pending.is_empty()) {
+        return None;
+    }
+
     let occupied = |kind| {
         jobs.values().any(|job| job.job.assignment.job_type == kind)
             || pending.values().any(|(job_type, _)| *job_type == kind)
@@ -3373,6 +3461,13 @@ fn next_multiplex_job_type(
         WorkerMode::CrfSearch => [Some(JobKind::CrfSearch), None],
         WorkerMode::Encode => [Some(JobKind::Encode), None],
         WorkerMode::Both => [Some(JobKind::CrfSearch), Some(JobKind::Encode)],
+        WorkerMode::Weighted => [
+            Some(scheduler.preferred()),
+            Some(match scheduler.preferred() {
+                JobKind::CrfSearch => JobKind::Encode,
+                JobKind::Encode => JobKind::CrfSearch,
+            }),
+        ],
     };
     allowed
         .into_iter()
@@ -3525,6 +3620,7 @@ async fn handle_multiplex_frame(
     pending: &mut HashMap<String, (JobKind, Option<String>)>,
     no_work: &mut HashMap<JobKind, bool>,
     pending_acks: &mut HashMap<String, PendingEventAck>,
+    scheduler: &mut WorkScheduler,
     output: &UnboundedSender<MultiplexOutput>,
     completed_pulls: &mut usize,
     local_path: Option<&Path>,
@@ -3630,6 +3726,7 @@ async fn handle_multiplex_frame(
                                     .map_err(|_| anyhow!("worker input command channel closed"))?;
                             }
                         } else {
+                            scheduler.record_assignment(job_type);
                             let job = build_worker_job(assignment, local_path)?;
                             let job_id = job.assignment.job_id.clone();
                             info!(
@@ -4387,6 +4484,7 @@ mod tests {
                 local_path: None,
                 worker_mode: WorkerMode::CrfSearch,
                 max_active_jobs: None,
+                crf_searches_per_encode: None,
             }
         }
 
@@ -4397,7 +4495,7 @@ mod tests {
 
     #[test]
     fn args_lowers_to_worker_config() {
-        let config = WorkerConfig::from(Args {
+        let config = WorkerConfig::try_from(Args {
             connect: "http://127.0.0.1:4000".into(),
             token: "token".into(),
             worker_id: "abav1-dev".into(),
@@ -4407,7 +4505,9 @@ mod tests {
             local_path: None,
             worker_mode: WorkerMode::CrfSearch,
             max_active_jobs: std::num::NonZeroUsize::new(1),
-        });
+            crf_searches_per_encode: None,
+        })
+        .expect("lower worker args");
 
         assert_eq!(config.connect, "http://127.0.0.1:4000");
         assert_eq!(config.token, "token");
@@ -4420,6 +4520,7 @@ mod tests {
             config.max_active_jobs.map(std::num::NonZeroUsize::get),
             Some(1)
         );
+        assert_eq!(config.crf_searches_per_encode, None);
     }
 
     #[test]
@@ -4438,6 +4539,27 @@ mod tests {
         .expect("parse worker mode");
 
         assert_eq!(args.worker_mode, WorkerMode::Both);
+    }
+
+    #[test]
+    fn args_accepts_weighted_worker_mode() {
+        let args = Args::try_parse_from([
+            "ab-av1",
+            "--connect",
+            "http://127.0.0.1:4000",
+            "--token",
+            "token",
+            "--worker-id",
+            "worker",
+            "--worker-mode",
+            "weighted",
+            "--crf-searches-per-encode",
+            "3",
+        ])
+        .expect("parse weighted worker mode");
+
+        assert_eq!(args.worker_mode, WorkerMode::Weighted);
+        assert_eq!(args.crf_searches_per_encode.unwrap().get(), 3);
     }
 
     #[test]
@@ -4489,6 +4611,62 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn args_accepts_nonzero_crf_searches_per_encode() {
+        let args = Args::try_parse_from([
+            "ab-av1",
+            "--connect",
+            "http://127.0.0.1:4000",
+            "--token",
+            "token",
+            "--worker-id",
+            "worker",
+            "--worker-mode",
+            "weighted",
+            "--crf-searches-per-encode",
+            "3",
+        ])
+        .expect("parse CRF searches per encode");
+
+        assert_eq!(args.crf_searches_per_encode.unwrap().get(), 3);
+        assert!(
+            Args::try_parse_from([
+                "ab-av1",
+                "--connect",
+                "http://127.0.0.1:4000",
+                "--token",
+                "token",
+                "--worker-id",
+                "worker",
+                "--worker-mode",
+                "weighted",
+                "--crf-searches-per-encode",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ratio_is_rejected_outside_weighted_mode() {
+        let args = Args::try_parse_from([
+            "ab-av1",
+            "--connect",
+            "http://127.0.0.1:4000",
+            "--token",
+            "token",
+            "--worker-id",
+            "worker",
+            "--worker-mode",
+            "both",
+            "--crf-searches-per-encode",
+            "3",
+        ])
+        .expect("parse worker args");
+
+        assert!(WorkerConfig::try_from(args).is_err());
     }
 
     #[test]
@@ -4552,35 +4730,161 @@ mod tests {
             Some(JobKind::CrfSearch)
         );
         assert_eq!(
+            initial_pull_work_payload(WorkerMode::Weighted).job_type,
+            Some(JobKind::CrfSearch)
+        );
+        assert_eq!(
             next_job_type_after_no_work(WorkerMode::Both, JobKind::CrfSearch),
             Some(JobKind::Encode)
         );
     }
 
     #[test]
-    fn both_scheduler_prefers_crf_then_uses_encode_slot() {
-        let jobs = HashMap::new();
-        let pending = HashMap::new();
+    fn both_mode_keeps_one_crf_and_one_encode_slot() {
+        let scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(1).unwrap());
         let no_work = HashMap::new();
         assert_eq!(
-            next_multiplex_job_type(WorkerMode::Both, &jobs, &pending, &no_work),
+            next_multiplex_job_type(
+                WorkerMode::Both,
+                &scheduler,
+                &HashMap::new(),
+                &HashMap::new(),
+                &no_work,
+            ),
             Some(JobKind::CrfSearch)
+        );
+
+        let pending = HashMap::from([("crf-pull".into(), (JobKind::CrfSearch, None))]);
+        assert_eq!(
+            next_multiplex_job_type(
+                WorkerMode::Both,
+                &scheduler,
+                &HashMap::new(),
+                &pending,
+                &no_work,
+            ),
+            Some(JobKind::Encode)
         );
 
         let mut no_work = HashMap::new();
         no_work.insert(JobKind::CrfSearch, true);
         assert_eq!(
-            next_multiplex_job_type(WorkerMode::Both, &jobs, &pending, &no_work),
+            next_multiplex_job_type(
+                WorkerMode::Both,
+                &scheduler,
+                &HashMap::new(),
+                &HashMap::new(),
+                &no_work,
+            ),
             Some(JobKind::Encode)
         );
+    }
 
-        let mut pending = HashMap::new();
-        pending.insert("crf-pull".into(), (JobKind::CrfSearch, None));
+    #[test]
+    fn weighted_mode_selects_n_crf_searches_per_encode() {
+        let mut scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(3).unwrap());
         let no_work = HashMap::new();
+        let expected = [
+            JobKind::CrfSearch,
+            JobKind::CrfSearch,
+            JobKind::CrfSearch,
+            JobKind::Encode,
+            JobKind::CrfSearch,
+            JobKind::CrfSearch,
+            JobKind::CrfSearch,
+            JobKind::Encode,
+        ];
+
+        for job_type in expected {
+            assert_eq!(
+                next_multiplex_job_type(
+                    WorkerMode::Weighted,
+                    &scheduler,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &no_work,
+                ),
+                Some(job_type)
+            );
+            scheduler.record_assignment(job_type);
+        }
+    }
+
+    #[test]
+    fn weighted_mode_uses_encode_when_crf_queue_is_empty() {
+        let scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(2).unwrap());
+        let no_work = HashMap::from([(JobKind::CrfSearch, true)]);
+
         assert_eq!(
-            next_multiplex_job_type(WorkerMode::Both, &jobs, &pending, &no_work),
+            next_multiplex_job_type(
+                WorkerMode::Weighted,
+                &scheduler,
+                &HashMap::new(),
+                &HashMap::new(),
+                &no_work,
+            ),
             Some(JobKind::Encode)
         );
+    }
+
+    #[test]
+    fn weighted_mode_waits_for_the_active_job_to_finish() {
+        let scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(5).unwrap());
+        let pending = HashMap::from([("crf-pull".into(), (JobKind::CrfSearch, None))]);
+
+        assert_eq!(
+            next_multiplex_job_type(
+                WorkerMode::Weighted,
+                &scheduler,
+                &HashMap::new(),
+                &pending,
+                &HashMap::new(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn weighted_scheduler_state_survives_connection_replacement() {
+        let mut scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(3).unwrap());
+        scheduler.record_assignment(JobKind::CrfSearch);
+        scheduler.record_assignment(JobKind::CrfSearch);
+
+        // Replacing the websocket connection does not replace the scheduler.
+        assert_eq!(scheduler.preferred(), JobKind::CrfSearch);
+        scheduler.record_assignment(JobKind::CrfSearch);
+        assert_eq!(scheduler.preferred(), JobKind::Encode);
+    }
+
+    #[test]
+    fn weighted_mode_runs_one_job_at_a_time() {
+        let capacity = WorkerCapacity::new(16, WorkerMode::Weighted, None);
+        let scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(10).unwrap());
+
+        assert_eq!(capacity.max_active_jobs(), 1);
+        assert_eq!(scheduler.preferred(), JobKind::CrfSearch);
+    }
+
+    #[test]
+    fn weighted_mode_rejects_concurrent_jobs() {
+        let args = Args::try_parse_from([
+            "ab-av1",
+            "--connect",
+            "http://127.0.0.1:4000",
+            "--token",
+            "token",
+            "--worker-id",
+            "worker",
+            "--worker-mode",
+            "weighted",
+            "--crf-searches-per-encode",
+            "3",
+            "--max-active-jobs",
+            "2",
+        ])
+        .expect("parse worker args");
+
+        assert!(WorkerConfig::try_from(args).is_err());
     }
 
     #[test]
@@ -5378,6 +5682,7 @@ mod tests {
             local_path: Some(input.clone()),
             worker_mode: WorkerMode::Encode,
             max_active_jobs: None,
+            crf_searches_per_encode: None,
         };
         let local = tokio::task::LocalSet::new();
         let result = local
@@ -5610,6 +5915,7 @@ mod tests {
         let mut pending = HashMap::from([("3".into(), (JobKind::CrfSearch, None))]);
         let mut no_work = HashMap::new();
         let mut pending_acks = HashMap::new();
+        let mut scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(1).unwrap());
         let (output, _outputs) = mpsc::unbounded_channel();
         let mut completed_pulls = 0;
         let frame = Message::Text(serde_json::to_string(&ServerFrame::reply(
@@ -5624,6 +5930,7 @@ mod tests {
             &mut pending,
             &mut no_work,
             &mut pending_acks,
+            &mut scheduler,
             &output,
             &mut completed_pulls,
             None,
@@ -6955,11 +7262,17 @@ mod tests {
         assert_eq!(frame[4]["version"], "0.11.4");
         assert_eq!(
             frame[4]["capabilities"]["crf_search"],
-            matches!(mode, WorkerMode::CrfSearch | WorkerMode::Both)
+            matches!(
+                mode,
+                WorkerMode::CrfSearch | WorkerMode::Both | WorkerMode::Weighted
+            )
         );
         assert_eq!(
             frame[4]["capabilities"]["encode"],
-            matches!(mode, WorkerMode::Encode | WorkerMode::Both)
+            matches!(
+                mode,
+                WorkerMode::Encode | WorkerMode::Both | WorkerMode::Weighted
+            )
         );
         assert_eq!(frame[4]["capabilities"]["mode"], mode.as_str());
         assert_eq!(
@@ -6967,6 +7280,10 @@ mod tests {
             std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
         );
         assert_eq!(frame[4]["capabilities"]["max_active_jobs"], 1);
+        assert_eq!(
+            frame[4]["capabilities"]["crf_searches_per_encode"],
+            Value::Null
+        );
     }
 
     async fn expect_pull_work<R>(reader: &mut R, request_ref: u64)
