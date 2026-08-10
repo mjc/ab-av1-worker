@@ -1,14 +1,15 @@
 use crate::command::worker_protocol::{
     AnnouncePayload, CRF_SEARCH_TOPIC, CancelPayload, Capabilities, ClientEvent, ClientFrame,
-    ControlAction, ControlPayload, ControlState, ControlStatePayload, CrfSearchProgressPayload,
-    CrfSearchResultPayload, EncodeCompletedPayload, EncodeProgressPayload, ErrorReplyPayload,
-    FailureReportPayload, HeartbeatPayload, JobKind, PullWorkPayload, ReplyBody, ServerPushFrame,
-    ServerReply, TransferFailurePayload, TransferProgressPayload, TransferStage,
-    TransferStartedPayload, WorkStatus,
+    ControlAction, ControlPayload, ControlState, ControlStatePayload, CrfSearchCompletedPayload,
+    CrfSearchProgressPayload, CrfSearchResultPayload, EncodeCompletedPayload,
+    EncodeProgressPayload, ErrorReplyPayload, FailureReportPayload, HeartbeatPayload, JobKind,
+    PullWorkPayload, ReplyBody, ServerPushFrame, ServerReply, TransferFailurePayload,
+    TransferProgressPayload, TransferStage, TransferStartedPayload, WorkStatus,
 };
 use crate::command::worker_transfer::{Chunk, ChunkReceiver};
 use crate::command::{crf_search, encode, sample_encode};
 use crate::ffprobe::Ffprobe;
+use crate::process::managed::ProcessScope;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -19,6 +20,7 @@ use std::{
     collections::HashMap,
     fs, io,
     io::Read,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -34,7 +36,7 @@ use tokio_tungstenite::{
     tungstenite::{Error as WsError, Message},
     tungstenite::{client::IntoClientRequest, http::header::ORIGIN, protocol::WebSocketConfig},
 };
-use tracing::{debug, trace};
+use tracing::{debug, info, trace, warn};
 
 const PHOENIX_VSN: &str = "2.0.0";
 const SUPPORTED_PROTOCOL_VERSION: u64 = 1;
@@ -46,6 +48,58 @@ const MAX_TRANSFER_FRAME_BYTES: usize = 640 * 1024 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HTTP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 static HEARTBEAT_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BytesPerSecond(Option<NonZeroU64>);
+
+impl BytesPerSecond {
+    #[must_use]
+    fn from_elapsed(received_bytes: u64, elapsed: Duration) -> Self {
+        let elapsed_secs = elapsed.as_secs().max(1);
+        Self(NonZeroU64::new(received_bytes / elapsed_secs))
+    }
+
+    #[must_use]
+    fn get(self) -> u64 {
+        self.0.map_or(0, NonZeroU64::get)
+    }
+
+    #[must_use]
+    fn eta(self, remaining_bytes: u64) -> Option<u64> {
+        self.0
+            .map(|bytes_per_second| remaining_bytes / bytes_per_second.get())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TransferProgressMetrics {
+    received_bytes: u64,
+    expected_bytes: u64,
+    percent: f64,
+    bytes_per_second: BytesPerSecond,
+    eta: Option<u64>,
+}
+
+impl TransferProgressMetrics {
+    #[must_use]
+    fn new(expected_bytes: u64, received_bytes: u64, elapsed: Duration) -> Self {
+        let bytes_per_second = BytesPerSecond::from_elapsed(received_bytes, elapsed);
+        let remaining_bytes = expected_bytes.saturating_sub(received_bytes);
+        let percent = if expected_bytes == 0 {
+            100.0
+        } else {
+            100.0 * received_bytes as f64 / expected_bytes as f64
+        };
+
+        Self {
+            received_bytes,
+            expected_bytes,
+            percent,
+            bytes_per_second,
+            eta: bytes_per_second.eta(remaining_bytes),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,23 +126,36 @@ impl WorkerMode {
 struct WorkerCapacity {
     logical_cpus: usize,
     mode: WorkerMode,
+    max_active_jobs: Option<std::num::NonZeroUsize>,
 }
 
 impl WorkerCapacity {
     #[must_use]
-    const fn new(logical_cpus: usize, mode: WorkerMode) -> Self {
-        Self { logical_cpus, mode }
+    const fn new(
+        logical_cpus: usize,
+        mode: WorkerMode,
+        max_active_jobs: Option<std::num::NonZeroUsize>,
+    ) -> Self {
+        Self {
+            logical_cpus,
+            mode,
+            max_active_jobs,
+        }
     }
 
     #[must_use]
-    fn detect(mode: WorkerMode) -> Self {
+    fn detect(mode: WorkerMode, max_active_jobs: Option<std::num::NonZeroUsize>) -> Self {
         let logical_cpus =
             std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        Self::new(logical_cpus, mode)
+        Self::new(logical_cpus, mode, max_active_jobs)
     }
 
     #[must_use]
     const fn max_active_jobs(self) -> usize {
+        if let Some(max_active_jobs) = self.max_active_jobs {
+            return max_active_jobs.get();
+        }
+
         match self.mode {
             WorkerMode::CrfSearch | WorkerMode::Encode => 1,
             WorkerMode::Both => {
@@ -106,7 +173,7 @@ impl WorkerCapacity {
 #[derive(Parser, Debug, Clone)]
 pub struct Args {
     /// Reencodarr base URL, e.g. http://127.0.0.1:4000
-    #[arg(long)]
+    #[arg(long, env = "REENCODARR_WORKER_CONNECT_URL")]
     connect: String,
 
     /// Worker authentication token.
@@ -114,7 +181,7 @@ pub struct Args {
     token: String,
 
     /// Client worker id announced to Reencodarr.
-    #[arg(long)]
+    #[arg(long, env = "REENCODARR_WORKER_ID")]
     worker_id: String,
 
     /// Worker version announced to Reencodarr.
@@ -136,6 +203,10 @@ pub struct Args {
     /// Job kinds this worker accepts.
     #[arg(long = "worker-mode", alias = "mode", default_value = "both")]
     worker_mode: WorkerMode,
+
+    /// Maximum jobs to run concurrently in worker mode.
+    #[arg(long, env = "AB_AV1_WORKER_MAX_ACTIVE_JOBS")]
+    max_active_jobs: Option<std::num::NonZeroUsize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +219,7 @@ pub struct WorkerConfig {
     once: bool,
     local_path: Option<PathBuf>,
     worker_mode: WorkerMode,
+    max_active_jobs: Option<std::num::NonZeroUsize>,
 }
 
 impl From<Args> for WorkerConfig {
@@ -161,6 +233,7 @@ impl From<Args> for WorkerConfig {
             once,
             local_path,
             worker_mode,
+            max_active_jobs,
         }: Args,
     ) -> Self {
         Self {
@@ -172,6 +245,7 @@ impl From<Args> for WorkerConfig {
             once,
             local_path,
             worker_mode,
+            max_active_jobs,
         }
     }
 }
@@ -309,6 +383,7 @@ impl WorkerJob {
         status: &sample_encode::Status,
     ) -> CrfSearchProgressPayload {
         CrfSearchProgressPayload {
+            job_id: self.assignment.job_id.clone(),
             video_id: self.assignment.video_id,
             percent: (status.progress.clamp(0.0, 1.0) * 100.0),
             filename: self.assignment.source_name.clone(),
@@ -347,6 +422,8 @@ impl WorkerJob {
     }
 
     fn failure_payload(&self, error: &anyhow::Error) -> FailureReportPayload {
+        let exit_code = 1;
+
         FailureReportPayload {
             job_id: self.assignment.job_id.clone(),
             video_id: self.assignment.video_id,
@@ -357,14 +434,11 @@ impl WorkerJob {
             .into(),
             category: "process_failure".into(),
             message: error.to_string(),
-            code: match self.assignment.job_type {
-                JobKind::CrfSearch => "worker_crf_search_failed",
-                JobKind::Encode => "worker_encode_failed",
-            }
-            .into(),
+            code: format!("EXIT_{exit_code}"),
             context: json!({
                 "job_id": self.assignment.job_id,
                 "source_name": self.assignment.source_name,
+                "exit_code": exit_code,
                 "error_chain": format!("{error:#}"),
             }),
             retriable: false,
@@ -387,6 +461,8 @@ struct WorkerJobReportState {
     encode_completed: Option<EncodeCompletedPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure: Option<FailureReportPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crf_completed: Option<CrfSearchCompletedPayload>,
     crf_results: Vec<CrfSearchResultPayload>,
 }
 
@@ -505,31 +581,22 @@ impl PendingJob {
             .as_ref()
             .map(ChunkReceiver::received_bytes)
             .unwrap_or(self.job.assignment.size_bytes);
-        let expected_bytes = Some(self.job.assignment.size_bytes);
-        let elapsed = self.transfer_started_at.elapsed().as_secs().max(1);
-        let bytes_per_second = received_bytes / elapsed;
-        let remaining_bytes = self
-            .job
-            .assignment
-            .size_bytes
-            .saturating_sub(received_bytes);
-        let eta = (bytes_per_second > 0).then_some(remaining_bytes / bytes_per_second);
-        let percent = if self.job.assignment.size_bytes == 0 {
-            100.0
-        } else {
-            100.0 * received_bytes as f64 / self.job.assignment.size_bytes as f64
-        };
+        let progress = TransferProgressMetrics::new(
+            self.job.assignment.size_bytes,
+            received_bytes,
+            self.transfer_started_at.elapsed(),
+        );
 
         TransferProgressPayload {
             job_id: self.job.assignment.job_id.clone(),
             transfer_id: self.job.assignment.job_id.clone(),
             video_id: self.job.assignment.video_id,
             filename: self.job.assignment.source_name.clone(),
-            received_bytes,
-            expected_bytes,
-            percent,
-            bytes_per_second,
-            eta,
+            received_bytes: progress.received_bytes,
+            expected_bytes: Some(progress.expected_bytes),
+            percent: progress.percent,
+            bytes_per_second: progress.bytes_per_second.get(),
+            eta: progress.eta,
             chunk_index,
             total_chunks,
         }
@@ -779,6 +846,14 @@ async fn handle_crf_update(
         Ok(crf_search::Update::Done(best)) => {
             let payload = job.crf_result_payload(&best, true);
             state.crf_results.push(payload.clone());
+            let completed = CrfSearchCompletedPayload {
+                job_id: job.assignment.job_id.clone(),
+                video_id: job.assignment.video_id,
+                result: "ok".into(),
+                chosen_crf: best.crf,
+                results: Vec::new(),
+            };
+            state.crf_completed = Some(completed.clone());
             let mut disconnected = false;
             if let Some(worker) = worker {
                 disconnected = !send_worker_event(
@@ -788,6 +863,15 @@ async fn handle_crf_update(
                     "crf_result",
                 )
                 .await;
+                if !disconnected {
+                    disconnected = !send_worker_event(
+                        worker,
+                        ClientEvent::CrfSearchCompleted(completed),
+                        &job.assignment.job_id,
+                        "crf_search_completed",
+                    )
+                    .await;
+                }
             }
             Ok((Some(best), disconnected))
         }
@@ -902,6 +986,15 @@ async fn replay_worker_state(worker: &mut ConnectedWorker, state: &WorkerJobRepo
             ClientEvent::CrfSearchResult(result.clone()),
             "state",
             "crf_result",
+        )
+        .await;
+    }
+    if let Some(completed) = &state.crf_completed {
+        delivered &= send_worker_event(
+            worker,
+            ClientEvent::CrfSearchCompleted(completed.clone()),
+            "state",
+            "crf_search_completed",
         )
         .await;
     }
@@ -1129,6 +1222,12 @@ struct MultiplexJob {
     finished: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PendingEventAck {
+    job_id: String,
+    name: &'static str,
+}
+
 struct MultiplexedWorker {
     next_ref: u64,
     writer: WorkerWriter,
@@ -1152,10 +1251,11 @@ impl MultiplexedWorker {
         }
     }
 
-    async fn send_event(&mut self, event: ClientEvent) -> Result<()> {
+    async fn send_event(&mut self, event: ClientEvent) -> Result<String> {
         let reference = self.next_ref;
         self.next_ref += 1;
-        send_json(&mut self.writer, ClientFrame::new(reference, event)).await
+        send_json(&mut self.writer, ClientFrame::new(reference, event)).await?;
+        Ok(reference.to_string())
     }
 
     async fn send_pull(&mut self, payload: PullWorkPayload) -> Result<String> {
@@ -1198,15 +1298,15 @@ async fn run_multiplex_job(
     output: UnboundedSender<MultiplexOutput>,
 ) {
     let job_id = job.assignment.job_id.clone();
-    let result = run_multiplex_job_inner(&job, &mut commands, &output).await;
-    if result.is_err()
-        && job.input_dir == worker_job_input_dir(&job.assignment.job_id)
-        && let Err(error) = fs::remove_dir_all(&job.input_dir)
-    {
+    let process_scope = ProcessScope::new(job_id.clone());
+    let result = process_scope
+        .run(run_multiplex_job_inner(&job, &mut commands, &output))
+        .await;
+    if let Err(error) = cleanup_multiplex_worker_input(&job, &result) {
         debug!(
             job_id = %job.assignment.job_id,
             error = %error,
-            "failed to remove incomplete multiplexed worker job directory"
+            "failed to remove completed multiplexed worker job directory"
         );
     }
     let outcome = result.map_err(|error| format!("{error:#}"));
@@ -1214,6 +1314,31 @@ async fn run_multiplex_job(
         job_id,
         result: outcome,
     });
+}
+
+fn cleanup_multiplex_worker_input(
+    job: &WorkerJob,
+    outcome: &Result<WorkerJobOutcome>,
+) -> Result<()> {
+    if matches!(outcome, Ok(WorkerJobOutcome::Completed)) {
+        let retain_local_output = job.assignment.job_type == JobKind::Encode
+            && job.assignment.output_transfer.is_none()
+            && job.assignment.output_shared_path.is_none();
+        if retain_local_output
+            && job.input_dir == worker_job_input_dir(&job.assignment.job_id)
+            && job.input_path().starts_with(&job.input_dir)
+        {
+            fs::remove_file(job.input_path()).with_context(|| {
+                format!(
+                    "remove completed worker input {}",
+                    job.input_path().display()
+                )
+            })?;
+        } else {
+            remove_worker_input(job)?;
+        }
+    }
+    Ok(())
 }
 
 async fn run_multiplex_job_inner(
@@ -1377,6 +1502,7 @@ async fn run_multiplex_crf(
     output: &UnboundedSender<MultiplexOutput>,
 ) -> Result<WorkerJobOutcome> {
     let crf_config = job.crf_search_config()?;
+    let process_scope = ProcessScope::new(job.assignment.job_id.clone());
     let mut run = std::pin::pin!(crf_search::run(crf_config, probe));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1399,7 +1525,7 @@ async fn run_multiplex_crf(
                 Some(JobCommand::Control(control)) => {
                     match control.action {
                         ControlAction::Pause => {
-                            crate::process::managed::pause_active_processes()?;
+                            process_scope.pause()?;
                             paused = true;
                             let _ = multiplex_event(
                                 output,
@@ -1407,12 +1533,13 @@ async fn run_multiplex_crf(
                                 ClientEvent::ControlState(ControlStatePayload {
                                     state: ControlState::Paused,
                                     active_video_id: Some(job.assignment.video_id),
+                                    job_id: None,
                                 }),
                                 "control_state",
                             );
                         }
                         ControlAction::Resume | ControlAction::Start => {
-                            crate::process::managed::resume_active_processes()?;
+                            process_scope.resume()?;
                             paused = false;
                             let _ = multiplex_event(
                                 output,
@@ -1420,18 +1547,20 @@ async fn run_multiplex_crf(
                                 ClientEvent::ControlState(ControlStatePayload {
                                     state: ControlState::Running,
                                     active_video_id: Some(job.assignment.video_id),
+                                    job_id: None,
                                 }),
                                 "control_state",
                             );
                         }
                         ControlAction::Stop => {
-                            crate::process::managed::resume_active_processes()?;
+                            process_scope.stop()?;
                             let _ = multiplex_event(
                                 output,
                                 &job.assignment.job_id,
                                 ClientEvent::ControlState(ControlStatePayload {
                                     state: ControlState::Stopped,
                                     active_video_id: None,
+                                    job_id: None,
                                 }),
                                 "control_state",
                             );
@@ -1451,6 +1580,18 @@ async fn run_multiplex_crf(
                             &job.assignment.job_id,
                             ClientEvent::CrfSearchResult(payload),
                             "crf_result",
+                        );
+                        let _ = multiplex_event(
+                            output,
+                            &job.assignment.job_id,
+                            ClientEvent::CrfSearchCompleted(CrfSearchCompletedPayload {
+                                job_id: job.assignment.job_id.clone(),
+                                video_id: job.assignment.video_id,
+                                result: "ok".into(),
+                                chosen_crf: best.crf,
+                                results: Vec::new(),
+                            }),
+                            "crf_search_completed",
                         );
                         return Ok(WorkerJobOutcome::Completed);
                     }
@@ -1487,7 +1628,19 @@ async fn run_multiplex_encode(
     commands: &mut UnboundedReceiver<JobCommand>,
     output: &UnboundedSender<MultiplexOutput>,
 ) -> Result<WorkerJobOutcome> {
+    run_multiplex_encode_with_heartbeat_interval(job, probe, commands, output, HEARTBEAT_INTERVAL)
+        .await
+}
+
+async fn run_multiplex_encode_with_heartbeat_interval(
+    job: &WorkerJob,
+    probe: Arc<Ffprobe>,
+    commands: &mut UnboundedReceiver<JobCommand>,
+    output: &UnboundedSender<MultiplexOutput>,
+    heartbeat_interval: Duration,
+) -> Result<WorkerJobOutcome> {
     let config = job.encode_config()?;
+    let process_scope = ProcessScope::new(job.assignment.job_id.clone());
     let _ = multiplex_event(
         output,
         &job.assignment.job_id,
@@ -1540,8 +1693,18 @@ async fn run_multiplex_encode(
         );
     });
     tokio::pin!(run);
+    let mut heartbeat = tokio::time::interval(heartbeat_interval);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                let _ = multiplex_event(
+                    output,
+                    &job.assignment.job_id,
+                    ClientEvent::Heartbeat(heartbeat_payload(&job.input_dir, Some(job.assignment.video_id))),
+                    "heartbeat",
+                );
+            }
             result = &mut run => {
                 let (output_path, finished) = result?;
                 let output_bytes = finished.metrics.output_bytes;
@@ -1586,10 +1749,44 @@ async fn run_multiplex_encode(
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
                 Some(JobCommand::Control(control)) => match control.action {
-                    ControlAction::Pause => crate::process::managed::pause_active_processes()?,
-                    ControlAction::Resume | ControlAction::Start => crate::process::managed::resume_active_processes()?,
+                    ControlAction::Pause => {
+                        process_scope.pause()?;
+                        let _ = multiplex_event(
+                            output,
+                            &job.assignment.job_id,
+                            ClientEvent::ControlState(ControlStatePayload {
+                                state: ControlState::Paused,
+                                active_video_id: Some(job.assignment.video_id),
+                                job_id: Some(job.assignment.job_id.clone()),
+                            }),
+                            "control_state",
+                        );
+                    }
+                    ControlAction::Resume | ControlAction::Start => {
+                        process_scope.resume()?;
+                        let _ = multiplex_event(
+                            output,
+                            &job.assignment.job_id,
+                            ClientEvent::ControlState(ControlStatePayload {
+                                state: ControlState::Running,
+                                active_video_id: Some(job.assignment.video_id),
+                                job_id: Some(job.assignment.job_id.clone()),
+                            }),
+                            "control_state",
+                        );
+                    }
                     ControlAction::Stop => {
-                        crate::process::managed::resume_active_processes()?;
+                        process_scope.stop()?;
+                        let _ = multiplex_event(
+                            output,
+                            &job.assignment.job_id,
+                            ClientEvent::ControlState(ControlStatePayload {
+                                state: ControlState::Stopped,
+                                active_video_id: None,
+                                job_id: Some(job.assignment.job_id.clone()),
+                            }),
+                            "control_state",
+                        );
                         return Ok(WorkerJobOutcome::Stopped);
                     }
                 },
@@ -1640,7 +1837,7 @@ struct ConnectedWorker {
 
 impl ConnectedWorker {
     async fn connect(config: &WorkerConfig) -> Result<Self> {
-        let capacity = WorkerCapacity::detect(config.worker_mode);
+        let capacity = WorkerCapacity::detect(config.worker_mode, config.max_active_jobs);
         let request_url = worker_websocket_url(&config.connect, &config.token)?;
         let mut request = request_url
             .clone()
@@ -1770,6 +1967,7 @@ impl ConnectedWorker {
         self.send_event(ClientEvent::ControlState(ControlStatePayload {
             state,
             active_video_id,
+            job_id: None,
         }))
         .await
     }
@@ -2100,22 +2298,16 @@ fn build_worker_job(
     assignment: crate::command::worker_protocol::JobAssignedPayload,
     local_path: Option<&Path>,
 ) -> Result<WorkerJob> {
-    if local_path.is_none()
-        && let Some(input_path) = offered_local_input(&assignment)
-    {
-        return Ok(WorkerJob::new(
-            assignment,
-            std::env::current_dir().context("current working directory")?,
-            input_path,
-        ));
-    }
-
     let input_dir = worker_job_input_dir(&assignment.job_id);
     fs::create_dir_all(&input_dir).context("create worker job dir")?;
     let input_path = local_path
         .map(Path::to_path_buf)
         .map(Ok)
-        .unwrap_or_else(|| worker_job_input_path(&input_dir, &assignment))?;
+        .unwrap_or_else(|| {
+            offered_local_input(&assignment)
+                .map(Ok)
+                .unwrap_or_else(|| worker_job_input_path(&input_dir, &assignment))
+        })?;
     Ok(WorkerJob::new(assignment, input_dir, input_path))
 }
 
@@ -2335,26 +2527,19 @@ fn http_transfer_progress_payload(
     received_bytes: u64,
     started_at: Instant,
 ) -> TransferProgressPayload {
-    let elapsed = started_at.elapsed().as_secs().max(1);
-    let bytes_per_second = received_bytes / elapsed;
-    let remaining_bytes = expected_size.saturating_sub(received_bytes);
-    let eta = (bytes_per_second > 0).then_some(remaining_bytes / bytes_per_second);
-    let percent = if expected_size == 0 {
-        100.0
-    } else {
-        100.0 * received_bytes as f64 / expected_size as f64
-    };
+    let progress =
+        TransferProgressMetrics::new(expected_size, received_bytes, started_at.elapsed());
 
     TransferProgressPayload {
         job_id: job_id.to_owned(),
         transfer_id: job_id.to_owned(),
         video_id,
         filename: filename.to_owned(),
-        received_bytes,
-        expected_bytes: Some(expected_size),
-        percent,
-        bytes_per_second,
-        eta,
+        received_bytes: progress.received_bytes,
+        expected_bytes: Some(progress.expected_bytes),
+        percent: progress.percent,
+        bytes_per_second: progress.bytes_per_second.get(),
+        eta: progress.eta,
         chunk_index: 0,
         total_chunks: 0,
     }
@@ -2730,11 +2915,19 @@ async fn run_multiplexed_worker(
     completed_pulls: &mut usize,
 ) -> Result<()> {
     let connected = ConnectedWorker::connect(config).await?;
+    let capacity = WorkerCapacity::detect(config.worker_mode, config.max_active_jobs);
+    info!(
+        worker_id = %connected.assigned_worker_id,
+        protocol_version = connected.negotiated_protocol_version,
+        mode = %config.worker_mode.as_str(),
+        max_active_jobs = capacity.max_active_jobs(),
+        "worker connected"
+    );
     let mut connection = Some(MultiplexedWorker::from_connected(connected));
-    let capacity = WorkerCapacity::detect(config.worker_mode);
     let (output, mut outputs) = mpsc::unbounded_channel();
     let mut jobs: HashMap<String, MultiplexJob> = HashMap::new();
     let mut pending: HashMap<String, (JobKind, Option<String>)> = HashMap::new();
+    let mut pending_acks: HashMap<String, PendingEventAck> = HashMap::new();
     let mut no_work = HashMap::new();
     let mut reconnect = tokio::time::interval(runtime.reconnect_base_delay);
     reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2763,6 +2956,7 @@ async fn run_multiplexed_worker(
                         item,
                         &mut jobs,
                         &mut pending,
+                        &mut pending_acks,
                     ).await?;
                 }
                 frame = worker.reader.next() => {
@@ -2772,6 +2966,7 @@ async fn run_multiplexed_worker(
                         &mut jobs,
                         &mut pending,
                         &mut no_work,
+                        &mut pending_acks,
                         &output,
                         completed_pulls,
                         config.local_path.as_deref(),
@@ -2792,10 +2987,16 @@ async fn run_multiplexed_worker(
                 _ = reconnect.tick() => {
                     match ConnectedWorker::connect(config).await {
                         Ok(candidate) => {
+                            let worker_id = candidate.assigned_worker_id.clone();
                             let mut candidate = MultiplexedWorker::from_connected(candidate);
-                            if replay_multiplex_jobs(&mut candidate, &jobs).await {
+                            pending_acks.clear();
+                            if replay_multiplex_jobs(&mut candidate, &jobs, &mut pending_acks).await {
+                                info!(
+                                    %worker_id,
+                                    active_jobs = jobs.len(),
+                                    "worker reconnected"
+                                );
                                 connection = Some(candidate);
-                                jobs.retain(|_, job| !job.finished);
                                 reconnect = tokio::time::interval(runtime.reconnect_base_delay);
                                 reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                             }
@@ -2811,6 +3012,8 @@ async fn run_multiplexed_worker(
         if connection_lost {
             connection = None;
             pending.clear();
+            no_work.clear();
+            pending_acks.clear();
         }
 
         if runtime.max_pulls.is_some_and(|max| *completed_pulls >= max) && jobs.is_empty() {
@@ -2902,6 +3105,7 @@ async fn handle_multiplex_output(
     item: Option<MultiplexOutput>,
     jobs: &mut HashMap<String, MultiplexJob>,
     pending: &mut HashMap<String, (JobKind, Option<String>)>,
+    pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> Result<bool> {
     let Some(item) = item else {
         bail!("multiplexed worker output channel closed");
@@ -2915,13 +3119,17 @@ async fn handle_multiplex_output(
             if let Some(job) = jobs.get_mut(&job_id) {
                 record_multiplex_event(&mut job.state, &event);
             }
-            Ok(send_multiplex_event(worker, event, &job_id, name).await)
+            Ok(send_multiplex_event(worker, event, &job_id, name, pending_acks).await)
         }
         MultiplexOutput::Done { job_id, result } => {
             let Some(job) = jobs.get_mut(&job_id) else {
                 return Ok(true);
             };
             job.finished = true;
+            match &result {
+                Ok(outcome) => info!(%job_id, ?outcome, "worker job finished"),
+                Err(error) => warn!(%job_id, %error, "worker job failed"),
+            }
             if let Err(error) = result {
                 let failure = job.job.failure_payload(&anyhow!(error));
                 job.state.failure = Some(failure.clone());
@@ -2930,14 +3138,14 @@ async fn handle_multiplex_output(
                     ClientEvent::VideoFailed(failure),
                     &job_id,
                     "video_failed",
+                    pending_acks,
                 )
                 .await
                 {
                     return Ok(false);
                 }
             }
-            jobs.remove(&job_id);
-            pending.retain(|_, (_, resend)| resend.as_deref() != Some(&job_id));
+            remove_finished_job_if_acknowledged(&job_id, jobs, pending, pending_acks);
             Ok(true)
         }
         MultiplexOutput::RequestInputResend { job_id } => {
@@ -2957,6 +3165,7 @@ async fn handle_multiplex_output(
                 }),
                 &job_id,
                 "transfer_failed",
+                pending_acks,
             )
             .await;
             let reference = worker
@@ -2976,13 +3185,30 @@ async fn send_multiplex_event(
     event: ClientEvent,
     job_id: &str,
     name: &'static str,
+    pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> bool {
-    if let Err(error) = worker.send_event(event).await {
-        debug!(job_id = %job_id, event = name, error = %error, "multiplexed worker send failed");
-        false
-    } else {
-        true
+    match worker.send_event(event).await {
+        Ok(reference) => {
+            if event_requires_ack(name) {
+                pending_acks.insert(
+                    reference,
+                    PendingEventAck {
+                        job_id: job_id.to_owned(),
+                        name,
+                    },
+                );
+            }
+            true
+        }
+        Err(error) => {
+            debug!(job_id = %job_id, event = name, error = %error, "multiplexed worker send failed");
+            false
+        }
     }
+}
+
+fn event_requires_ack(name: &str) -> bool {
+    matches!(name, "encode_completed" | "video_failed")
 }
 
 fn record_multiplex_event(state: &mut WorkerJobReportState, event: &ClientEvent) {
@@ -2991,6 +3217,7 @@ fn record_multiplex_event(state: &mut WorkerJobReportState, event: &ClientEvent)
         ClientEvent::TransferProgress(payload) => state.transfer_progress = Some(payload.clone()),
         ClientEvent::CrfSearchProgress(payload) => state.crf_progress = Some(payload.clone()),
         ClientEvent::CrfSearchResult(payload) => state.crf_results.push(payload.clone()),
+        ClientEvent::CrfSearchCompleted(payload) => state.crf_completed = Some(payload.clone()),
         ClientEvent::EncodeProgress(payload) => state.encode_progress = Some(payload.clone()),
         ClientEvent::EncodeCompleted(payload) => state.encode_completed = Some(payload.clone()),
         ClientEvent::VideoFailed(payload) => state.failure = Some(payload.clone()),
@@ -3009,6 +3236,7 @@ async fn handle_multiplex_frame(
     jobs: &mut HashMap<String, MultiplexJob>,
     pending: &mut HashMap<String, (JobKind, Option<String>)>,
     no_work: &mut HashMap<JobKind, bool>,
+    pending_acks: &mut HashMap<String, PendingEventAck>,
     output: &UnboundedSender<MultiplexOutput>,
     completed_pulls: &mut usize,
     local_path: Option<&Path>,
@@ -3041,20 +3269,49 @@ async fn handle_multiplex_frame(
             Ok(true)
         }
         Message::Text(text) => {
+            let mut event_ack = None;
+            for (reference, ack) in pending_acks.iter() {
+                if let Some(decoded) = decode_expected_reply::<Value>(&text, reference, ack.name)? {
+                    event_ack = Some((reference.clone(), ack.clone(), decoded));
+                    break;
+                }
+            }
+            if let Some((reference, ack, decoded)) = event_ack {
+                pending_acks.remove(&reference);
+                if let Err(error) = decoded {
+                    debug!(
+                        job_id = %ack.job_id,
+                        event = ack.name,
+                        error = %error,
+                        "multiplexed worker event was rejected"
+                    );
+                    return Ok(false);
+                }
+                acknowledge_multiplex_event(&ack, jobs, pending);
+                return Ok(true);
+            }
+
             let mut reply = None;
             for reference in pending.keys() {
                 if let Some(decoded) =
                     decode_expected_reply::<ServerReply>(&text, reference, "pull_work")?
                 {
-                    reply = Some((reference.clone(), decoded?));
+                    reply = Some((reference.clone(), decoded));
                     break;
                 }
             }
             if let Some((reference, response)) = reply {
-                *completed_pulls += 1;
                 let (job_type, resend_for) = pending
                     .remove(&reference)
                     .expect("pending pull reference still present");
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        warn!(error = %error, "pull_work reply failed; reconnecting worker");
+                        return Ok(false);
+                    }
+                };
+                *completed_pulls += 1;
                 *no_work.entry(job_type).or_insert(false) =
                     matches!(response, ServerReply::NoWork(_));
                 match response {
@@ -3083,6 +3340,13 @@ async fn handle_multiplex_frame(
                         } else {
                             let job = build_worker_job(assignment, local_path)?;
                             let job_id = job.assignment.job_id.clone();
+                            info!(
+                                %job_id,
+                                video_id = job.assignment.video_id,
+                                job_type = ?job.assignment.job_type,
+                                source_name = %job.assignment.source_name,
+                                "worker job assigned"
+                            );
                             let (command, commands) = mpsc::unbounded_channel();
                             let _ = multiplex_event(
                                 output,
@@ -3122,20 +3386,21 @@ async fn handle_multiplex_frame(
                     }
                 }
                 Some(WorkerPush::Control(control)) => {
-                    let job = control
-                        .job_id
-                        .as_deref()
-                        .and_then(|job_id| jobs.get(job_id))
-                        .or_else(|| {
-                            control.video_id.and_then(|video_id| {
-                                jobs.values().find(|job| {
-                                    job.job.assignment.video_id == video_id && !job.finished
-                                })
-                            })
-                        });
-                    if let Some(job) = job {
+                    let jobs: Vec<_> = jobs
+                        .values()
+                        .filter(|job| {
+                            control_targets_job(
+                                &control,
+                                &job.job.assignment.job_id,
+                                job.job.assignment.video_id,
+                                job.finished,
+                            )
+                        })
+                        .collect();
+
+                    for job in jobs {
                         job.command
-                            .send(JobCommand::Control(control))
+                            .send(JobCommand::Control(control.clone()))
                             .map_err(|_| anyhow!("worker control channel closed"))?;
                     }
                 }
@@ -3153,23 +3418,76 @@ async fn handle_multiplex_frame(
     }
 }
 
+fn acknowledge_multiplex_event(
+    ack: &PendingEventAck,
+    jobs: &mut HashMap<String, MultiplexJob>,
+    pending: &mut HashMap<String, (JobKind, Option<String>)>,
+) {
+    if !event_requires_ack(ack.name) {
+        return;
+    }
+
+    if jobs.get(&ack.job_id).is_some_and(|job| job.finished) {
+        jobs.remove(&ack.job_id);
+        pending.retain(|_, (_, resend)| resend.as_deref() != Some(&ack.job_id));
+    }
+}
+
+fn remove_finished_job_if_acknowledged(
+    job_id: &str,
+    jobs: &mut HashMap<String, MultiplexJob>,
+    pending: &mut HashMap<String, (JobKind, Option<String>)>,
+    pending_acks: &HashMap<String, PendingEventAck>,
+) {
+    let Some(job) = jobs.get(job_id) else {
+        return;
+    };
+    if !job.finished {
+        return;
+    }
+    if job.state.encode_completed.is_some() || job.state.failure.is_some() {
+        if pending_acks.values().any(|ack| ack.job_id == job_id) {
+            return;
+        }
+    }
+    jobs.remove(job_id);
+    pending.retain(|_, (_, resend)| resend.as_deref() != Some(job_id));
+}
+
 async fn replay_multiplex_jobs(
     worker: &mut MultiplexedWorker,
     jobs: &HashMap<String, MultiplexJob>,
+    pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> bool {
     for (job_id, job) in jobs {
+        if !send_multiplex_event(
+            worker,
+            ClientEvent::ControlState(ControlStatePayload {
+                state: ControlState::Running,
+                active_video_id: Some(job.job.assignment.video_id),
+                job_id: Some(job_id.clone()),
+            }),
+            job_id,
+            "control_state",
+            pending_acks,
+        )
+        .await
+        {
+            return false;
+        }
         if let Some(progress) = encode_reconnect_progress(&job.job, &job.state, job.finished)
             && !send_multiplex_event(
                 worker,
                 ClientEvent::EncodeProgress(progress),
                 job_id,
                 "encode_progress",
+                pending_acks,
             )
             .await
         {
             return false;
         }
-        if !replay_multiplex_state(worker, &job.state, job_id).await {
+        if !replay_multiplex_state(worker, &job.state, job_id, pending_acks).await {
             return false;
         }
     }
@@ -3202,6 +3520,7 @@ async fn replay_multiplex_state(
     worker: &mut MultiplexedWorker,
     state: &WorkerJobReportState,
     job_id: &str,
+    pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> bool {
     if let Some(payload) = &state.heartbeat
         && !send_multiplex_event(
@@ -3209,6 +3528,7 @@ async fn replay_multiplex_state(
             ClientEvent::Heartbeat(payload.clone()),
             job_id,
             "heartbeat",
+            pending_acks,
         )
         .await
     {
@@ -3220,6 +3540,7 @@ async fn replay_multiplex_state(
             ClientEvent::TransferProgress(payload.clone()),
             job_id,
             "transfer_progress",
+            pending_acks,
         )
         .await
     {
@@ -3231,6 +3552,7 @@ async fn replay_multiplex_state(
             ClientEvent::CrfSearchProgress(payload.clone()),
             job_id,
             "crf_progress",
+            pending_acks,
         )
         .await
     {
@@ -3242,11 +3564,24 @@ async fn replay_multiplex_state(
             ClientEvent::CrfSearchResult(payload.clone()),
             job_id,
             "crf_result",
+            pending_acks,
         )
         .await
         {
             return false;
         }
+    }
+    if let Some(payload) = &state.crf_completed
+        && !send_multiplex_event(
+            worker,
+            ClientEvent::CrfSearchCompleted(payload.clone()),
+            job_id,
+            "crf_search_completed",
+            pending_acks,
+        )
+        .await
+    {
+        return false;
     }
     if let Some(payload) = &state.encode_progress
         && !send_multiplex_event(
@@ -3254,6 +3589,7 @@ async fn replay_multiplex_state(
             ClientEvent::EncodeProgress(payload.clone()),
             job_id,
             "encode_progress",
+            pending_acks,
         )
         .await
     {
@@ -3265,6 +3601,7 @@ async fn replay_multiplex_state(
             ClientEvent::EncodeCompleted(payload.clone()),
             job_id,
             "encode_completed",
+            pending_acks,
         )
         .await
     {
@@ -3276,6 +3613,7 @@ async fn replay_multiplex_state(
             ClientEvent::VideoFailed(payload.clone()),
             job_id,
             "video_failed",
+            pending_acks,
         )
         .await
     {
@@ -3311,6 +3649,20 @@ fn work_status_label(reply: &ServerReply) -> String {
             format!("{} (job_id={})", payload.status.as_str(), payload.job_id)
         }
     }
+}
+
+fn control_targets_job(
+    control: &ControlPayload,
+    job_id: &str,
+    video_id: u64,
+    finished: bool,
+) -> bool {
+    !finished
+        && match (&control.job_id, control.video_id) {
+            (None, None) => true,
+            (Some(target_job_id), _) => target_job_id == job_id,
+            (None, Some(target_video_id)) => target_video_id == video_id,
+        }
 }
 
 fn decode_worker_push(text: &str) -> Result<Option<WorkerPush>> {
@@ -3686,6 +4038,7 @@ mod tests {
                 once: config.once,
                 local_path: None,
                 worker_mode: WorkerMode::CrfSearch,
+                max_active_jobs: None,
             }
         }
 
@@ -3705,6 +4058,7 @@ mod tests {
             once: false,
             local_path: None,
             worker_mode: WorkerMode::CrfSearch,
+            max_active_jobs: std::num::NonZeroUsize::new(1),
         });
 
         assert_eq!(config.connect, "http://127.0.0.1:4000");
@@ -3714,6 +4068,10 @@ mod tests {
         assert_eq!(config.protocol_version, 1);
         assert!(!config.once);
         assert_eq!(config.worker_mode, WorkerMode::CrfSearch);
+        assert_eq!(
+            config.max_active_jobs.map(std::num::NonZeroUsize::get),
+            Some(1)
+        );
     }
 
     #[test]
@@ -3751,11 +4109,82 @@ mod tests {
     }
 
     #[test]
+    fn args_accepts_nonzero_max_active_jobs() {
+        let args = Args::try_parse_from([
+            "ab-av1",
+            "--connect",
+            "http://127.0.0.1:4000",
+            "--token",
+            "token",
+            "--worker-id",
+            "worker",
+            "--max-active-jobs",
+            "1",
+        ])
+        .expect("parse max active jobs");
+
+        assert_eq!(
+            args.max_active_jobs.map(std::num::NonZeroUsize::get),
+            Some(1)
+        );
+        assert!(
+            Args::try_parse_from([
+                "ab-av1",
+                "--connect",
+                "http://127.0.0.1:4000",
+                "--token",
+                "token",
+                "--worker-id",
+                "worker",
+                "--max-active-jobs",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn both_mode_capacity_changes_after_eight_logical_cpus() {
-        let small = WorkerCapacity::new(8, WorkerMode::Both);
-        let large = WorkerCapacity::new(9, WorkerMode::Both);
+        let small = WorkerCapacity::new(8, WorkerMode::Both, None);
+        let large = WorkerCapacity::new(9, WorkerMode::Both, None);
         assert_eq!(small.max_active_jobs(), 1);
         assert_eq!(large.max_active_jobs(), 2);
+    }
+
+    #[test]
+    fn max_active_jobs_overrides_detected_capacity() {
+        let capacity = WorkerCapacity::new(16, WorkerMode::Both, std::num::NonZeroUsize::new(1));
+        assert_eq!(capacity.max_active_jobs(), 1);
+    }
+
+    #[test]
+    fn worker_failure_payload_uses_cli_exit_code_shape() {
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::CrfSearch,
+                job_id: "crf-search-123".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 1_000,
+                chunk_size_bytes: 256,
+                target_vmaf: 95.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: vec!["crf-search".into(), "movie.mkv".into()],
+            },
+            PathBuf::from("/tmp/crf-search-123"),
+            PathBuf::from("/tmp/crf-search-123/movie.mkv"),
+        );
+
+        let payload = job.failure_payload(&anyhow!("ab-av1 failed"));
+
+        assert_eq!(payload.stage, "crf_search");
+        assert_eq!(payload.category, "process_failure");
+        assert_eq!(payload.code, "EXIT_1");
+        assert_eq!(payload.context["exit_code"], json!(1));
     }
 
     #[test]
@@ -3802,6 +4231,63 @@ mod tests {
             next_multiplex_job_type(WorkerMode::Both, &jobs, &pending, &no_work),
             Some(JobKind::Encode)
         );
+    }
+
+    #[test]
+    fn finished_encode_waits_for_completion_ack_before_job_removal() {
+        let (command, _commands) = mpsc::unbounded_channel();
+        let mut jobs = HashMap::from([(
+            "encode-123".into(),
+            MultiplexJob {
+                job: WorkerJob::new(
+                    JobAssignedPayload {
+                        status: WorkStatus::JobAssigned,
+                        job_type: JobKind::Encode,
+                        job_id: "encode-123".into(),
+                        video_id: 123,
+                        source_name: "movie.mkv".into(),
+                        size_bytes: 1_000,
+                        chunk_size_bytes: 256,
+                        target_vmaf: 95.0,
+                        transfer: None,
+                        output_transfer: None,
+                        output_shared_path: Some("/tmp/movie.av1.mkv".into()),
+                        encode_args: vec!["encode".into(), "--input".into(), "movie.mkv".into()],
+                        crf_search_args: Vec::new(),
+                    },
+                    PathBuf::from("/tmp"),
+                    PathBuf::from("/tmp/movie.mkv"),
+                ),
+                command,
+                state: WorkerJobReportState {
+                    encode_completed: Some(EncodeCompletedPayload {
+                        job_id: "encode-123".into(),
+                        video_id: 123,
+                        source_name: "movie.mkv".into(),
+                        output_path: "/tmp/movie.av1.mkv".into(),
+                        output_bytes: 500,
+                        output_percent: 50.0,
+                    }),
+                    ..WorkerJobReportState::default()
+                },
+                finished: true,
+            },
+        )]);
+        let mut pending = HashMap::new();
+        let mut pending_acks = HashMap::from([(
+            "7".into(),
+            PendingEventAck {
+                job_id: "encode-123".into(),
+                name: "encode_completed",
+            },
+        )]);
+
+        remove_finished_job_if_acknowledged("encode-123", &mut jobs, &mut pending, &pending_acks);
+        assert!(jobs.contains_key("encode-123"));
+
+        let ack = pending_acks.remove("7").expect("pending ack");
+        acknowledge_multiplex_event(&ack, &mut jobs, &mut pending);
+        assert!(!jobs.contains_key("encode-123"));
     }
 
     #[test]
@@ -3999,6 +4485,99 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn multiplex_encode_sends_heartbeat_without_ffmpeg_progress() -> Result<()> {
+        let input_dir =
+            std::env::temp_dir().join(format!("ab-av1-multiplex-heartbeat-{}", std::process::id()));
+        fs::create_dir_all(&input_dir)?;
+        let input = input_dir.join("movie.mkv");
+        fs::write(&input, b"input-bytes")?;
+        crate::command::encode::test_hooks::set_fixture("sleep-long");
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::Encode,
+                job_id: "heartbeat-job".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 11,
+                chunk_size_bytes: 1,
+                target_vmaf: 0.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: vec![
+                    "encode".into(),
+                    "--input".into(),
+                    "/server/movie.mkv".into(),
+                    "--output".into(),
+                    input_dir.join("movie.av1.mkv").display().to_string(),
+                    "--crf".into(),
+                    "30".into(),
+                ],
+                crf_search_args: Vec::new(),
+            },
+            input_dir.clone(),
+            input,
+        );
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let mut run = std::pin::pin!(run_multiplex_encode_with_heartbeat_interval(
+            &job,
+            Arc::new(Ffprobe {
+                duration: Ok(Duration::from_secs(120)),
+                has_audio: false,
+                max_audio_channels: None,
+                fps: Ok(24.0),
+                resolution: Some((1920, 1080)),
+                is_image: false,
+                pix_fmt: Some("yuv420p".into()),
+            }),
+            &mut command_receiver,
+            &output,
+            Duration::from_millis(1),
+        ));
+
+        assert!(matches!(
+            tokio::select! {
+                item = outputs.recv() => item,
+                result = &mut run => panic!("encode ended early: {result:?}"),
+            },
+            Some(MultiplexOutput::Event {
+                event: ClientEvent::EncodeProgress(_),
+                ..
+            })
+        ));
+        let heartbeat = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                tokio::select! {
+                    item = outputs.recv() => match item {
+                        Some(MultiplexOutput::Event {
+                            event: ClientEvent::Heartbeat(_),
+                            ..
+                        }) => break true,
+                        Some(_) => continue,
+                        None => break false,
+                    },
+                    result = &mut run => panic!("encode ended early: {result:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Stop,
+            video_id: Some(123),
+            job_id: Some("heartbeat-job".into()),
+        }))?;
+        assert!(matches!(run.await?, WorkerJobOutcome::Stopped));
+        crate::command::encode::test_hooks::clear();
+        let _ = fs::remove_dir_all(input_dir);
+        assert!(heartbeat);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_accepts_and_completes_encode_assignment() -> Result<()> {
         let (listener, address) = FakeCoordinator::bind("127.0.0.1:0").await?;
         let input = std::env::temp_dir().join(format!(
@@ -4069,6 +4648,17 @@ mod tests {
                 let frame: Value = serde_json::from_str(&text).expect("worker event json");
                 if frame[3] == "encode_completed" {
                     assert_eq!(frame[4]["output_path"], expected_output);
+                    let request_ref = frame[1].as_str().expect("encode_completed ref");
+                    writer
+                        .send(Message::Text(
+                            json!(["1", request_ref, CRF_SEARCH_TOPIC, "phx_reply", {
+                                "status": "ok",
+                                "response": {}
+                            }])
+                            .to_string(),
+                        ))
+                        .await
+                        .expect("send encode_completed ack");
                     break;
                 }
             }
@@ -4083,6 +4673,7 @@ mod tests {
             once: false,
             local_path: Some(input.clone()),
             worker_mode: WorkerMode::Encode,
+            max_active_jobs: None,
         };
         let local = tokio::task::LocalSet::new();
         let result = local
@@ -4300,6 +4891,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn multiplexed_pull_error_requests_reconnect() -> Result<()> {
+        let coordinator = FakeCoordinator::with_no_work_replies(0).await?;
+        let connected =
+            ConnectedWorker::connect(&coordinator.worker_config(WorkerTestConfig::continuous()))
+                .await?;
+        let mut worker = MultiplexedWorker::from_connected(connected);
+        let mut jobs = HashMap::new();
+        let mut pending = HashMap::from([("3".into(), (JobKind::CrfSearch, None))]);
+        let mut no_work = HashMap::new();
+        let mut pending_acks = HashMap::new();
+        let (output, _outputs) = mpsc::unbounded_channel();
+        let mut completed_pulls = 0;
+        let frame = Message::Text(serde_json::to_string(&ServerFrame::reply(
+            3,
+            ReplyBody::error(ErrorReplyPayload::new("unmatched topic")),
+        ))?);
+
+        let connection_is_lost = handle_multiplex_frame(
+            &mut worker,
+            Some(Ok(frame)),
+            &mut jobs,
+            &mut pending,
+            &mut no_work,
+            &mut pending_acks,
+            &output,
+            &mut completed_pulls,
+            None,
+        )
+        .await?;
+
+        assert!(!connection_is_lost);
+        assert_eq!(completed_pulls, 0);
+        coordinator.finish().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_requests_input_resend_when_resumed_job_lacks_local_file() -> Result<()> {
         let job_id = "missing-input-resend";
         let _ = fs::remove_dir_all(worker_job_input_dir(job_id));
@@ -4463,6 +5091,19 @@ mod tests {
     }
 
     #[test]
+    fn unscoped_control_targets_every_active_job() {
+        let control = crate::command::worker_protocol::ControlPayload {
+            action: crate::command::worker_protocol::ControlAction::Resume,
+            video_id: None,
+            job_id: None,
+        };
+
+        assert!(control_targets_job(&control, "crf-1", 1, false));
+        assert!(control_targets_job(&control, "encode-2", 2, false));
+        assert!(!control_targets_job(&control, "finished-3", 3, true));
+    }
+
+    #[test]
     fn worker_formats_assigned_job_status_with_job_id() {
         let status = work_status_label(&ServerReply::JobAssigned(JobAssignedPayload {
             status: WorkStatus::JobAssigned,
@@ -4585,7 +5226,9 @@ mod tests {
         let job = build_worker_job(assignment, None)?;
 
         assert_eq!(job.input_path(), local_path.as_path());
-        assert!(!worker_dir.exists());
+        assert_eq!(job.input_dir, worker_dir);
+        assert!(worker_dir.exists());
+        fs::remove_dir_all(&worker_dir)?;
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -4754,6 +5397,29 @@ mod tests {
     }
 
     #[test]
+    fn transfer_progress_zero_rate_has_no_eta() {
+        let payload = http_transfer_progress_payload(
+            "job-zero-rate",
+            1,
+            "input.mkv",
+            1024,
+            0,
+            Instant::now(),
+        );
+
+        assert_eq!(payload.eta, None);
+    }
+
+    #[test]
+    fn transfer_progress_reports_eta_when_rate_is_nonzero() {
+        let payload =
+            http_transfer_progress_payload("job-rate", 1, "input.mkv", 2048, 1024, Instant::now());
+
+        assert_eq!(payload.bytes_per_second, 1024);
+        assert_eq!(payload.eta, Some(1));
+    }
+
+    #[test]
     fn worker_input_cleanup_removes_owned_directory_only() -> Result<()> {
         let root = worker_job_input_dir("cleanup-job");
         let _ = fs::remove_dir_all(&root);
@@ -4787,6 +5453,130 @@ mod tests {
         );
         remove_worker_input(&job)?;
         assert!(!root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn multiplex_worker_input_cleanup_is_success_only() -> Result<()> {
+        let job_id = format!("cleanup-outcome-{}", std::process::id());
+        let root = worker_job_input_dir(&job_id);
+        let _ = fs::remove_dir_all(&root);
+        let input_path = root.join("movie.mkv");
+        fs::create_dir_all(&root)?;
+        fs::write(&input_path, b"data")?;
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::CrfSearch,
+                job_id,
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: vec!["crf-search".into(), "--input".into(), "movie.mkv".into()],
+            },
+            root.clone(),
+            input_path,
+        );
+
+        cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Stopped))?;
+        assert!(root.exists());
+        cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Completed))?;
+        assert!(!root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn completed_local_encode_cleanup_preserves_output() -> Result<()> {
+        let job_id = format!("cleanup-local-output-{}", std::process::id());
+        let root = worker_job_input_dir(&job_id);
+        let _ = fs::remove_dir_all(&root);
+        let input_path = root.join("movie.mkv");
+        let output_path = root.join("movie.av1.mkv");
+        fs::create_dir_all(&root)?;
+        fs::write(&input_path, b"input")?;
+        fs::write(&output_path, b"output")?;
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::Encode,
+                job_id,
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 5,
+                chunk_size_bytes: 5,
+                target_vmaf: 0.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: vec![
+                    "encode".into(),
+                    "--input".into(),
+                    "movie.mkv".into(),
+                    "--output".into(),
+                    "movie.av1.mkv".into(),
+                ],
+                crf_search_args: Vec::new(),
+            },
+            root.clone(),
+            input_path.clone(),
+        );
+
+        cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Completed))?;
+
+        assert!(!input_path.exists());
+        assert!(output_path.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn completed_offered_local_encode_cleanup_preserves_source() -> Result<()> {
+        let job_id = format!("cleanup-offered-local-output-{}", std::process::id());
+        let root = worker_job_input_dir(&job_id);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        let source_root =
+            std::env::temp_dir().join(format!("ab-av1-worker-source-{}", std::process::id()));
+        let source_path = source_root.join("movie.mkv");
+        fs::create_dir_all(&source_root)?;
+        fs::write(&source_path, b"input")?;
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::Encode,
+                job_id,
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 5,
+                chunk_size_bytes: 5,
+                target_vmaf: 0.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: vec![
+                    "encode".into(),
+                    "--input".into(),
+                    source_path.display().to_string(),
+                    "--output".into(),
+                    root.join("movie.av1.mkv").display().to_string(),
+                ],
+                crf_search_args: Vec::new(),
+            },
+            root.clone(),
+            source_path.clone(),
+        );
+
+        cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Completed))?;
+
+        assert!(source_path.exists());
+        assert!(!root.exists());
+        fs::remove_dir_all(source_root)?;
         Ok(())
     }
 
