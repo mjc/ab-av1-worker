@@ -18,6 +18,7 @@ pub struct SpawnConfig {
     pub video_only: bool,
     encode: args::Encode,
     crf: f32,
+    output_ext: Arc<str>,
 }
 
 /// Validated encode inputs lowered from the raw clap surface.
@@ -77,9 +78,15 @@ impl EncodePlan {
             defaulting_output,
         } = resolve_output(&encode.input, &encode.encoder, &encode_to, &probe)?;
         let audio = audio_config(&encode_to, &probe)?;
+        let output_ext: Arc<str> = planned
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .into();
 
         // Validate ffmpeg arg construction during preflight.
-        encode.to_ffmpeg_args(crf, &probe)?;
+        encode.to_ffmpeg_args(crf, &probe, &output_ext)?;
 
         Ok(Self {
             input: encode.input.clone(),
@@ -92,6 +99,7 @@ impl EncodePlan {
                 audio_codec: audio.audio_codec,
                 encode,
                 crf,
+                output_ext,
                 video_only: encode_to.video_only,
             },
         })
@@ -114,14 +122,14 @@ impl EncodePlan {
         &self.spawn
     }
 
-    pub fn begin(self) -> (PartialOutput, EncodeSession) {
-        let partial = self.planned.begin();
+    pub fn begin(self) -> anyhow::Result<(PartialOutput, EncodeSession)> {
+        let partial = self.planned.begin()?;
         let session = EncodeSession {
             input: self.input,
             probe: self.probe,
             spawn: self.spawn,
         };
-        (partial, session)
+        Ok((partial, session))
     }
 }
 
@@ -134,10 +142,11 @@ pub struct EncodeSession {
 
 impl EncodeSession {
     pub fn ffmpeg_args(&self) -> Result<FfmpegEncodeArgs<'_>, EncodePlanError> {
-        let mut enc_args = self
-            .spawn
-            .encode
-            .to_ffmpeg_args(self.spawn.crf, &self.probe)?;
+        let mut enc_args = self.spawn.encode.to_ffmpeg_args(
+            self.spawn.crf,
+            &self.probe,
+            &self.spawn.output_ext,
+        )?;
         enc_args.video_only = self.spawn.video_only;
         Ok(enc_args)
     }
@@ -215,6 +224,29 @@ mod tests {
     }
 
     #[test]
+    fn build_uses_final_output_extension_for_encoder_defaults() {
+        let input = temp_input("plan", "output-extension");
+        let output = env::temp_dir().join(format!(
+            "ab-av1-encode-plan-output-extension-{}.mp4",
+            std::process::id()
+        ));
+        let mut args = encode_args(input.clone(), Some(output));
+        args.args.encoder = "libx265".parse().unwrap();
+
+        let plan = EncodePlan::build(args.into(), arc_probe(Some(6))).expect("plan build");
+        let (_partial, session) = plan.begin().expect("begin encode");
+        let ffmpeg = session.ffmpeg_args().expect("ffmpeg args");
+
+        assert!(
+            ffmpeg
+                .output_args
+                .windows(2)
+                .any(|args| args[0].as_str() == "-tag:v" && args[1].as_str() == "hvc1")
+        );
+        let _ = fs::remove_file(input);
+    }
+
+    #[test]
     fn build_carries_video_only_and_stereo_downmix_decisions() {
         let input = temp_input("plan", "flags");
         let output =
@@ -227,7 +259,7 @@ mod tests {
         assert!(plan.spawn_config().video_only);
         assert!(plan.spawn_config().stereo_downmix);
         assert!(plan.spawn_config().has_audio);
-        let (_partial, session) = plan.begin();
+        let (_partial, session) = plan.begin().expect("begin encode");
         assert!(session.ffmpeg_args().expect("ffmpeg args").video_only);
         let _ = fs::remove_file(input);
     }

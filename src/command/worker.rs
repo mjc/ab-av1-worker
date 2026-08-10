@@ -810,6 +810,7 @@ where
                 Some(Ok(crf_search::Update::Done(best))) => return Ok(best),
                 Some(Ok(crf_search::Update::Status { .. }))
                 | Some(Ok(crf_search::Update::SampleResult { .. }))
+                | Some(Ok(crf_search::Update::SampleEncodeDone(_)))
                 | Some(Ok(crf_search::Update::RunResult(_))) => {}
                 Some(Err(error)) => return Err(error.into()),
                 None => break,
@@ -1049,6 +1050,7 @@ async fn handle_crf_update(
             );
             Ok((None, false))
         }
+        Ok(crf_search::Update::SampleEncodeDone(_)) => Ok((None, false)),
         Ok(crf_search::Update::RunResult(sample)) => {
             let payload = job.crf_result_payload(&sample, false);
             state.crf_results.push(payload.clone());
@@ -1931,7 +1933,8 @@ async fn run_multiplex_crf(
                             "crf_run_result",
                         );
                     }
-                    Some(Ok(crf_search::Update::SampleResult { .. })) => {}
+                    Some(Ok(crf_search::Update::SampleResult { .. }))
+                    | Some(Ok(crf_search::Update::SampleEncodeDone(_))) => {}
                     Some(Err(error)) => return Err(error.into()),
                     None => bail!("CRF search ended without a result"),
                 }

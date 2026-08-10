@@ -33,7 +33,7 @@ pub async fn run_encode_with_progress<F>(
 where
     F: FnMut(f32, std::time::Duration, &std::path::Path),
 {
-    let (partial, session) = plan.begin();
+    let (partial, session) = plan.begin()?;
     let input = session.input.clone();
     let output = partial.path().to_path_buf();
 
@@ -71,7 +71,7 @@ where
 
     Ok(EncodeRun {
         input,
-        output: partial.commit(),
+        output: partial.commit()?,
         stream_sizes: progress.stream_sizes,
     })
 }

@@ -1,5 +1,9 @@
 use crate::temporary::CleanupGuard;
-use std::path::{Path, PathBuf};
+use anyhow::Context;
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 /// User-selected or defaulted output path before ffmpeg may write it.
 #[must_use]
@@ -12,6 +16,7 @@ pub struct PlannedOutput {
 #[must_use]
 pub struct PartialOutput {
     guard: CleanupGuard,
+    final_path: PathBuf,
 }
 
 /// Successful encode output, no longer subject to failure cleanup.
@@ -29,10 +34,15 @@ impl PlannedOutput {
         &self.path
     }
 
-    pub fn begin(self) -> PartialOutput {
-        PartialOutput {
-            guard: CleanupGuard::arm(self.path),
-        }
+    pub fn begin(self) -> anyhow::Result<PartialOutput> {
+        let final_path = self.path;
+        let mut staged_name = OsString::from(".tmp.ab-av1-encoding.");
+        staged_name.push(final_path.file_name().context("no output file name")?);
+        let staged_path = final_path.with_file_name(staged_name);
+        Ok(PartialOutput {
+            guard: CleanupGuard::arm(staged_path),
+            final_path,
+        })
     }
 }
 
@@ -41,10 +51,17 @@ impl PartialOutput {
         self.guard.path()
     }
 
-    pub fn commit(self) -> CompletedOutput {
-        CompletedOutput {
-            path: self.guard.disarm(),
-        }
+    pub fn commit(self) -> anyhow::Result<CompletedOutput> {
+        let Self { guard, final_path } = self;
+        std::fs::rename(guard.path(), &final_path).with_context(|| {
+            format!(
+                "move encoded output {} to {}",
+                guard.path().display(),
+                final_path.display()
+            )
+        })?;
+        guard.disarm();
+        Ok(CompletedOutput { path: final_path })
     }
 }
 
@@ -92,25 +109,43 @@ mod tests {
     #[tokio::test]
     async fn partial_output_cleans_up_when_not_committed() {
         let path = temp_path("partial-drop");
-        fs::write(&path, b"temp").expect("write file");
+        let staged;
         {
-            let _partial = PlannedOutput::new(path.clone()).begin();
+            let partial = PlannedOutput::new(path.clone())
+                .begin()
+                .expect("begin output");
+            staged = partial.path().to_path_buf();
+            fs::write(&staged, b"temp").expect("write staged file");
         }
         temporary::clean_all().await;
-        assert!(!path.exists(), "uncommitted partial output must be deleted");
+        assert!(
+            !staged.exists(),
+            "uncommitted partial output must be deleted"
+        );
     }
 
     #[serial]
     #[tokio::test]
-    async fn completed_output_survives_cleanup() {
+    async fn completed_output_replaces_destination_and_survives_cleanup() {
         let path = temp_path("completed");
-        fs::write(&path, b"stay").expect("write file");
-        let completed = PlannedOutput::new(path.clone()).begin().commit();
-        temporary::clean_all().await;
+        fs::write(&path, b"old").expect("write final file");
+        let partial = PlannedOutput::new(path.clone())
+            .begin()
+            .expect("begin output");
+        assert_eq!(partial.path().parent(), path.parent());
         assert!(
-            completed.path().exists(),
-            "completed output must survive cleanup"
+            partial
+                .path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".tmp.ab-av1-encoding.")
         );
+        fs::write(partial.path(), b"new").expect("write staged file");
+        let completed = partial.commit().expect("commit output");
+        temporary::clean_all().await;
+        assert_eq!(completed.path(), path);
+        assert_eq!(fs::read(&path).expect("read final file"), b"new");
         let _ = fs::remove_file(path);
     }
 }

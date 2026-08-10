@@ -18,13 +18,13 @@ pub fn sample_dest_path(
     floor_to_sec: bool,
     frames: u32,
     temp_dir: Option<PathBuf>,
-) -> PathBuf {
+) -> anyhow::Result<PathBuf> {
     let mut sample_start_s = sample_start.as_secs_f32();
     if floor_to_sec {
         sample_start_s = sample_start_s.floor();
     }
 
-    let mut dest = temporary::process_dir(temp_dir, input.parent().map(Path::to_path_buf));
+    let mut dest = temporary::process_dir(temp_dir, input.parent().map(Path::to_path_buf))?;
     // Always using mkv for the samples works better than, e.g. using mp4 for mp4s
     // see https://github.com/alexheretic/ab-av1/issues/82#issuecomment-1337306325
     dest.push(
@@ -33,7 +33,7 @@ pub fn sample_dest_path(
             .file_name()
             .unwrap(),
     );
-    dest
+    Ok(dest)
 }
 
 /// Whether ffmpeg copy should retry with `-fflags +genpts`.
@@ -122,7 +122,7 @@ pub async fn copy(
     frames: u32,
     temp_dir: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
-    let dest = sample_dest_path(input, sample_start, floor_to_sec, frames, temp_dir);
+    let dest = sample_dest_path(input, sample_start, floor_to_sec, frames, temp_dir)?;
     if dest.exists() {
         return Ok(dest);
     }
@@ -259,7 +259,8 @@ mod tests {
         let input = Path::new("/tmp/vid.mp4");
 
         // execute
-        let dest = sample_dest_path(input, Duration::from_secs_f32(12.5), false, 48, None);
+        let dest = sample_dest_path(input, Duration::from_secs_f32(12.5), false, 48, None)
+            .expect("sample destination");
 
         // assert
         assert!(dest.to_string_lossy().contains("sample12.5+48f.mkv"));
@@ -271,7 +272,8 @@ mod tests {
         let input = Path::new("/tmp/vid.mp4");
 
         // execute
-        let dest = sample_dest_path(input, Duration::from_secs_f32(12.9), true, 24, None);
+        let dest = sample_dest_path(input, Duration::from_secs_f32(12.9), true, 24, None)
+            .expect("sample destination");
 
         // assert
         assert!(dest.to_string_lossy().contains("sample12+24f.mkv"));
@@ -334,7 +336,8 @@ mod tests {
     async fn copy_returns_existing_dest_without_spawning() {
         // setup
         let input = temp_input("existing");
-        let dest = sample_dest_path(&input, Duration::from_secs(0), true, 10, None);
+        let dest = sample_dest_path(&input, Duration::from_secs(0), true, 10, None)
+            .expect("sample destination");
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).expect("create temp parent");
         }

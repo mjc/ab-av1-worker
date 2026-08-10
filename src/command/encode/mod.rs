@@ -47,7 +47,7 @@ pub struct Args {
     #[clap(flatten)]
     pub args: args::Encode,
 
-    /// Encoder constant rate factor (1-63). Lower means better quality.
+    /// Encoder constant rate factor (e.g. 1-63 for svt-av1). Lower means better quality.
     #[arg(long)]
     pub crf: Crf,
 
@@ -256,6 +256,7 @@ mod tests {
         let input = temp_input("run", "encode-fail");
         let output =
             env::temp_dir().join(format!("ab-av1-encode-fail-out-{}.mkv", std::process::id()));
+        fs::write(&output, b"existing-output").expect("write existing output");
         let args = encode_args(input.clone(), Some(output.clone()));
         let bar = ProgressBar::new(1);
         let spawner = FixtureSpawner::new("stderr-badness-exit-7");
@@ -267,14 +268,16 @@ mod tests {
 
         // assert
         assert!(!err.to_string().is_empty());
-        assert!(
-            !output.exists(),
-            "failed encode must remove temporary output file"
+        assert_eq!(
+            fs::read(&output).expect("read existing output"),
+            b"existing-output",
+            "failed encode must leave the destination untouched"
         );
 
         // cleanup
         temporary::clean_all().await;
         let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
     }
 
     #[tokio::test]
@@ -345,6 +348,42 @@ mod tests {
         assert!(output.exists());
 
         // cleanup
+        temporary::clean_all().await;
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
+    }
+
+    #[serial]
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_progress_uses_staged_path_but_returns_final_path() {
+        let input = temp_input("worker", "staged-progress");
+        let output = env::temp_dir().join(format!(
+            "ab-av1-worker-staged-progress-{}.mkv",
+            std::process::id()
+        ));
+        let mut progress_paths = Vec::new();
+        test_support::test_hooks::set_fixture("stderr-ffmpeg-progress");
+
+        let result = run_worker_with_progress(
+            encode_args(input.clone(), Some(output.clone())).into(),
+            arc_probe(Some(6)),
+            |_fps, _time, path| progress_paths.push(path.to_path_buf()),
+        )
+        .await;
+        test_support::test_hooks::clear();
+        let (completed_path, _) = result.expect("worker encode");
+
+        assert_eq!(completed_path, output);
+        assert!(!progress_paths.is_empty());
+        assert!(progress_paths.iter().all(|path| {
+            path != &output
+                && path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".tmp.ab-av1-encoding.")
+        }));
+
         temporary::clean_all().await;
         let _ = fs::remove_file(input);
         let _ = fs::remove_file(output);

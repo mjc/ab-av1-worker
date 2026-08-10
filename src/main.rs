@@ -28,7 +28,7 @@ enum Command {
     Vmaf(command::vmaf::Args),
     Xpsnr(command::xpsnr::Args),
     Encode(command::encode::Args),
-    CrfSearch(command::crf_search::Args),
+    CrfSearch(command::crf_search::CommandArgs),
     AutoEncode(command::auto_encode::Args),
     Worker(command::worker::Args),
     PrintCompletions(command::print_completions::Args),
@@ -64,7 +64,7 @@ async fn main() {
             command::encode(command::encode::EncodeConfig::from(args)).boxed_local()
         }
         Command::CrfSearch(args) => {
-            command::crf_search(command::crf_search::CrfSearchConfig::from(args)).boxed_local()
+            command::crf_search(command::crf_search::CommandConfig::from(args)).boxed_local()
         }
         Command::AutoEncode(args) => {
             command::auto_encode(command::auto_encode::AutoEncodeConfig::from(args)).boxed_local()
@@ -102,7 +102,7 @@ impl Command {
     fn keep_temp_files(&self) -> bool {
         match self {
             Self::SampleEncode(args) => args.sample.keep,
-            Self::CrfSearch(args) => args.sample.keep,
+            Self::CrfSearch(args) => args.search.sample.keep,
             Self::AutoEncode(args) => args.search.sample.keep,
             _ => false,
         }

@@ -250,20 +250,17 @@ pub enum StdoutFormat {
 }
 
 impl StdoutFormat {
-    pub(crate) fn print_result(
-        self,
-        Output {
-            vmaf_score,
-            xpsnr_score,
-            predicted_encode_size,
-            encode_percent,
-            predicted_encode_time,
-            from_cache: _,
-        }: &Output,
-        image: bool,
-    ) {
+    pub(crate) fn print_result(self, output: &Output, crf: f32, image: bool) {
         match self {
             Self::Human => {
+                let Output {
+                    vmaf_score,
+                    xpsnr_score,
+                    predicted_encode_size,
+                    encode_percent,
+                    predicted_encode_time,
+                    from_cache: _,
+                } = output;
                 let vmaf_fmt = match *vmaf_score {
                     None => format_args!(""),
                     Some(s) => match s {
@@ -296,20 +293,7 @@ impl StdoutFormat {
                     "{vmaf_fmt}{xpsnr_fmt}predicted {enc_description} size {size} ({percent}) taking {time}"
                 );
             }
-            Self::Json => {
-                let mut json = serde_json::json!({
-                    "predicted_encode_size": predicted_encode_size,
-                    "predicted_encode_percent": encode_percent,
-                    "predicted_encode_seconds": predicted_encode_time.as_secs_f64(),
-                });
-                if let Some(score) = *vmaf_score {
-                    json["vmaf"] = score.into();
-                }
-                if let Some(score) = *xpsnr_score {
-                    json["xpsnr"] = score.into();
-                }
-                println!("{json}");
-            }
+            Self::Json => println!("{}", output.sample_encode_done_json(crf)),
         }
     }
 }
@@ -336,6 +320,24 @@ pub struct Output {
 }
 
 impl Output {
+    pub fn sample_encode_done_json(&self, crf: f32) -> serde_json::Value {
+        let mut json = serde_json::json!({
+            "type": "sample-encode-done",
+            "crf": crf,
+            "from_cache": self.from_cache,
+            "predicted_encode_size": self.predicted_encode_size,
+            "predicted_encode_percent": self.encode_percent,
+            "predicted_encode_seconds": self.predicted_encode_time.as_secs_f64(),
+        });
+        if let Some(score) = self.vmaf_score {
+            json["vmaf"] = score.into();
+        }
+        if let Some(score) = self.xpsnr_score {
+            json["xpsnr"] = score.into();
+        }
+        json
+    }
+
     /// Extract vmaf or xpsnr score. Use when it is expected to have only 1 of these.
     pub fn single_score(&self) -> f32 {
         self.vmaf_score.or(self.xpsnr_score).unwrap_or(f32::NAN)
@@ -348,5 +350,35 @@ impl Output {
             (None, Some(_)) => ScoreKind::Xpsnr,
             (None, None) => ScoreKind::Vmaf,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_encode_done_json_has_protocol_fields() {
+        let output = Output {
+            vmaf_score: Some(95.5),
+            xpsnr_score: None,
+            predicted_encode_size: 38_889_644,
+            encode_percent: 41.25,
+            predicted_encode_time: Duration::from_secs(1_560),
+            from_cache: true,
+        };
+
+        assert_eq!(
+            output.sample_encode_done_json(28.25),
+            serde_json::json!({
+                "type": "sample-encode-done",
+                "crf": 28.25,
+                "from_cache": true,
+                "predicted_encode_size": 38_889_644,
+                "predicted_encode_percent": 41.25,
+                "predicted_encode_seconds": 1_560.0,
+                "vmaf": 95.5,
+            })
+        );
     }
 }
