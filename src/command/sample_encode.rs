@@ -196,7 +196,7 @@ pub async fn sample_encode(mut config: SampleEncodeConfig) -> anyhow::Result<()>
                         style(enc_args.encode_hint(crf)).dim().italic(),
                     );
                 }
-                stdout_fmt.print_result(&output, input_is_image);
+                stdout_fmt.print_result(&output, crf, input_is_image);
             }
         }
     }

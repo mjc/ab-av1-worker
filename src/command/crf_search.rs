@@ -13,7 +13,7 @@ use crate::{
         PROGRESS_CHARS, args,
         args::VmafArg,
         rules::{CrfSearchRules, PositionalVmafScore},
-        sample_encode::{self, Work},
+        sample_encode::{self, StdoutFormat, Work},
     },
     console_ext::style,
     ffprobe::{self, Ffprobe},
@@ -23,7 +23,7 @@ use anyhow::Context;
 use clap::{ArgAction, Parser};
 use console::style;
 use futures_util::{Stream, StreamExt};
-use indicatif::{HumanBytes, HumanDuration, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
 use std::{fmt, io::IsTerminal, pin::pin, str::FromStr, sync::Arc, time::Duration};
 
@@ -154,6 +154,36 @@ pub struct Args {
 
     #[command(flatten)]
     pub verbose: clap_verbosity_flag::Verbosity,
+}
+
+/// CRF-search-only CLI args. Auto-encode reuses [`Args`] without inheriting
+/// command output options.
+#[derive(Parser)]
+#[clap(verbatim_doc_comment)]
+#[group(skip)]
+pub struct CommandArgs {
+    #[clap(flatten)]
+    pub search: Args,
+
+    /// Stdout message format `human` or `json`.
+    ///
+    /// See <https://github.com/alexheretic/ab-av1/blob/main/stdout-format-json.md>
+    #[arg(long, value_enum, default_value_t = StdoutFormat::Human)]
+    pub stdout_format: StdoutFormat,
+}
+
+pub struct CommandConfig {
+    search: CrfSearchConfig,
+    stdout_format: StdoutFormat,
+}
+
+impl From<CommandArgs> for CommandConfig {
+    fn from(args: CommandArgs) -> Self {
+        Self {
+            search: args.search.into(),
+            stdout_format: args.stdout_format,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -321,8 +351,12 @@ fn positional_vmaf_score(args: &[VmafArg]) -> Option<PositionalVmafScore> {
         .map(PositionalVmafScore::new)
 }
 
-pub async fn crf_search(mut config: CrfSearchConfig) -> anyhow::Result<()> {
-    config.validate()?;
+pub async fn crf_search(config: CommandConfig) -> anyhow::Result<()> {
+    let CommandConfig {
+        mut search,
+        stdout_format,
+    } = config;
+    search.validate()?;
 
     let bar = ProgressBar::new(BAR_LEN).with_style(
         ProgressStyle::default_bar()
@@ -331,24 +365,27 @@ pub async fn crf_search(mut config: CrfSearchConfig) -> anyhow::Result<()> {
     );
     bar.enable_steady_tick(Duration::from_millis(100));
 
-    let probe = ffprobe::probe(&config.args.input);
+    let probe = ffprobe::probe(&search.args.input);
     let input_is_image = probe.is_image;
-    config
+    search
         .sample
-        .set_extension_from_input(&config.args.input, &config.args.encoder, &probe);
+        .set_extension_from_input(&search.args.input, &search.args.encoder, &probe);
 
-    let min_score = config.min_score();
-    let use_xpsnr = config.min_xpsnr.is_some();
-    let max_encoded_percent = config.max_encoded_percent;
-    let thorough = config.thorough;
-    let enc_args = config.args.clone();
-    let verbose = config.verbose;
+    let min_score = search.min_score();
+    let use_xpsnr = search.min_xpsnr.is_some();
+    let max_encoded_percent = search.max_encoded_percent;
+    let thorough = search.thorough;
+    let enc_args = search.args.clone();
+    let verbose = search.verbose;
 
-    let mut run = pin!(run(config, probe.into()));
+    let mut run = pin!(run(search, probe.into()));
     while let Some(update) = run.next().await {
         let update = update.inspect_err(|e| {
             if let Error::NoGoodCrf { last } = e {
                 last.print_attempt(&bar, min_score, max_encoded_percent, use_xpsnr);
+                if let StdoutFormat::Json = stdout_format {
+                    println!("{}", error_json(e));
+                }
             }
         })?;
         match update {
@@ -390,6 +427,11 @@ pub async fn crf_search(mut config: CrfSearchConfig) -> anyhow::Result<()> {
                     result.print_attempt(&bar, sample, Some(crf))
                 }
             }
+            Update::SampleEncodeDone(sample) => {
+                if let StdoutFormat::Json = stdout_format {
+                    println!("{}", sample.enc.sample_encode_done_json(sample.crf));
+                }
+            }
             Update::RunResult(result) => {
                 result.print_attempt(&bar, min_score, max_encoded_percent, use_xpsnr)
             }
@@ -403,7 +445,10 @@ pub async fn crf_search(mut config: CrfSearchConfig) -> anyhow::Result<()> {
                         style(enc_args.encode_hint(best.crf)).dim().italic(),
                     );
                 }
-                StdoutFormat::Human.print_result(&best, input_is_image);
+                match stdout_format {
+                    StdoutFormat::Human => best.print_result_human(input_is_image),
+                    StdoutFormat::Json => println!("{}", best.done_json()),
+                }
                 return Ok(());
             }
         }
@@ -515,6 +560,7 @@ pub fn run(
             );
             let score = output_search_score(&sample.enc, use_xpsnr);
             crf_attempts.push(sample.clone());
+            yield Update::SampleEncodeDone(sample.clone());
 
             match decide_next_transition(
                 &sample,
@@ -615,34 +661,35 @@ impl Sample {
             "{crf_label} {crf} {score_label} {score:.2} {open}{percent}{close}{cache_msg}"
         ));
     }
-}
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-pub enum StdoutFormat {
-    Human,
-}
-
-impl StdoutFormat {
-    fn print_result(self, sample: &Sample, image: bool) {
-        match self {
-            Self::Human => {
-                let crf = style(TerseF32(sample.crf)).bold().green();
-                let enc = &sample.enc;
-                let score = style(enc.single_score()).bold().green();
-                let score_kind = enc.single_score_kind();
-                let size = style(HumanBytes(enc.predicted_encode_size)).bold().green();
-                let percent = style!("{}%", enc.encode_percent.round()).bold().green();
-                let time = style(HumanDuration(enc.predicted_encode_time)).bold();
-                let enc_description = match image {
-                    true => "image",
-                    false => "video stream",
-                };
-                println!(
-                    "crf {crf} {score_kind} {score:.2} predicted {enc_description} size {size} ({percent}) taking {time}"
-                );
-            }
-        }
+    fn print_result_human(&self, image: bool) {
+        let crf = style(TerseF32(self.crf)).bold().green();
+        let enc = &self.enc;
+        let score = style(enc.single_score()).bold().green();
+        let score_kind = enc.single_score_kind();
+        let size = style(indicatif::HumanBytes(enc.predicted_encode_size))
+            .bold()
+            .green();
+        let percent = style!("{}%", enc.encode_percent.round()).bold().green();
+        let time = style(indicatif::HumanDuration(enc.predicted_encode_time)).bold();
+        let enc_description = if image { "image" } else { "video stream" };
+        println!(
+            "crf {crf} {score_kind} {score:.2} predicted {enc_description} size {size} ({percent}) taking {time}"
+        );
     }
+
+    fn done_json(&self) -> serde_json::Value {
+        let mut json = self.enc.sample_encode_done_json(self.crf);
+        json["type"] = "crf-search-done".into();
+        json
+    }
+}
+
+fn error_json(err: &Error) -> serde_json::Value {
+    serde_json::json!({
+        "type": "crf-search-error",
+        "message": err.to_string(),
+    })
 }
 
 /// Conversion logic for integer "q" values used in the crf search.
@@ -826,6 +873,7 @@ pub enum Update {
         sample: u64,
         result: sample_encode::EncodeResult,
     },
+    SampleEncodeDone(Sample),
     /// Run result (excludes successful final runs)
     RunResult(Sample),
     Done(Sample),
@@ -834,9 +882,9 @@ pub enum Update {
 #[cfg(test)]
 mod crf_search_tests {
     use super::{
-        Args, Crf, CrfSearchConfig, CrfStep, Error, MaxEncodedPercent, MinScore, Sample, Update,
-        ValidationError, guess_progress, output_search_score, positional_vmaf_score, run,
-        test_hooks, vmaf_lerp_q,
+        Args, CommandArgs, Crf, CrfSearchConfig, CrfStep, Error, MaxEncodedPercent, MinScore,
+        Sample, Update, ValidationError, error_json, guess_progress, output_search_score,
+        positional_vmaf_score, run, test_hooks, vmaf_lerp_q,
     };
     use crate::{
         command::{
@@ -964,6 +1012,42 @@ mod crf_search_tests {
 
     use helpers::*;
 
+    #[test]
+    fn stdout_format_is_crf_search_only() {
+        assert!(
+            CommandArgs::try_parse_from([
+                "ab-av1",
+                "--input",
+                "input.mkv",
+                "--stdout-format",
+                "json",
+            ])
+            .is_ok()
+        );
+        assert!(
+            crate::command::auto_encode::Args::try_parse_from([
+                "ab-av1",
+                "--input",
+                "input.mkv",
+                "--stdout-format",
+                "json",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn json_terminal_messages_are_typed() {
+        let sample = Sample::new(34.0, 34, mock_output(Some(95.5), None, 41.25));
+        let done = sample.done_json();
+        assert_eq!(done["type"], "crf-search-done");
+        assert_eq!(done["crf"], 34.0);
+
+        let error = error_json(&Error::NoGoodCrf { last: sample });
+        assert_eq!(error["type"], "crf-search-error");
+        assert!(error["message"].as_str().unwrap().contains("34"));
+    }
+
     struct MockGuard;
 
     impl MockGuard {
@@ -993,6 +1077,14 @@ mod crf_search_tests {
         // assert
         let done = last_done(&updates).expect("expected Done");
         assert_eq!(done.enc.vmaf_score, Some(min_score));
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|update| matches!(update, Update::SampleEncodeDone(_)))
+                .count(),
+            1,
+            "one sample-encode-done is emitted for the one attempted CRF"
+        );
     }
 
     #[test]
