@@ -250,6 +250,23 @@ mod test {
     }
 
     #[tokio::test]
+    async fn vmaf_stream_reports_one_child_failure_without_score() {
+        let mut stream = fixture_stream("vmaf-no-score-exit-7");
+        let mut errors = Vec::new();
+
+        while let Some(out) = stream.next().await {
+            match out {
+                VmafOut::Err(err) => errors.push(err.to_string()),
+                other => panic!("expected only VMAF process errors, got {other:?}"),
+            }
+        }
+
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("ffmpeg vmaf exit code 7"));
+        assert!(errors[0].contains("vmaf badness"));
+    }
+
+    #[tokio::test]
     async fn vmaf_stream_ignores_stdout_noise() {
         let mut stream = fixture_stream("stdout-noise-vmaf-progress-score");
         assert!(matches!(

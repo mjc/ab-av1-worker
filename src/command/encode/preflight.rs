@@ -1,27 +1,24 @@
 use super::{default_output_name, error::EncodePlanError, lifecycle::PlannedOutput};
 use crate::{command::args, ffprobe::Ffprobe};
 use same_file::is_same_file;
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
 /// Resolved output path and whether the CLI omitted `--output`.
 #[derive(Debug)]
-pub struct ResolvedOutput {
-    pub planned: PlannedOutput,
-    pub defaulting_output: bool,
+pub(in crate::command) struct ResolvedOutput {
+    pub(in crate::command) planned: PlannedOutput,
+    pub(in crate::command) defaulting_output: bool,
 }
 
 /// Audio options derived from CLI flags and probe metadata.
 #[derive(Debug)]
-pub struct AudioConfig {
-    pub has_audio: bool,
-    pub stereo_downmix: bool,
-    pub audio_codec: Option<Arc<str>>,
+pub(in crate::command) struct AudioConfig {
+    pub(super) has_audio: bool,
+    pub(super) stereo_downmix: bool,
+    pub(super) audio_codec: Option<Arc<str>>,
 }
 
-pub fn resolve_output(
+pub(in crate::command) fn resolve_output(
     input: &Path,
     encoder: &args::Encoder,
     encode_to: &args::EncodeToOutput,
@@ -43,7 +40,7 @@ pub fn resolve_output(
     })
 }
 
-pub fn audio_config(
+pub(in crate::command) fn audio_config(
     encode_to: &args::EncodeToOutput,
     probe: &Ffprobe,
 ) -> Result<AudioConfig, EncodePlanError> {
@@ -64,7 +61,7 @@ pub fn audio_config(
 mod tests {
     use super::*;
     use crate::command::args::{EncodeToOutput, Encoder};
-    use std::{env, fs, time::Duration};
+    use std::{env, fs, path::PathBuf, time::Duration};
 
     fn probe(channels: Option<i64>) -> Ffprobe {
         Ffprobe {

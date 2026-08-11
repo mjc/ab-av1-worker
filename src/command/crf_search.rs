@@ -38,9 +38,10 @@ pub(crate) mod test_hooks {
     use super::sample_encode;
     use std::cell::RefCell;
 
+    type Mock = Box<dyn Fn(f32) -> sample_encode::Output>;
+
     thread_local! {
-        static MOCK: RefCell<Option<Box<dyn Fn(f32) -> sample_encode::Output>>> =
-            const { RefCell::new(None) };
+        static MOCK: RefCell<Option<Mock>> = const { RefCell::new(None) };
     }
 
     pub fn set(mock: impl Fn(f32) -> sample_encode::Output + 'static) {

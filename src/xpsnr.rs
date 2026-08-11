@@ -90,6 +90,7 @@ impl XpsnrOut {
 
 // E.g. "[Parsed_xpsnr_0 @ 0x711494004cc0] XPSNR  y: 33.6547  u: 41.8741  v: 42.2571  (minimum: 33.6547)"
 // E.g. "[Parsed_xpsnr_0 @ 0x711494004cc0] XPSNR  y: 33.6547  u: 41.8741  v: 42.2571  (minimum: 33.6547)"
+#[cfg(test)]
 fn score_from_line(line: &str) -> Option<f32> {
     score_from_minimum_line(line).or_else(|| score_from_average_line(line))
 }

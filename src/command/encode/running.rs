@@ -1,14 +1,14 @@
 use super::{
     lifecycle::CompletedOutput,
-    plan::{EncodePlan, EncodeSession},
+    plan::EncodePlan,
     progress::{BarUpdate, ProgressState, StreamSizes, apply_ffmpeg_event},
     sink::ProgressSink,
     spawner::EncodeSpawner,
 };
 use crate::{command::SmallDuration, log::ProgressLogger};
+use futures_util::{TryStreamExt, future};
 use log::info;
 use std::time::Instant;
-use tokio_stream::StreamExt;
 
 pub struct EncodeRun {
     pub input: std::path::PathBuf,
@@ -35,16 +35,18 @@ pub async fn run_encode(
 
     let mut logger = ProgressLogger::new(module_path!(), Instant::now());
     let mut progress = ProgressState::default();
-    while let Some(event) = enc.next().await {
-        let event = event?;
-        if let Some(BarUpdate::Fps { fps, time }) = apply_ffmpeg_event(&mut progress, event) {
-            sink.set_message(format!("{fps} fps, "));
-            if let Ok(d) = &session.probe.duration {
-                sink.set_position(time.as_micros_u64());
-                logger.update(*d, time, fps);
+    (&mut enc)
+        .try_for_each(|event| {
+            if let Some(BarUpdate::Fps { fps, time }) = apply_ffmpeg_event(&mut progress, event) {
+                sink.set_message(format!("{fps} fps, "));
+                if let Ok(d) = &session.probe.duration {
+                    sink.set_position(time.as_micros_u64());
+                    logger.update(*d, time, fps);
+                }
             }
-        }
-    }
+            future::ready(Ok(()))
+        })
+        .await?;
     enc.wait().await?;
     sink.finish();
 

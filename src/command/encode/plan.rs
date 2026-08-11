@@ -81,16 +81,8 @@ impl EncodePlan {
         self.defaulting_output
     }
 
-    pub fn planned(&self) -> &PlannedOutput {
-        &self.planned
-    }
-
     pub fn output_path(&self) -> &Path {
         self.planned.path()
-    }
-
-    pub fn spawn_config(&self) -> &SpawnConfig {
-        &self.spawn
     }
 
     pub fn begin(self) -> anyhow::Result<(PartialOutput, EncodeSession)> {
@@ -132,10 +124,6 @@ impl EncodeSession {
 
     pub fn audio_codec(&self) -> Option<&str> {
         self.spawn.audio_codec.as_deref()
-    }
-
-    pub fn video_only(&self) -> bool {
-        self.spawn.video_only
     }
 }
 
@@ -198,11 +186,10 @@ mod tests {
         args.encode.downmix_to_stereo = true;
 
         let plan = EncodePlan::build(args, arc_probe(Some(6))).expect("plan build");
-        assert!(plan.spawn_config().video_only);
-        assert!(plan.spawn_config().stereo_downmix);
-        assert!(plan.spawn_config().has_audio);
+        assert!(plan.spawn.video_only);
+        assert!(plan.spawn.stereo_downmix);
+        assert!(plan.spawn.has_audio);
         let (_partial, session) = plan.begin().expect("begin output");
-        assert!(session.video_only());
         assert!(session.ffmpeg_args().expect("ffmpeg args").video_only);
         let _ = fs::remove_file(input);
     }
@@ -218,7 +205,7 @@ mod tests {
         args.encode.downmix_to_stereo = true;
 
         let plan = EncodePlan::build(args, arc_probe(Some(2))).expect("plan build");
-        assert!(!plan.spawn_config().stereo_downmix);
+        assert!(!plan.spawn.stereo_downmix);
         let _ = fs::remove_file(input);
     }
 }

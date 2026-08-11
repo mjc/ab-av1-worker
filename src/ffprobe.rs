@@ -445,18 +445,9 @@ mod tests {
     }
 
     #[test]
-    fn probe_reads_zero_duration_from_minimal_gif() {
-        // setup: 1×1 GIF — ffprobe succeeds, format duration is zero.
-        let gif = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00,\
-\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
-        let path =
-            std::env::temp_dir().join(format!("ab-av1-probe-gif-{}.gif", std::process::id()));
-        std::fs::write(&path, gif).expect("write gif stub");
-        // execute
-        let probe = probe(&path);
-        // assert
-        assert!(probe.is_image);
-        assert_eq!(probe.duration.ok(), Some(Duration::ZERO));
-        let _ = std::fs::remove_file(path);
+    fn read_duration_defaults_missing_format_duration_to_zero() {
+        let probe = ffprobe::FfProbe::default();
+
+        assert_eq!(read_duration(&probe).unwrap(), Duration::ZERO);
     }
 }

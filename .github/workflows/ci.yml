@@ -34,13 +34,19 @@ jobs:
     - run: rustup component add llvm-tools-preview
     - run: cargo install cargo-llvm-cov --locked
     - run: cargo install cargo-nextest --locked
-    - run: cargo install cargo-nextest --locked
     - run: cargo llvm-cov nextest --locked --summary-only --fail-under-lines 80
     - run: cargo llvm-cov nextest --locked --lcov --output-path lcov.info
     - uses: actions/upload-artifact@v4
       with:
         name: lcov
         path: lcov.info
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+    - run: rustup update stable
+    - uses: actions/checkout@v6
+    - run: cargo clippy --locked --all-targets -- -D warnings
 
   # Disabled while we no longer need cfg(windows) code
   # test-windows:

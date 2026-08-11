@@ -1,18 +1,18 @@
-#![allow(
-    dead_code,
-    reason = "managed process wrapper is introduced before callers migrate onto it"
-)]
-
 use anyhow::bail;
 use std::process::{ExitStatus, Output};
 use std::time::Duration;
 use tokio::process::Command;
-use tokio_process_tools::{Chunk, visitors::inspect::InspectChunks};
+use tokio_process_tools::Chunk;
+#[cfg(test)]
+use tokio_process_tools::Consumable;
+#[cfg(test)]
+use tokio_process_tools::Next;
+#[cfg(test)]
+use tokio_process_tools::visitors::inspect::InspectChunks;
 use tokio_process_tools::{
-    CollectionOverflowBehavior, Consumable, DEFAULT_MAX_BUFFERED_CHUNKS,
-    DEFAULT_OUTPUT_EOF_TIMEOUT, DEFAULT_READ_CHUNK_SIZE, GracefulShutdown,
-    LossyWithoutBackpressure, Next, Process, RawCollectionOptions, RawOutputOptions, ReplayEnabled,
-    StreamEvent, Subscribable, Subscription,
+    CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_OUTPUT_EOF_TIMEOUT,
+    DEFAULT_READ_CHUNK_SIZE, GracefulShutdown, LossyWithoutBackpressure, Process,
+    RawCollectionOptions, RawOutputOptions, ReplayEnabled, StreamEvent, Subscribable, Subscription,
 };
 use tokio_process_tools::{NumBytesExt, ProcessHandle, SingleSubscriberOutputStream};
 use tokio_stream::Stream;
@@ -39,11 +39,13 @@ impl Default for ManagedProcessOptions {
 }
 
 impl ManagedProcessOptions {
+    #[cfg(test)]
     pub fn with_wait_timeout(mut self, wait_timeout: Duration) -> Self {
         self.wait_timeout = wait_timeout;
         self
     }
 
+    #[cfg(test)]
     pub fn with_stderr_limit(mut self, stderr_limit: usize) -> Self {
         self.stderr_limit = stderr_limit;
         self
@@ -96,15 +98,18 @@ impl Drop for TerminateOnDropProcess {
 pub struct ManagedOutput {
     pub status: ExitStatus,
     pub stderr: Vec<u8>,
+    #[cfg(test)]
     pub stderr_truncation: OutputTruncation,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputTruncation {
     Complete,
     Truncated,
 }
 
+#[cfg(test)]
 impl OutputTruncation {
     fn from_truncated(truncated: bool) -> Self {
         if truncated {
@@ -120,19 +125,15 @@ impl OutputTruncation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawOutputChunk(Vec<u8>);
+pub struct RawOutputChunk(Chunk);
 
 impl RawOutputChunk {
-    fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+    fn new(chunk: Chunk) -> Self {
+        Self(chunk)
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0
+        self.0.as_ref()
     }
 }
 
@@ -196,6 +197,7 @@ impl ManagedProcess {
             .build()
     }
 
+    #[cfg(test)]
     pub async fn stderr_chunks(self) -> anyhow::Result<(ExitStatus, Vec<u8>)> {
         let output = self.stderr_output().await?;
         Ok((output.status, output.stderr))
@@ -235,10 +237,12 @@ impl ManagedProcess {
         Ok(ManagedOutput {
             status: output.status,
             stderr: output.stderr.bytes,
+            #[cfg(test)]
             stderr_truncation: OutputTruncation::from_truncated(output.stderr.truncated),
         })
     }
 
+    #[cfg(test)]
     pub async fn observe_stderr_chunks(
         mut self,
         on_chunk: impl FnMut(Chunk) -> Next + Send + 'static,
@@ -280,6 +284,7 @@ impl ManagedProcess {
         TerminateOnDropProcess(Some(self))
     }
 
+    #[cfg(test)]
     pub async fn observe_stdout_chunks(
         mut self,
         on_chunk: impl FnMut(Chunk) -> Next + Send + 'static,
@@ -305,6 +310,7 @@ impl ManagedProcess {
         Ok(status)
     }
 
+    #[cfg(test)]
     pub fn id(&self) -> Option<u32> {
         self.handle.id()
     }
@@ -326,9 +332,7 @@ impl ManagedProcess {
 
 fn managed_event_from_stream_event(event: StreamEvent) -> anyhow::Result<Option<ManagedEvent>> {
     Ok(match event {
-        StreamEvent::Chunk(chunk) => Some(ManagedEvent::RawStderr(RawOutputChunk::new(
-            chunk.as_ref().to_vec(),
-        ))),
+        StreamEvent::Chunk(chunk) => Some(ManagedEvent::RawStderr(RawOutputChunk::new(chunk))),
         StreamEvent::Gap => Some(ManagedEvent::ReplayGap(OutputReplayGap)),
         StreamEvent::Eof => None,
         StreamEvent::ReadError(err) => Err(err)?,
@@ -470,6 +474,7 @@ mod tests {
         VmafScoreThenSleep,
         VmafProgressScore,
         VmafNoScore,
+        VmafNoScoreExit7,
         VmafScoreExit7,
         StdoutNoiseVmafProgressScore,
         XpsnrScoreThenSleep,
@@ -496,6 +501,7 @@ mod tests {
             Self::VmafScoreThenSleep,
             Self::VmafProgressScore,
             Self::VmafNoScore,
+            Self::VmafNoScoreExit7,
             Self::VmafScoreExit7,
             Self::StdoutNoiseVmafProgressScore,
             Self::XpsnrScoreThenSleep,
@@ -529,6 +535,7 @@ mod tests {
                 Self::VmafScoreThenSleep => "vmaf-score-then-sleep",
                 Self::VmafProgressScore => "vmaf-progress-score",
                 Self::VmafNoScore => "vmaf-no-score",
+                Self::VmafNoScoreExit7 => "vmaf-no-score-exit-7",
                 Self::VmafScoreExit7 => "vmaf-score-exit-7",
                 Self::StdoutNoiseVmafProgressScore => "stdout-noise-vmaf-progress-score",
                 Self::XpsnrScoreThenSleep => "xpsnr-score-then-sleep",
@@ -566,6 +573,7 @@ mod tests {
                     "stderr: ffmpeg progress; delay; stderr: VMAF score; exit 0"
                 }
                 Self::VmafNoScore => "stderr: ffmpeg progress without score; exit 0",
+                Self::VmafNoScoreExit7 => "stderr: VMAF failure without score; exit 7",
                 Self::VmafScoreExit7 => "stderr: VMAF score; stderr: badness; exit 7",
                 Self::StdoutNoiseVmafProgressScore => {
                     "stdout: noise; stderr: ffmpeg progress; delay; stderr: VMAF score; exit 0"
@@ -610,6 +618,7 @@ mod tests {
                 self,
                 Self::StderrBadnessExit7
                     | Self::StderrManyLinesExit7
+                    | Self::VmafNoScoreExit7
                     | Self::VmafScoreExit7
                     | Self::XpsnrScoreExit7
             )
@@ -699,6 +708,10 @@ mod tests {
                 Self::VmafNoScore => eprintln!(
                     "frame=  1 fps=  1 q=-0.0 size=N/A time=00:00:00.10 bitrate=N/A speed=1x"
                 ),
+                Self::VmafNoScoreExit7 => {
+                    eprintln!("vmaf badness");
+                    std::process::exit(7);
+                }
                 Self::VmafScoreExit7 => {
                     eprintln!("VMAF score: 97.500000");
                     eprintln!("vmaf badness");
@@ -758,9 +771,8 @@ mod tests {
 
     #[test]
     fn raw_output_chunk_exposes_borrowed_bytes_for_parsers() {
-        let chunk = RawOutputChunk::new(b"progress".to_vec());
+        let chunk = RawOutputChunk::new(Chunk::from(b"progress"));
         assert_eq!(chunk.as_bytes(), b"progress");
-        assert_eq!(chunk.into_bytes(), b"progress");
     }
 
     #[test]
@@ -1086,7 +1098,7 @@ mod tests {
         let mut status = None;
         while let Some(event) = events.next().await {
             match event.expect("managed event") {
-                ManagedEvent::RawStderr(chunk) => stderr.extend(chunk.into_bytes()),
+                ManagedEvent::RawStderr(chunk) => stderr.extend_from_slice(chunk.as_bytes()),
                 ManagedEvent::ReplayGap(_) => {}
                 ManagedEvent::ProcessDone(done) => status = Some(done.status()),
             }
@@ -1109,7 +1121,7 @@ mod tests {
         let mut stderr = Vec::new();
         while let Some(event) = events.next().await {
             match event.expect("managed event") {
-                ManagedEvent::RawStderr(chunk) => stderr.extend(chunk.into_bytes()),
+                ManagedEvent::RawStderr(chunk) => stderr.extend_from_slice(chunk.as_bytes()),
                 ManagedEvent::ReplayGap(_) => {}
                 ManagedEvent::ProcessDone(_) => break,
             }

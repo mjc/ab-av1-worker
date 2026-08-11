@@ -1,7 +1,6 @@
 use crate::{
     command::{
-        PROGRESS_CHARS, args, crf_search,
-        encode::{self, EncodePlanError},
+        PROGRESS_CHARS, args, crf_search, encode,
         sample_encode::{self, Work},
     },
     console_ext::style,
@@ -203,9 +202,8 @@ mod tests {
         },
         temporary::{self, TempKind},
     };
-    use std::{env, fs, path::PathBuf, sync::Mutex, time::Duration};
-
-    static AUTO_ENCODE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use serial_test::serial;
+    use std::{env, fs, path::PathBuf, time::Duration};
 
     /// crf-search json output is not currently available in auto-encode.
     #[test]
@@ -344,9 +342,9 @@ mod tests {
     }
 
     // ab-kgc.90: auto-encode must reject --stereo-downmix with --acodec copy before search
+    #[serial]
     #[tokio::test]
     async fn rejects_stereo_downmix_with_copy_codec_before_search() {
-        let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
         // setup
         let input = temp_input("downmix-copy");
         let output = env::temp_dir().join(format!(
@@ -374,9 +372,9 @@ mod tests {
         let _ = fs::remove_file(input);
     }
 
+    #[serial]
     #[tokio::test]
     async fn rejects_same_input_and_output_without_overwrite() {
-        let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
         // setup
         let input = temp_input("same-io");
         let args = auto_args(input.clone(), Some(input.clone()), false);
@@ -393,9 +391,9 @@ mod tests {
         let _ = fs::remove_file(input);
     }
 
+    #[serial]
     #[tokio::test]
     async fn propagates_no_good_crf_from_search() {
-        let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
         // setup
         let input = temp_input("no-good-crf");
         let output = env::temp_dir().join(format!(
@@ -416,9 +414,9 @@ mod tests {
         let _ = fs::remove_file(input);
     }
 
+    #[serial]
     #[tokio::test]
     async fn successful_run_preserves_keepable_temps_with_keep_ab_kgc_15() {
-        let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
         // setup
         let input = temp_input("keep");
         let output = env::temp_dir().join(format!(
@@ -452,9 +450,9 @@ mod tests {
         let _ = fs::remove_file(keepable);
     }
 
+    #[serial]
     #[tokio::test]
     async fn successful_run_cleans_keepable_temps_without_keep() {
-        let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
         // setup
         let input = temp_input("no-keep");
         let output = env::temp_dir().join(format!(

@@ -8,14 +8,12 @@ use crate::{
     ffprobe::{self, Ffprobe},
 };
 use clap::Parser;
-use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
-use tokio_stream::StreamExt;
 
 mod error;
 mod lifecycle;
@@ -33,14 +31,8 @@ mod test_support;
 #[cfg(test)]
 pub(crate) use test_support::test_hooks;
 
-pub use error::EncodePlanError;
-pub use lifecycle::{CompletedOutput, PartialOutput, PlannedOutput};
-pub use plan::EncodePlan;
-pub use preflight::{audio_config, resolve_output};
-pub use progress::StreamSizes;
-pub use report::{EncodeMetrics, FinishedEncode};
-pub use sink::ProgressSink;
-pub use spawner::{EncodeSpawner, FfmpegSpawner};
+pub(super) use error::EncodePlanError;
+pub(super) use preflight::{audio_config, resolve_output};
 
 /// Invoke ffmpeg to encode a video or image.
 #[derive(Parser)]
@@ -76,7 +68,7 @@ pub async fn run(args: Args, probe: Arc<Ffprobe>, bar: &ProgressBar) -> anyhow::
     }
     #[cfg(not(test))]
     {
-        run_with_spawner(args, probe, bar, &FfmpegSpawner).await
+        run_with_spawner(args, probe, bar, &spawner::FfmpegSpawner).await
     }
 }
 
@@ -84,9 +76,9 @@ pub(crate) async fn run_with_spawner(
     args: Args,
     probe: Arc<Ffprobe>,
     bar: &ProgressBar,
-    spawner: &impl EncodeSpawner,
+    spawner: &impl spawner::EncodeSpawner,
 ) -> anyhow::Result<()> {
-    let plan = EncodePlan::build(args, probe).map_err(EncodePlanError::into_anyhow)?;
+    let plan = plan::EncodePlan::build(args, probe).map_err(EncodePlanError::into_anyhow)?;
 
     if plan.defaulting_output() {
         let out = shell_escape::escape(plan.output_path().display().to_string().into());
@@ -98,8 +90,8 @@ pub(crate) async fn run_with_spawner(
     }
 
     let run = running::run_encode(plan, bar, spawner).await?;
-    let finished = FinishedEncode::load(run.input, run.output, run.stream_sizes).await?;
-    finished.render_summary(&mut std::io::stderr())?;
+    let metrics = report::EncodeMetrics::load(&run.input, &run.output, run.stream_sizes).await?;
+    report::render_encode_summary(&metrics, &mut std::io::stderr())?;
     Ok(())
 }
 

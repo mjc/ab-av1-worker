@@ -856,6 +856,7 @@ fn encoder_from_str_matrix(#[case] input: &str, #[case] expected: &str) {
     assert_eq!(enc.as_str(), expected);
 }
 
+#[cfg(test)]
 fn test_probe(duration_secs: u64, fps: f64) -> Ffprobe {
     Ffprobe {
         duration: Ok(Duration::from_secs(duration_secs)),

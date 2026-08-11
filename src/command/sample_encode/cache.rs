@@ -75,7 +75,7 @@ pub async fn cache_result(key: Key, result: &super::EncodeResult) -> anyhow::Res
     })
     .await
     .context("db.insert task failed")
-    .and_then(|r| Ok(r?));
+    .and_then(|result| result);
 
     if let Err(err) = insert {
         eprintln!("cache error: {err}")
@@ -134,43 +134,6 @@ impl<S: Hash> Hash for EncodeScoringIdentity<'_, S> {
     }
 }
 
-/// Typed builder for sample-encode cache keys.
-struct CacheKeyBuilder<'a, S> {
-    source: SourceIdentity<'a>,
-    encode_scoring: EncodeScoringIdentity<'a, S>,
-}
-
-impl<'a, S: Hash> CacheKeyBuilder<'a, S> {
-    fn new(
-        sample: &'a Path,
-        source_input: &'a Path,
-        input_duration: Duration,
-        input_extension: Option<&'a OsStr>,
-        input_size: u64,
-        full_pass: bool,
-        dest_ext: &'a str,
-        enc_args: &'a FfmpegEncodeArgs<'a>,
-        scoring: S,
-    ) -> Self {
-        Self {
-            source: SourceIdentity {
-                sample,
-                source_input,
-                input_duration,
-                input_extension,
-                input_size,
-                full_pass,
-                dest_ext,
-            },
-            encode_scoring: EncodeScoringIdentity { enc_args, scoring },
-        }
-    }
-
-    fn build(self) -> Key {
-        Key(hash_components(self.source, self.encode_scoring))
-    }
-}
-
 /// Build a cache key from sample path, source input identity, and encode/scoring args.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_cache_key(
@@ -184,18 +147,18 @@ pub(crate) fn encode_cache_key(
     enc_args: &FfmpegEncodeArgs<'_>,
     scoring: impl Hash,
 ) -> Key {
-    CacheKeyBuilder::new(
-        sample,
-        source_input,
-        input_duration,
-        input_extension,
-        input_size,
-        full_pass,
-        dest_ext,
-        enc_args,
-        scoring,
-    )
-    .build()
+    Key(hash_components(
+        SourceIdentity {
+            sample,
+            source_input,
+            input_duration,
+            input_extension,
+            input_size,
+            full_pass,
+            dest_ext,
+        },
+        EncodeScoringIdentity { enc_args, scoring },
+    ))
 }
 
 fn hash_components(source: impl Hash, encode_scoring: impl Hash) -> blake3::Hash {
@@ -230,6 +193,15 @@ mod tests {
 
         use std::ffi::OsStr;
 
+        pub type StandardKeyInputs = (
+            &'static Path,
+            &'static Path,
+            Option<&'static OsStr>,
+            u64,
+            Duration,
+            (ScoreArgs, Vmaf, bool, Xpsnr),
+        );
+
         pub fn minimal_enc_args(input: &Path) -> FfmpegEncodeArgs<'_> {
             FfmpegEncodeArgs {
                 input,
@@ -258,14 +230,7 @@ mod tests {
             )
         }
 
-        pub fn standard_key_inputs() -> (
-            &'static Path,
-            &'static Path,
-            Option<&'static OsStr>,
-            u64,
-            Duration,
-            (ScoreArgs, Vmaf, bool, Xpsnr),
-        ) {
+        pub fn standard_key_inputs() -> StandardKeyInputs {
             (
                 Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv"),
                 Path::new("/movies/a/clip.mkv"),
@@ -278,85 +243,6 @@ mod tests {
     }
 
     use helpers::{default_scoring, minimal_enc_args, standard_key_inputs};
-
-    #[test]
-    fn cache_key_builder_stable_for_equal_inputs() {
-        // setup
-        let (sample, input, extension, size, duration, scoring) = standard_key_inputs();
-        let enc = minimal_enc_args(input);
-        let builder_a = CacheKeyBuilder::new(
-            sample, input, duration, extension, size, false, "mkv", &enc, &scoring,
-        );
-        let builder_b = CacheKeyBuilder::new(
-            sample, input, duration, extension, size, false, "mkv", &enc, &scoring,
-        );
-
-        // execute / assert
-        assert_eq!(builder_a.build(), builder_b.build());
-    }
-
-    #[test]
-    fn cache_key_builder_distinct_source_inputs() {
-        // setup
-        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
-        let input_a = Path::new("/movies/a/clip.mkv");
-        let input_b = Path::new("/movies/b/clip.mkv");
-        let duration = Duration::from_secs(3600);
-        let extension = Some(std::ffi::OsStr::new("mkv"));
-        let size = 1_000_000_u64;
-        let enc = minimal_enc_args(input_a);
-        let scoring = default_scoring(false);
-
-        // execute
-        let key_a = CacheKeyBuilder::new(
-            sample, input_a, duration, extension, size, false, "mkv", &enc, &scoring,
-        )
-        .build();
-        let key_b = CacheKeyBuilder::new(
-            sample, input_b, duration, extension, size, false, "mkv", &enc, &scoring,
-        )
-        .build();
-
-        // assert
-        assert_ne!(key_a, key_b);
-    }
-
-    #[test]
-    fn cache_key_builder_distinct_scoring_inputs() {
-        // setup
-        let (sample, input, extension, size, duration, scoring_vmaf) = standard_key_inputs();
-        let enc = minimal_enc_args(input);
-        let scoring_xpsnr = default_scoring(true);
-
-        // execute
-        let key_vmaf = CacheKeyBuilder::new(
-            sample,
-            input,
-            duration,
-            extension,
-            size,
-            false,
-            "mkv",
-            &enc,
-            &scoring_vmaf,
-        )
-        .build();
-        let key_xpsnr = CacheKeyBuilder::new(
-            sample,
-            input,
-            duration,
-            extension,
-            size,
-            false,
-            "mkv",
-            &enc,
-            &scoring_xpsnr,
-        )
-        .build();
-
-        // assert
-        assert_ne!(key_vmaf, key_xpsnr);
-    }
 
     #[test]
     fn distinct_source_inputs_do_not_share_cache_keys_ab_kgc_3() {

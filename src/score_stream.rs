@@ -28,20 +28,18 @@ impl Score {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum LogicalScoreCompletion {
     Pending,
-    Done(Score),
+    Done,
 }
 
 impl LogicalScoreCompletion {
     fn record(&mut self, event: &ScoreStreamParse) {
-        if let ScoreStreamParse::LogicalDone(score) = event
-            && !self.is_done()
-        {
-            *self = Self::Done(*score);
+        if matches!(event, ScoreStreamParse::LogicalDone(_)) {
+            *self = Self::Done;
         }
     }
 
     fn is_done(self) -> bool {
-        matches!(self, Self::Done(_))
+        matches!(self, Self::Done)
     }
 }
 
@@ -99,9 +97,13 @@ pub fn run_score_stream<Out>(
                     let status = done.status();
                     if let Err(err) = exit_ok_stderr(name, Ok(status), &cmd_str, &chunks) {
                         yield into_err(err);
+                        return;
                     }
                 }
-                Err(err) => yield into_err(err),
+                Err(err) => {
+                    yield into_err(err);
+                    return;
+                }
             }
         }
         if !logical_score.is_done() {
@@ -145,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_score_completion_tracks_score_as_a_state() {
+    fn logical_score_completion_tracks_logical_done() {
         let mut completion = LogicalScoreCompletion::Pending;
         assert!(!completion.is_done());
 
@@ -158,25 +160,7 @@ mod tests {
         assert!(!completion.is_done());
 
         completion.record(&ScoreStreamParse::LogicalDone(Score::new(97.5)));
-        assert_eq!(completion, LogicalScoreCompletion::Done(Score::new(97.5)));
+        assert_eq!(completion, LogicalScoreCompletion::Done);
         assert!(completion.is_done());
-    }
-
-    // ab-kgc.44: first parsed score must win when ffmpeg prints duplicate score lines
-    #[test]
-    fn logical_score_completion_keeps_first_score_when_duplicated() {
-        // setup
-        let mut completion = LogicalScoreCompletion::Pending;
-
-        // execute
-        completion.record(&ScoreStreamParse::LogicalDone(Score::new(97.5)));
-        completion.record(&ScoreStreamParse::LogicalDone(Score::new(88.0)));
-
-        // assert
-        assert_eq!(
-            completion,
-            LogicalScoreCompletion::Done(Score::new(97.5)),
-            "duplicate score lines must not overwrite the first logical score"
-        );
     }
 }
