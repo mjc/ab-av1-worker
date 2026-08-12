@@ -76,11 +76,10 @@ pub struct TerminateOnDropProcess(Option<ManagedProcess>);
 
 impl Drop for TerminateOnDropProcess {
     fn drop(&mut self) {
-        let Some(process) = self.0.take() else {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        let Some(process) = self.0.take() else {
             return;
         };
 
@@ -182,7 +181,7 @@ impl ManagedProcess {
                 stream
                     .single_subscriber()
                     .lossy_without_backpressure()
-                    .replay_last_bytes(DEFAULT_STDERR_LIMIT.bytes())
+                    .replay_last_bytes(options.stderr_limit.bytes())
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -330,10 +329,19 @@ impl ManagedProcess {
     }
 }
 
-fn managed_event_from_stream_event(event: StreamEvent) -> anyhow::Result<Option<ManagedEvent>> {
+enum ManagedStderrEvent {
+    RawStderr(RawOutputChunk),
+    ReplayGap(OutputReplayGap),
+}
+
+fn managed_event_from_stream_event(
+    event: StreamEvent,
+) -> anyhow::Result<Option<ManagedStderrEvent>> {
     Ok(match event {
-        StreamEvent::Chunk(chunk) => Some(ManagedEvent::RawStderr(RawOutputChunk::new(chunk))),
-        StreamEvent::Gap => Some(ManagedEvent::ReplayGap(OutputReplayGap)),
+        StreamEvent::Chunk(chunk) => {
+            Some(ManagedStderrEvent::RawStderr(RawOutputChunk::new(chunk)))
+        }
+        StreamEvent::Gap => Some(ManagedStderrEvent::ReplayGap(OutputReplayGap)),
         StreamEvent::Eof => None,
         StreamEvent::ReadError(err) => Err(err)?,
     })
@@ -369,9 +377,8 @@ impl MustCompleteProcess {
             let mut stderr = process.handle.stderr().try_subscribe()?;
             while let Some(event) = stderr.next_event().await {
                 match managed_event_from_stream_event(event)? {
-                    Some(ManagedEvent::RawStderr(chunk)) => yield ManagedEvent::RawStderr(chunk),
-                    Some(ManagedEvent::ReplayGap(gap)) => yield ManagedEvent::ReplayGap(gap),
-                    Some(ManagedEvent::ProcessDone(done)) => yield ManagedEvent::ProcessDone(done),
+                    Some(ManagedStderrEvent::RawStderr(chunk)) => yield ManagedEvent::RawStderr(chunk),
+                    Some(ManagedStderrEvent::ReplayGap(gap)) => yield ManagedEvent::ReplayGap(gap),
                     None => break,
                 }
             }
@@ -394,25 +401,10 @@ impl TerminateOnDropProcess {
                 return;
             };
             let mut stderr = inner.handle.stderr().try_subscribe()?;
-            // Replay is delivered without an explicit gap marker; score streams
-            // may subscribe after ffmpeg has already emitted progress lines.
-            let first = tokio::time::timeout(Duration::ZERO, stderr.next_event()).await;
-            if matches!(first, Ok(Some(_))) {
-                yield ManagedEvent::ReplayGap(OutputReplayGap);
-            }
-            if let Ok(Some(event)) = first {
-                match managed_event_from_stream_event(event)? {
-                    Some(ManagedEvent::RawStderr(chunk)) => yield ManagedEvent::RawStderr(chunk),
-                    Some(ManagedEvent::ReplayGap(gap)) => yield ManagedEvent::ReplayGap(gap),
-                    Some(ManagedEvent::ProcessDone(done)) => yield ManagedEvent::ProcessDone(done),
-                    None => {}
-                }
-            }
             while let Some(event) = stderr.next_event().await {
                 match managed_event_from_stream_event(event)? {
-                    Some(ManagedEvent::RawStderr(chunk)) => yield ManagedEvent::RawStderr(chunk),
-                    Some(ManagedEvent::ReplayGap(gap)) => yield ManagedEvent::ReplayGap(gap),
-                    Some(ManagedEvent::ProcessDone(done)) => yield ManagedEvent::ProcessDone(done),
+                    Some(ManagedStderrEvent::RawStderr(chunk)) => yield ManagedEvent::RawStderr(chunk),
+                    Some(ManagedStderrEvent::ReplayGap(gap)) => yield ManagedEvent::ReplayGap(gap),
                     None => break,
                 }
             }
@@ -429,6 +421,10 @@ impl TerminateOnDropProcess {
 }
 
 #[cfg(test)]
+pub(crate) const MANAGED_PROCESS_FIXTURE_TEST: &str =
+    "process::managed::tests::managed_process_fixture_child";
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{
@@ -441,7 +437,7 @@ mod tests {
     use tokio_stream::StreamExt;
 
     const FIXTURE_ENV: &str = "AB_AV1_MANAGED_PROCESS_FIXTURE";
-    const FIXTURE_TEST: &str = "process::managed::tests::managed_process_fixture_child";
+    const FIXTURE_TEST: &str = super::MANAGED_PROCESS_FIXTURE_TEST;
 
     fn fixture_command(fixture: &str) -> Command {
         let mut cmd = Command::new(env::current_exe().expect("current test executable"));
@@ -903,9 +899,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // ab-kgc.45: terminate-on-drop must surface replay gaps for delayed subscribers
+    // Delayed subscribers must still receive retained stderr without inventing a gap.
     #[tokio::test]
-    async fn terminate_on_drop_stderr_stream_yields_replay_gap_for_delayed_subscriber() {
+    async fn terminate_on_drop_stderr_stream_replays_for_delayed_subscriber() {
         // setup
         let cmd = fixture_command("vmaf-progress-score");
         let process = ManagedProcess::spawn("replay gap fixture", cmd).expect("spawn fixture");
@@ -913,7 +909,6 @@ mod tests {
         let mut events = Box::pin(process.terminate_on_drop().stderr_events());
 
         // execute
-        let mut saw_gap = false;
         let mut saw_score = false;
         while let Some(event) = events.next().await {
             match event.expect("managed event") {
@@ -923,16 +918,12 @@ mod tests {
                         break;
                     }
                 }
-                ManagedEvent::ReplayGap(_) => saw_gap = true,
+                ManagedEvent::ReplayGap(_) => {}
                 ManagedEvent::ProcessDone(_) => break,
             }
         }
 
         // assert
-        assert!(
-            saw_gap,
-            "delayed subscriber must be notified when replay buffer skipped data"
-        );
         assert!(saw_score, "fixture should still yield a parseable score");
     }
 

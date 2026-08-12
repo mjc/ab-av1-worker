@@ -26,11 +26,14 @@ const DEFAULT_MIN_VMAF: f32 = 95.0;
 ///
 /// When the user targets XPSNR (`--min-xpsnr`), search must use XPSNR even if VMAF
 /// is also present (e.g. `--and-vmaf`).
-fn output_search_score(enc: &sample_encode::Output, use_xpsnr: bool) -> f32 {
-    match use_xpsnr {
-        true => enc.xpsnr_score.or(enc.vmaf_score).unwrap_or_default(),
-        false => enc.vmaf_score.or(enc.xpsnr_score).unwrap_or_default(),
-    }
+fn output_search_score(enc: &sample_encode::Output, use_xpsnr: bool) -> anyhow::Result<f32> {
+    let score = match use_xpsnr {
+        true => enc.xpsnr_score.or(enc.vmaf_score),
+        false => enc.vmaf_score.or(enc.xpsnr_score),
+    };
+    let score = score.context("sample encode produced no score")?;
+    anyhow::ensure!(score.is_finite(), "sample encode produced no finite score");
+    Ok(score)
 }
 
 #[cfg(test)]
@@ -398,7 +401,7 @@ pub fn run(
                 q,
                 enc: sample_enc_output.context("no sample output?")?,
             };
-            let score = output_search_score(&sample.enc, use_xpsnr);
+            let score = output_search_score(&sample.enc, use_xpsnr)?;
             crf_attempts.push(sample.clone());
             yield Update::SampleEncodeDone(sample.clone());
             let sample_small_enough = sample.enc.encode_percent <= max_encoded_percent as _;
@@ -426,7 +429,7 @@ pub fn run(
                         return;
                     }
                     Some(upper) => {
-                        q = vmaf_lerp_q(min_score, upper, &sample, use_xpsnr);
+                        q = vmaf_lerp_q(min_score, upper, &sample, use_xpsnr)?;
                     }
                     None if sample.q == max_q => {
                         Error::ensure_or_no_good_crf(sample_small_enough, &sample)?;
@@ -451,7 +454,7 @@ pub fn run(
 
                 match l_bound {
                     Some(lower) if lower.q + 1 == sample.q => {
-                        let lower_score = output_search_score(&lower.enc, use_xpsnr);
+                        let lower_score = output_search_score(&lower.enc, use_xpsnr)?;
                         if lower_score >= min_score {
                             Error::ensure_or_no_good_crf(
                                 lower.enc.encode_percent <= max_encoded_percent as _,
@@ -461,10 +464,10 @@ pub fn run(
                             yield Update::Done(lower.clone());
                             return;
                         }
-                        q = vmaf_lerp_q(min_score, &sample, lower, use_xpsnr);
+                        q = vmaf_lerp_q(min_score, &sample, lower, use_xpsnr)?;
                     }
                     Some(lower) => {
-                        q = vmaf_lerp_q(min_score, &sample, lower, use_xpsnr);
+                        q = vmaf_lerp_q(min_score, &sample, lower, use_xpsnr)?;
                     }
                     None if cut_on_iter2 && run == 1 && sample.q > min_q + 1 => {
                         q = (sample.q as f32 * 0.4 + min_q as f32 * 0.6).round() as _;
@@ -612,15 +615,21 @@ fn parse_stdout_format() {
 /// though it seems to work better than a binary search.
 /// Perhaps a better approximation of a general crf->vmaf model could be found.
 /// This would be helpful particularly for small crf-increments.
-fn vmaf_lerp_q(min_vmaf: f32, worse_q: &Sample, better_q: &Sample, use_xpsnr: bool) -> i64 {
-    let worse_score = output_search_score(&worse_q.enc, use_xpsnr);
-    let better_score = output_search_score(&better_q.enc, use_xpsnr);
+fn vmaf_lerp_q(
+    min_vmaf: f32,
+    worse_q: &Sample,
+    better_q: &Sample,
+    use_xpsnr: bool,
+) -> anyhow::Result<i64> {
+    let worse_score = output_search_score(&worse_q.enc, use_xpsnr)?;
+    let better_score = output_search_score(&better_q.enc, use_xpsnr)?;
     assert!(
         worse_score <= min_vmaf && worse_score < better_score && worse_q.q > better_q.q,
         "invalid vmaf_lerp_crf usage: ({min_vmaf}, {worse_q:?}, {better_q:?})"
     );
 
     let vmaf_diff = better_score - worse_score;
+    anyhow::ensure!(vmaf_diff > 0.0, "sample scores are indistinguishable");
     let vmaf_factor = (min_vmaf - worse_score) / vmaf_diff;
 
     let q_diff = worse_q.q - better_q.q;
@@ -630,11 +639,11 @@ fn vmaf_lerp_q(min_vmaf: f32, worse_q: &Sample, better_q: &Sample, use_xpsnr: bo
     if lo > hi {
         // Target score is outside the range between the two samples.
         if min_vmaf > better_score {
-            return better_q.q - 1;
+            return Ok(better_q.q - 1);
         }
-        return worse_q.q;
+        return Ok(worse_q.q);
     }
-    lerp.clamp(lo, hi)
+    Ok(lerp.clamp(lo, hi))
 }
 
 /// sample_progress: [0, 1]
@@ -983,7 +992,7 @@ mod crf_search_tests {
         let enc = mock_output(vmaf, xpsnr, 50.0);
 
         // execute / assert
-        assert_eq!(output_search_score(&enc, use_xpsnr), expected);
+        assert_eq!(output_search_score(&enc, use_xpsnr).unwrap(), expected);
     }
 
     #[rstest]
@@ -1017,7 +1026,7 @@ mod crf_search_tests {
         };
 
         // execute
-        let q = vmaf_lerp_q(92.0, &worse, &better, use_xpsnr);
+        let q = vmaf_lerp_q(92.0, &worse, &better, use_xpsnr).unwrap();
 
         // assert
         assert!((26..=28).contains(&q));
@@ -1090,10 +1099,17 @@ mod crf_search_tests {
 
         // execute / assert
         assert_eq!(
-            output_search_score(&enc, true),
+            output_search_score(&enc, true).unwrap(),
             96.0,
             "use_xpsnr search should fall back to VMAF when XPSNR score is missing"
         );
+    }
+
+    #[test]
+    fn output_search_score_rejects_missing_scores() {
+        let enc = mock_output(None, None, 50.0);
+        let err = output_search_score(&enc, false).expect_err("missing score must fail");
+        assert!(err.to_string().contains("no score"));
     }
 
     // ab-kgc.27: --min-xpsnr must win over --min-vmaf when both are set
@@ -1146,7 +1162,7 @@ mod crf_search_tests {
         };
 
         // execute
-        let q = vmaf_lerp_q(92.0, &worse, &better, use_xpsnr);
+        let q = vmaf_lerp_q(92.0, &worse, &better, use_xpsnr).unwrap();
 
         // assert
         assert!((26..=28).contains(&q));
@@ -1358,7 +1374,7 @@ mod crf_search_tests {
                     enc: mock_output(Some(better_score), None, 50.0),
                 };
 
-                let q = vmaf_lerp_q(min_vmaf, &worse, &better, false);
+                let q = vmaf_lerp_q(min_vmaf, &worse, &better, false).unwrap();
 
                 prop_assert!(q > better_q && q < worse_q);
             }

@@ -165,6 +165,7 @@ mod tests {
         let input = temp_input("run", "encode-fail");
         let output =
             env::temp_dir().join(format!("ab-av1-encode-fail-out-{}.mkv", std::process::id()));
+        let temporary_output = lifecycle::temporary_output_path(&output).expect("temp output path");
         let args = encode_args(input.clone(), Some(output.clone()));
         let bar = ProgressBar::new(1);
         let spawner = FixtureSpawner::new("stderr-badness-exit-7");
@@ -177,8 +178,8 @@ mod tests {
         // assert
         assert!(!err.to_string().is_empty());
         assert!(
-            !output.exists(),
-            "failed encode must remove temporary output file"
+            !temporary_output.exists(),
+            "failed encode must remove partial temporary output file"
         );
 
         // cleanup

@@ -60,34 +60,15 @@ pub(in crate::command) fn audio_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::args::{EncodeToOutput, Encoder};
-    use std::{env, fs, path::PathBuf, time::Duration};
-
-    fn probe(channels: Option<i64>) -> Ffprobe {
-        Ffprobe {
-            duration: Ok(Duration::from_secs(120)),
-            has_audio: channels.is_some(),
-            max_audio_channels: channels,
-            fps: Ok(24.0),
-            resolution: Some((1920, 1080)),
-            is_image: false,
-            pix_fmt: Some("yuv420p".into()),
-        }
-    }
-
-    fn temp_input(label: &str) -> PathBuf {
-        let path = env::temp_dir().join(format!(
-            "ab-av1-preflight-test-{}-{}",
-            label,
-            std::process::id()
-        ));
-        fs::write(&path, b"x").expect("write temp input");
-        path
-    }
+    use crate::command::{
+        args::{EncodeToOutput, Encoder},
+        encode::test_support::{temp_input, test_probe},
+    };
+    use std::fs;
 
     #[test]
     fn resolve_output_rejects_same_input_and_output() {
-        let input = temp_input("same-io");
+        let input = temp_input("preflight", "same-io");
         let encode_to = EncodeToOutput {
             output: Some(input.clone()),
             audio_codec: None,
@@ -96,7 +77,7 @@ mod tests {
             overwrite_input: false,
         };
         let encoder: Encoder = "libsvtav1".parse().unwrap();
-        let err = match resolve_output(&input, &encoder, &encode_to, &probe(Some(6))) {
+        let err = match resolve_output(&input, &encoder, &encode_to, &test_probe(Some(6))) {
             Err(err) => err,
             Ok(_) => panic!("expected same-file error"),
         };
@@ -113,7 +94,7 @@ mod tests {
             video_only: false,
             overwrite_input: false,
         };
-        let err = match audio_config(&encode_to, &probe(Some(6))) {
+        let err = match audio_config(&encode_to, &test_probe(Some(6))) {
             Err(err) => err,
             Ok(_) => panic!("expected error"),
         };

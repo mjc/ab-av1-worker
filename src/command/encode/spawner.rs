@@ -84,7 +84,16 @@ impl EncodeSpawner for ThreadLocalFixtureSpawner {
         if let Some(fixture) = super::test_support::test_hooks::fixture() {
             return super::test_support::test_ffmpeg_stream(fixture);
         }
-        FfmpegSpawner.spawn(session, enc_args, output)
+        // Keep the production spawner and session accessors type-checked in the
+        // test-only fixture implementation without silently running ffmpeg.
+        let _ = FfmpegSpawner;
+        let _ = (
+            session.has_audio(),
+            session.stereo_downmix(),
+            session.audio_codec(),
+        );
+        let _ = (enc_args, output);
+        anyhow::bail!("encode fixture not configured for ThreadLocalFixtureSpawner")
     }
 
     async fn finalize_output(&self, output: &Path) -> anyhow::Result<()> {

@@ -31,16 +31,12 @@ pub fn unadd(file: &Path) -> bool {
 /// Tracks a path registered for cleanup on failure.
 pub struct CleanupGuard {
     path: PathBuf,
-    registered: bool,
 }
 
 impl CleanupGuard {
     pub fn arm(path: PathBuf) -> Self {
         add(&path, TempKind::NotKeepable);
-        Self {
-            path,
-            registered: true,
-        }
+        Self { path }
     }
 
     pub fn path(&self) -> &Path {
@@ -48,11 +44,8 @@ impl CleanupGuard {
     }
 
     /// Successful completion: unregister and return the kept path.
-    pub fn disarm(mut self) -> PathBuf {
-        if self.registered {
-            unadd(&self.path);
-        }
-        self.registered = false;
+    pub fn disarm(self) -> PathBuf {
+        unadd(&self.path);
         self.path
     }
 }
@@ -122,9 +115,7 @@ pub fn process_dir(
     temp_dir.push(&*SUBDIR);
 
     add(&temp_dir, TempKind::Keepable);
-    if !temp_dir.exists() {
-        std::fs::create_dir_all(&temp_dir).context("failed to create temp-dir")?;
-    }
+    std::fs::create_dir_all(&temp_dir).context("failed to create temp-dir")?;
 
     Ok(temp_dir)
 }

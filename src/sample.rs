@@ -87,6 +87,11 @@ fn apply_copy_args(
     dest: &Path,
     genpts: bool,
 ) {
+    #[cfg(test)]
+    if test_hooks::uses_fixture() {
+        test_hooks::apply_fixture(cmd);
+        return;
+    }
     cmd.arg("-nostdin").arg("-y");
     if genpts {
         cmd.arg2("-fflags", "+genpts");
@@ -100,8 +105,6 @@ fn apply_copy_args(
         .arg("-an")
         .arg("-sn")
         .arg(dest);
-    #[cfg(test)]
-    test_hooks::apply_fixture(cmd);
 }
 
 fn copy_program() -> std::path::PathBuf {
@@ -128,25 +131,6 @@ pub async fn copy(
     }
     temporary::add(&dest, TempKind::Keepable);
 
-    #[cfg(test)]
-    if test_hooks::uses_fixture() {
-        let mut cmd = Command::new(std::env::current_exe().expect("current test executable"));
-        test_hooks::apply_fixture(&mut cmd);
-        let out = ManagedProcess::spawn("ffmpeg copy", cmd)
-            .context("ffmpeg copy")?
-            .output()
-            .await
-            .context("ffmpeg copy")?;
-        ensure_success("ffmpeg copy", &out)?;
-        if !dest.exists() {
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent).context("create sample parent")?;
-            }
-            std::fs::write(&dest, b"fixture-sample").context("write fixture sample")?;
-        }
-        return Ok(dest);
-    }
-
     let mut cmd = copy_command(input, sample_start, floor_to_sec, frames, &dest);
     let mut out = ManagedProcess::spawn("ffmpeg copy", cmd)
         .context("ffmpeg copy")?
@@ -164,6 +148,13 @@ pub async fn copy(
     }
 
     ensure_success("ffmpeg copy", &out)?;
+    #[cfg(test)]
+    if test_hooks::uses_fixture() && !dest.exists() {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).context("create sample parent")?;
+        }
+        std::fs::write(&dest, b"fixture-sample").context("write fixture sample")?;
+    }
     Ok(dest)
 }
 
@@ -173,7 +164,7 @@ pub(crate) mod test_hooks {
     use tokio::process::Command;
 
     const FIXTURE_ENV: &str = "AB_AV1_MANAGED_PROCESS_FIXTURE";
-    const FIXTURE_TEST: &str = "process::managed::tests::managed_process_fixture_child";
+    const FIXTURE_TEST: &str = crate::process::managed::MANAGED_PROCESS_FIXTURE_TEST;
 
     thread_local! {
         static FIXTURE: RefCell<Option<&'static str>> = const { RefCell::new(None) };
@@ -253,6 +244,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn sample_dest_path_uses_mkv_and_start_offset() {
         // setup
@@ -266,6 +258,7 @@ mod tests {
         assert!(dest.to_string_lossy().contains("sample12.5+48f.mkv"));
     }
 
+    #[serial]
     #[test]
     fn sample_dest_path_floors_start_when_requested() {
         // setup
@@ -279,6 +272,7 @@ mod tests {
         assert!(dest.to_string_lossy().contains("sample12+24f.mkv"));
     }
 
+    #[serial]
     #[test]
     fn unknown_timestamp_retry_detects_genpts_message() {
         // setup
@@ -290,6 +284,7 @@ mod tests {
     }
 
     // ab-kgc.42: partial message match must not miss alternate ffmpeg wording
+    #[serial]
     #[test]
     fn unknown_timestamp_retry_is_case_insensitive() {
         // setup
@@ -302,6 +297,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn copy_command_uses_ffmpeg_program_by_default() {
         // setup
@@ -315,6 +311,7 @@ mod tests {
         assert_eq!(cmd.as_std().get_program(), "ffmpeg");
     }
 
+    #[serial]
     #[test]
     fn copy_command_with_genpts_is_distinct_from_primary() {
         // setup
@@ -332,6 +329,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[tokio::test]
     async fn copy_returns_existing_dest_without_spawning() {
         // setup
@@ -376,8 +374,9 @@ mod tests {
         let _ = fs::remove_file(input);
     }
 
-    /// Real ffmpeg copy against a minimal GIF input (devshell provides ffmpeg-full).
+    /// Real ffmpeg copy against a minimal GIF input.
     #[serial]
+    #[ignore = "requires ffmpeg; run the dedicated ffmpeg e2e CI step"]
     #[tokio::test]
     async fn copy_e2e_real_ffmpeg() {
         // setup

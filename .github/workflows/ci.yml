@@ -14,10 +14,13 @@ jobs:
       PROPTEST_CASES: "256"
     steps:
     - run: rustup update stable
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      with:
+        persist-credentials: false
     - run: sudo apt-get update && sudo apt-get install -y ffmpeg
     - run: cargo install cargo-nextest --locked
     - run: cargo nextest run --locked
+    - run: cargo test --locked sample::tests::copy_e2e_real_ffmpeg -- --ignored
     # check print-completions don't fail
     - run: cargo run --locked -- print-completions bash
     - run: cargo run --locked -- print-completions fish
@@ -30,23 +33,27 @@ jobs:
       PROPTEST_CASES: "256"
     steps:
     - run: rustup update stable
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      with:
+        persist-credentials: false
     - run: sudo apt-get update && sudo apt-get install -y ffmpeg
     - run: rustup component add llvm-tools-preview
     - run: cargo install cargo-llvm-cov --locked
     - run: cargo install cargo-nextest --locked
-    - run: cargo llvm-cov nextest --locked --summary-only --fail-under-lines 80
     - run: cargo llvm-cov nextest --locked --lcov --output-path lcov.info
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: lcov
         path: lcov.info
+    - run: cargo llvm-cov nextest --locked --summary-only --fail-under-lines 80
 
   clippy:
     runs-on: ubuntu-latest
     steps:
     - run: rustup update stable
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      with:
+        persist-credentials: false
     - run: cargo clippy --locked --all-targets -- -D warnings
 
   # Disabled while we no longer need cfg(windows) code
@@ -63,5 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - run: rustup update stable
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      with:
+        persist-credentials: false
     - run: cargo fmt -- --check

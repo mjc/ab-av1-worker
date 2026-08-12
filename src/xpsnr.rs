@@ -122,7 +122,7 @@ fn score_from_average_line(line: &str) -> Option<f32> {
 fn parse_score_number(s: &str) -> Option<f32> {
     let end_idx = s
         .char_indices()
-        .take_while(|(_, c)| *c == '-' || *c == '.' || c.is_numeric())
+        .take_while(|(_, c)| *c == '-' || *c == '.' || c.is_ascii_digit())
         .last()?
         .0;
     s[..=end_idx].parse().ok()

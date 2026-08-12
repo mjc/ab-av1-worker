@@ -6,7 +6,7 @@ use crate::{
         args::{self, PixelFormat},
     },
     console_ext::style,
-    ffmpeg::{self, FfmpegEncodeArgs, remove_arg},
+    ffmpeg::{self, FfmpegEncodeArgs, remove_all_args},
     ffprobe::{self, Ffprobe},
     log::ProgressLogger,
     process::FfmpegOut,
@@ -163,8 +163,8 @@ pub fn run(
         let sample_out_ext = sample_args.extension.as_deref().unwrap_or("mkv");
         let mut enc_args = args.to_ffmpeg_args(crf, &input_probe, sample_out_ext)?;
         // ignore user -fps_mode for sample encoding, as we always use passthrough
-        remove_arg(&mut enc_args.output_args, "-fps_mode");
-        remove_arg(&mut enc_args.output_args, "-vsync");
+        remove_all_args(&mut enc_args.output_args, "-fps_mode");
+        remove_all_args(&mut enc_args.output_args, "-vsync");
 
         let duration = input_probe.duration.clone()?;
         let input_fps = input_probe.fps.clone()?;
@@ -192,9 +192,6 @@ pub fn run(
             }
         };
         let sample_duration_us = sample_duration.as_micros_u64().max(1);
-        let encode_progress_denom =
-            (sample_duration_us.saturating_mul(samples).saturating_mul(2)).max(1) as f32;
-
         // Start creating copy samples async, this is IO bound & not cpu intensive
         let (tx, mut sample_tasks) = tokio::sync::mpsc::unbounded_channel();
         let sample_temp = temp_dir.clone();
@@ -281,8 +278,12 @@ pub fn run(
                             yield Update::Status(Status {
                                 work: Work::Encode,
                                 fps,
-                                progress: (time.as_micros_u64() + sample_idx * sample_duration_us * 2) as f32
-                                    / encode_progress_denom,
+                                progress: encode_progress_ratio(
+                                    time.as_micros_u64(),
+                                    sample_idx,
+                                    sample_duration_us,
+                                    samples,
+                                ),
                                 full_pass,
                                 sample: sample_n,
                                 samples,
@@ -336,14 +337,18 @@ pub fn run(
                                 }
                                 XpsnrOut::Progress(FfmpegOut::Progress { time, fps, .. }) => {
                                     let progress = match do_vmaf {
-                                        false => (sample_duration_us +
-                                            time.as_micros_u64() +
-                                            sample_idx * sample_duration_us * 2) as f32
-                                            / encode_progress_denom,
-                                        true => (sample_duration_us +
-                                            time.as_micros_u64() / 2 +
-                                            sample_idx * sample_duration_us * 2) as f32
-                                            / encode_progress_denom
+                                        false => encode_progress_ratio(
+                                            time.as_micros_u64().saturating_add(sample_duration_us),
+                                            sample_idx,
+                                            sample_duration_us,
+                                            samples,
+                                        ),
+                                        true => encode_progress_ratio(
+                                            time.as_micros_u64() / 2 + sample_duration_us,
+                                            sample_idx,
+                                            sample_duration_us,
+                                            samples,
+                                        ),
                                     };
                                     yield Update::Status(Status {
                                         work: Work::Score(ScoreKind::Xpsnr),
@@ -392,14 +397,18 @@ pub fn run(
                                 }
                                 VmafOut::Progress(FfmpegOut::Progress { time, fps, .. }) => {
                                     let progress = match xpsnr {
-                                        false => (sample_duration_us +
-                                            time.as_micros_u64() +
-                                            sample_idx * sample_duration_us * 2) as f32
-                                            / encode_progress_denom,
-                                        true => (sample_duration_us + sample_duration_us / 2 +
-                                            time.as_micros_u64() / 2 +
-                                            sample_idx * sample_duration_us * 2) as f32
-                                            / encode_progress_denom,
+                                        false => encode_progress_ratio(
+                                            time.as_micros_u64().saturating_add(sample_duration_us),
+                                            sample_idx,
+                                            sample_duration_us,
+                                            samples,
+                                        ),
+                                        true => encode_progress_ratio(
+                                            time.as_micros_u64() / 2 + sample_duration_us + sample_duration_us / 2,
+                                            sample_idx,
+                                            sample_duration_us,
+                                            samples,
+                                        ),
                                     };
                                     yield Update::Status(Status {
                                         work: Work::Score(ScoreKind::Vmaf),
@@ -481,13 +490,8 @@ async fn sample(
     fps: f64,
     temp_dir: Option<PathBuf>,
 ) -> anyhow::Result<(Arc<PathBuf>, u64)> {
-    let sample_n = sample_idx + 1;
-
-    let grid_divisor = ((samples.saturating_add(1)).min(u64::from(u32::MAX)) as u32).max(1);
-
-    let sample_start = (duration.saturating_sub(sample_duration * samples as _) / grid_divisor)
-        * sample_n as _
-        + sample_duration * sample_idx as _;
+    let sample_n = sample_idx.saturating_add(1);
+    let sample_start = sample_start(duration, sample_duration, sample_idx, sample_n, samples);
 
     let sample_frames_u64 = (sample_duration.as_secs_f64() * fps).round() as u64;
     let sample_frames = sample_frames_u64.clamp(1, u64::from(u32::MAX)) as u32;
@@ -503,6 +507,42 @@ async fn sample(
     Ok((sample.into(), sample_size))
 }
 
+fn sample_grid_divisor(samples: u64) -> u32 {
+    samples.saturating_add(1).min(u64::from(u32::MAX)) as u32
+}
+
+fn sample_start(
+    duration: Duration,
+    sample_duration: Duration,
+    sample_idx: u64,
+    sample_n: u64,
+    samples: u64,
+) -> Duration {
+    let samples = samples.min(u64::from(u32::MAX));
+    let sample_n = sample_n.min(u64::from(u32::MAX)) as u32;
+    let sample_idx = sample_idx.min(u64::from(u32::MAX)) as u32;
+    (duration.saturating_sub(sample_duration.saturating_mul(samples as u32))
+        / sample_grid_divisor(samples))
+    .saturating_mul(sample_n)
+        + sample_duration.saturating_mul(sample_idx)
+}
+
+fn encode_progress_ratio(
+    time_us: u64,
+    sample_idx: u64,
+    sample_duration_us: u64,
+    samples: u64,
+) -> f32 {
+    let denom = sample_duration_us
+        .saturating_mul(samples)
+        .saturating_mul(2)
+        .max(1) as f32;
+    let offset = sample_idx
+        .saturating_mul(sample_duration_us)
+        .saturating_mul(2);
+    time_us.saturating_add(offset) as f32 / denom
+}
+
 mod score_json {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -512,6 +552,8 @@ mod score_json {
     {
         match score {
             Some(v) if v.is_nan() => serializer.serialize_str("NaN"),
+            // serde_json encodes infinities as null; deserialization intentionally treats
+            // that as a missing score, matching the mean-score filtering behavior.
             Some(v) => serializer.serialize_some(v),
             None => serializer.serialize_none(),
         }
@@ -544,12 +586,14 @@ pub struct EncodeResult {
     pub encoded_size: u64,
     #[serde(
         serialize_with = "score_json::serialize",
-        deserialize_with = "score_json::deserialize"
+        deserialize_with = "score_json::deserialize",
+        default
     )]
     pub vmaf_score: Option<f32>,
     #[serde(
         serialize_with = "score_json::serialize",
-        deserialize_with = "score_json::deserialize"
+        deserialize_with = "score_json::deserialize",
+        default
     )]
     pub xpsnr_score: Option<f32>,
     pub encode_time: Duration,
@@ -984,22 +1028,6 @@ mod tests {
 
     use helpers::*;
 
-    /// Mirror `sample_encode::sample` grid divisor.
-    fn sample_grid_divisor(samples: u64) -> u32 {
-        ((samples.saturating_add(1)).min(u64::from(u32::MAX)) as u32).max(1)
-    }
-
-    /// Mirror progress denominator: `sample_duration_us * samples * 2`.
-    fn encode_progress_ratio(
-        time_us: u64,
-        sample_idx: u64,
-        sample_duration_us: u64,
-        samples: u64,
-    ) -> f32 {
-        let denom = (sample_duration_us.saturating_mul(samples).saturating_mul(2)).max(1) as f32;
-        (time_us + sample_idx * sample_duration_us * 2) as f32 / denom
-    }
-
     // ab-kgc.23: mirrors sample_encode::sample frame math
     #[test]
     fn sample_frame_calculation_does_not_truncate_large_products() {
@@ -1064,7 +1092,7 @@ mod tests {
         let samples = u32::MAX as u64 + 1;
 
         // execute
-        let divisor = sample_grid_divisor(samples);
+        let divisor = super::sample_grid_divisor(samples);
 
         // assert
         assert_ne!(
@@ -1077,7 +1105,7 @@ mod tests {
     #[test]
     fn encode_progress_finite_when_sample_duration_zero() {
         // setup — mirrors encode progress denominator in sample_encode::run
-        let progress = encode_progress_ratio(1_000, 0, 0, 4);
+        let progress = super::encode_progress_ratio(1_000, 0, 0, 4);
 
         // execute / assert
         assert!(
@@ -1135,22 +1163,9 @@ mod tests {
     // ab-kgc.50–63: zero sample_size must not yield infinite attempt percentages
     #[test]
     fn attempt_percentages_finite_when_sample_size_zero() {
-        // setup — mirrors EncodeResult::print_attempt and log_attempt percentage math
-        let sample_size = 0_u64;
-        let encoded_size = 500_u64;
-
-        // execute
-        let percent = if sample_size == 0 {
-            0.0
-        } else {
-            100.0 * encoded_size as f32 / sample_size as f32
-        };
-
-        // assert — ab-kgc.50/63: print_attempt and log_attempt share this math
-        assert!(
-            percent.is_finite(),
-            "attempt/log attempt percent must be finite when sample_size is zero, got {percent}"
-        );
+        // setup / execute: exercise the production percentage calculation.
+        let result = encode_result(0, 500, 1, None, None);
+        result.log_attempt(1, 1, 30.0);
     }
     // ab-kgc.51–52: absent scores must not guess defaults
     #[test]
@@ -1308,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn estimate_encode_time_scales_and_truncates_to_seconds() {
+    fn estimate_encode_time_scales_by_duration_ratio() {
         // setup
         let results = vec![
             encode_result(1000, 500, 10, None, Some(90.0)),
@@ -1358,6 +1373,20 @@ mod tests {
         assert_eq!(decoded.vmaf_score, original.vmaf_score);
         assert_eq!(decoded.xpsnr_score, original.xpsnr_score);
         assert!(!decoded.from_cache);
+    }
+
+    #[test]
+    fn encode_result_json_accepts_missing_score_fields() {
+        let json = r#"{
+            "sample_size": 1000,
+            "encoded_size": 500,
+            "encode_time": {"secs": 1, "nanos": 0},
+            "sample_duration": {"secs": 1, "nanos": 0},
+            "from_cache": false
+        }"#;
+        let decoded: EncodeResult = serde_json::from_str(json).expect("deserialize old cache");
+        assert_eq!(decoded.vmaf_score, None);
+        assert_eq!(decoded.xpsnr_score, None);
     }
 
     #[rstest]

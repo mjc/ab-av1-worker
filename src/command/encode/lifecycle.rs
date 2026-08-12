@@ -60,7 +60,7 @@ impl PartialOutput {
     }
 }
 
-fn temporary_output_path(output: &Path) -> anyhow::Result<PathBuf> {
+pub(super) fn temporary_output_path(output: &Path) -> anyhow::Result<PathBuf> {
     let mut temp_name = OsString::from(".tmp.ab-av1-encoding.");
     temp_name.push(output.file_name().context("no output file name")?);
     let mut temp = output.to_path_buf();
@@ -112,14 +112,16 @@ mod tests {
     #[tokio::test]
     async fn partial_output_cleans_up_when_not_committed() {
         let path = temp_path("partial-drop");
-        {
+        let temp = {
             let partial = PlannedOutput::new(path.clone())
                 .begin()
                 .expect("begin output");
+            let temp = partial.path().to_path_buf();
             fs::write(partial.path(), b"temp").expect("write partial");
-        }
+            temp
+        };
         temporary::clean_all().await;
-        assert!(!path.exists(), "uncommitted partial output must be deleted");
+        assert!(!temp.exists(), "uncommitted partial output must be deleted");
     }
 
     #[serial]
