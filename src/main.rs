@@ -6,6 +6,7 @@ mod float;
 mod log;
 mod process;
 mod sample;
+mod score_stream;
 mod temporary;
 mod vmaf;
 mod xpsnr;
@@ -61,8 +62,6 @@ async fn main() {
         _ = signal::ctrl_c() => Err(anyhow!("ctrl_c")),
     };
     drop(local);
-
-    crate::process::child::wait().await;
 
     // Final cleanup. Samples are already deleted (if wished by the user) during `command::sample_encode::run`.
     temporary::clean(keep).await;

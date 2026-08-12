@@ -6,7 +6,7 @@ use crate::{
         args::{self, PixelFormat},
     },
     console_ext::style,
-    ffmpeg::{self, FfmpegEncodeArgs, remove_arg},
+    ffmpeg::{self, FfmpegEncodeArgs, remove_all_args},
     ffprobe::{self, Ffprobe},
     log::ProgressLogger,
     process::FfmpegOut,
@@ -163,8 +163,8 @@ pub fn run(
         let sample_out_ext = sample_args.extension.as_deref().unwrap_or("mkv");
         let mut enc_args = args.to_ffmpeg_args(crf, &input_probe, sample_out_ext)?;
         // ignore user -fps_mode for sample encoding, as we always use passthrough
-        remove_arg(&mut enc_args.output_args, "-fps_mode");
-        remove_arg(&mut enc_args.output_args, "-vsync");
+        remove_all_args(&mut enc_args.output_args, "-fps_mode");
+        remove_all_args(&mut enc_args.output_args, "-vsync");
 
         let duration = input_probe.duration.clone()?;
         let input_fps = input_probe.fps.clone()?;
@@ -191,8 +191,7 @@ pub fn run(
                 (samples, sample_duration, false)
             }
         };
-        let sample_duration_us = sample_duration.as_micros_u64();
-
+        let sample_duration_us = sample_duration.as_micros_u64().max(1);
         // Start creating copy samples async, this is IO bound & not cpu intensive
         let (tx, mut sample_tasks) = tokio::sync::mpsc::unbounded_channel();
         let sample_temp = temp_dir.clone();
@@ -243,12 +242,17 @@ pub fn run(
             let result = match cache::cached_encode(
                 cache,
                 &sample,
+                &input,
                 duration,
                 input.extension(),
                 input_len,
                 full_pass,
+                sample_args.extension.as_deref().unwrap_or("mkv"),
                 &enc_args,
-                (&score, &vmaf, &xpsnr),
+                &score,
+                &vmaf,
+                xpsnr,
+                &xpsnr_opts,
             )
             .await
             {
@@ -274,8 +278,12 @@ pub fn run(
                             yield Update::Status(Status {
                                 work: Work::Encode,
                                 fps,
-                                progress: (time.as_micros_u64() + sample_idx * sample_duration_us * 2) as f32
-                                    / (sample_duration_us * samples * 2) as f32,
+                                progress: encode_progress_ratio(
+                                    time.as_micros_u64(),
+                                    sample_idx,
+                                    sample_duration_us,
+                                    samples,
+                                ),
                                 full_pass,
                                 sample: sample_n,
                                 samples,
@@ -329,14 +337,18 @@ pub fn run(
                                 }
                                 XpsnrOut::Progress(FfmpegOut::Progress { time, fps, .. }) => {
                                     let progress = match do_vmaf {
-                                        false => (sample_duration_us +
-                                            time.as_micros_u64() +
-                                            sample_idx * sample_duration_us * 2) as f32
-                                            / (sample_duration_us * samples * 2) as f32,
-                                        true => (sample_duration_us +
-                                            time.as_micros_u64() / 2 +
-                                            sample_idx * sample_duration_us * 2) as f32
-                                            / (sample_duration_us * samples * 2) as f32
+                                        false => encode_progress_ratio(
+                                            time.as_micros_u64().saturating_add(sample_duration_us),
+                                            sample_idx,
+                                            sample_duration_us,
+                                            samples,
+                                        ),
+                                        true => encode_progress_ratio(
+                                            time.as_micros_u64() / 2 + sample_duration_us,
+                                            sample_idx,
+                                            sample_duration_us,
+                                            samples,
+                                        ),
                                     };
                                     yield Update::Status(Status {
                                         work: Work::Score(ScoreKind::Xpsnr),
@@ -385,14 +397,18 @@ pub fn run(
                                 }
                                 VmafOut::Progress(FfmpegOut::Progress { time, fps, .. }) => {
                                     let progress = match xpsnr {
-                                        false => (sample_duration_us +
-                                            time.as_micros_u64() +
-                                            sample_idx * sample_duration_us * 2) as f32
-                                            / (sample_duration_us * samples * 2) as f32,
-                                        true => (sample_duration_us + sample_duration_us / 2 +
-                                            time.as_micros_u64() / 2 +
-                                            sample_idx * sample_duration_us * 2) as f32
-                                            / (sample_duration_us * samples * 2) as f32,
+                                        false => encode_progress_ratio(
+                                            time.as_micros_u64().saturating_add(sample_duration_us),
+                                            sample_idx,
+                                            sample_duration_us,
+                                            samples,
+                                        ),
+                                        true => encode_progress_ratio(
+                                            time.as_micros_u64() / 2 + sample_duration_us + sample_duration_us / 2,
+                                            sample_idx,
+                                            sample_duration_us,
+                                            samples,
+                                        ),
                                     };
                                     yield Update::Status(Status {
                                         work: Work::Score(ScoreKind::Vmaf),
@@ -474,14 +490,11 @@ async fn sample(
     fps: f64,
     temp_dir: Option<PathBuf>,
 ) -> anyhow::Result<(Arc<PathBuf>, u64)> {
-    let sample_n = sample_idx + 1;
+    let sample_n = sample_idx.saturating_add(1);
+    let sample_start = sample_start(duration, sample_duration, sample_idx, sample_n, samples);
 
-    let sample_start = (duration.saturating_sub(sample_duration * samples as _)
-        / (samples as u32 + 1))
-        * sample_n as _
-        + sample_duration * sample_idx as _;
-
-    let sample_frames = ((sample_duration.as_secs_f64() * fps).round() as u32).max(1);
+    let sample_frames_u64 = (sample_duration.as_secs_f64() * fps).round() as u64;
+    let sample_frames = sample_frames_u64.clamp(1, u64::from(u32::MAX)) as u32;
     let floor_to_sec = sample_duration >= Duration::from_secs(2);
 
     let sample = sample::copy(&input, sample_start, floor_to_sec, sample_frames, temp_dir).await?;
@@ -494,11 +507,94 @@ async fn sample(
     Ok((sample.into(), sample_size))
 }
 
+fn sample_grid_divisor(samples: u64) -> u32 {
+    samples.saturating_add(1).min(u64::from(u32::MAX)) as u32
+}
+
+fn sample_start(
+    duration: Duration,
+    sample_duration: Duration,
+    sample_idx: u64,
+    sample_n: u64,
+    samples: u64,
+) -> Duration {
+    let samples = samples.min(u64::from(u32::MAX));
+    let sample_n = sample_n.min(u64::from(u32::MAX)) as u32;
+    let sample_idx = sample_idx.min(u64::from(u32::MAX)) as u32;
+    (duration.saturating_sub(sample_duration.saturating_mul(samples as u32))
+        / sample_grid_divisor(samples))
+    .saturating_mul(sample_n)
+        + sample_duration.saturating_mul(sample_idx)
+}
+
+fn encode_progress_ratio(
+    time_us: u64,
+    sample_idx: u64,
+    sample_duration_us: u64,
+    samples: u64,
+) -> f32 {
+    let denom = sample_duration_us
+        .saturating_mul(samples)
+        .saturating_mul(2)
+        .max(1) as f32;
+    let offset = sample_idx
+        .saturating_mul(sample_duration_us)
+        .saturating_mul(2);
+    time_us.saturating_add(offset) as f32 / denom
+}
+
+mod score_json {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(score: &Option<f32>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match score {
+            Some(v) if v.is_nan() => serializer.serialize_str("NaN"),
+            // serde_json encodes infinities as null; deserialization intentionally treats
+            // that as a missing score, matching the mean-score filtering behavior.
+            Some(v) => serializer.serialize_some(v),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+        match value {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) if s.eq_ignore_ascii_case("nan") => {
+                Ok(Some(f32::NAN))
+            }
+            Some(serde_json::Value::Number(n)) => n
+                .as_f64()
+                .map(|v| Some(v as f32))
+                .ok_or_else(|| serde::de::Error::custom("invalid score number")),
+            Some(other) => Err(serde::de::Error::custom(format!(
+                "invalid score value: {other}"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EncodeResult {
     pub sample_size: u64,
     pub encoded_size: u64,
+    #[serde(
+        serialize_with = "score_json::serialize",
+        deserialize_with = "score_json::deserialize",
+        default
+    )]
     pub vmaf_score: Option<f32>,
+    #[serde(
+        serialize_with = "score_json::serialize",
+        deserialize_with = "score_json::deserialize",
+        default
+    )]
     pub xpsnr_score: Option<f32>,
     pub encode_time: Duration,
     /// Duration of the sample.
@@ -519,11 +615,15 @@ impl EncodeResult {
             from_cache,
             ..
         } = self;
+        let percent = if *sample_size == 0 {
+            0.0
+        } else {
+            100.0 * *encoded_size as f32 / *sample_size as f32
+        };
         bar.println(
             style!(
-                "- {}Sample {sample_n} ({:.0}%){}{}{}",
+                "- {}Sample {sample_n} ({percent:.0}%){}{}{}",
                 crf.map(|crf| format!("crf {crf}: ")).unwrap_or_default(),
-                100.0 * *encoded_size as f32 / *sample_size as f32,
                 vmaf_score
                     .map(|s| format!(" VMAF {s:.2}"))
                     .unwrap_or_default(),
@@ -546,15 +646,19 @@ impl EncodeResult {
             from_cache,
             ..
         } = self;
+        let percent = if *sample_size == 0 {
+            0.0
+        } else {
+            100.0 * *encoded_size as f32 / *sample_size as f32
+        };
         info!(
-            "sample {sample_n}/{samples} crf {crf}{}{} ({:.0}%){}",
+            "sample {sample_n}/{samples} crf {crf}{}{} ({percent:.0}%){}",
             vmaf_score
                 .map(|s| format!(" VMAF {s:.2}"))
                 .unwrap_or_default(),
             xpsnr_score
                 .map(|s| format!(" XPSNR {s:.2}"))
                 .unwrap_or_default(),
-            100.0 * *encoded_size as f32 / *sample_size as f32,
             if *from_cache { " (cache)" } else { "" }
         );
     }
@@ -610,23 +714,38 @@ trait EncodeResults {
 impl EncodeResults for Vec<EncodeResult> {
     fn encoded_percent_size(&self) -> f64 {
         if self.is_empty() {
-            return 100.0;
+            return 0.0;
         }
         let encoded = self.iter().map(|r| r.encoded_size).sum::<u64>() as f64;
         let sample = self.iter().map(|r| r.sample_size).sum::<u64>() as f64;
+        if sample <= 0.0 {
+            return 0.0;
+        }
         encoded * 100.0 / sample
     }
 
     fn mean_vmaf_score(&self) -> Option<f32> {
-        let mut scores = self.iter().filter_map(|r| r.vmaf_score).peekable();
-        scores.peek()?;
-        Some(scores.sum::<f32>() / self.len() as f32)
+        let scores: Vec<f32> = self
+            .iter()
+            .filter_map(|r| r.vmaf_score)
+            .filter(|s| s.is_finite())
+            .collect();
+        if scores.is_empty() {
+            return None;
+        }
+        Some(scores.iter().sum::<f32>() / scores.len() as f32)
     }
 
     fn mean_xpsnr_score(&self) -> Option<f32> {
-        let mut scores = self.iter().filter_map(|r| r.xpsnr_score).peekable();
-        scores.peek()?;
-        Some(scores.sum::<f32>() / self.len() as f32)
+        let scores: Vec<f32> = self
+            .iter()
+            .filter_map(|r| r.xpsnr_score)
+            .filter(|s| s.is_finite())
+            .collect();
+        if scores.is_empty() {
+            return None;
+        }
+        Some(scores.iter().sum::<f32>() / scores.len() as f32)
     }
 
     fn estimate_encode_size_by_duration(
@@ -642,7 +761,11 @@ impl EncodeResults for Vec<EncodeResult> {
         }
 
         let sample_duration: Duration = self.iter().map(|s| s.sample_duration).sum();
-        let sample_factor = input_duration.as_secs_f64() / sample_duration.as_secs_f64();
+        let sample_secs = sample_duration.as_secs_f64();
+        if sample_secs <= 0.0 {
+            return 0;
+        }
+        let sample_factor = input_duration.as_secs_f64() / sample_secs;
         let sample_encode_size: f64 = self.iter().map(|r| r.encoded_size as f64).sum();
 
         (sample_encode_size * sample_factor).round() as _
@@ -657,15 +780,14 @@ impl EncodeResults for Vec<EncodeResult> {
         }
 
         let sample_duration: Duration = self.iter().map(|s| s.sample_duration).sum();
-        let sample_factor = input_duration.as_secs_f64() / sample_duration.as_secs_f64();
+        let sample_secs = sample_duration.as_secs_f64();
+        if sample_secs <= 0.0 {
+            return Duration::ZERO;
+        }
+        let sample_factor = input_duration.as_secs_f64() / sample_secs;
         let sample_encode_time: Duration = self.iter().map(|r| r.encode_time).sum();
 
-        let estimate = sample_encode_time.mul_f64(sample_factor);
-        if estimate < Duration::from_secs(1) {
-            estimate
-        } else {
-            Duration::from_secs(estimate.as_secs())
-        }
+        sample_encode_time.mul_f64(sample_factor)
     }
 }
 
@@ -768,14 +890,15 @@ pub struct Output {
 impl Output {
     /// Extract vmaf or xpsnr score. Use when it is expected to have only 1 of these.
     pub fn single_score(&self) -> f32 {
-        self.vmaf_score.or(self.xpsnr_score).unwrap_or_default()
+        self.vmaf_score.or(self.xpsnr_score).unwrap_or(f32::NAN)
     }
 
     /// Extract vmaf or xpsnr kind. Use when it is expected to have only 1 of these.
     pub fn single_score_kind(&self) -> ScoreKind {
-        match self.vmaf_score {
-            Some(_) => ScoreKind::Vmaf,
-            _ => ScoreKind::Xpsnr,
+        match (self.vmaf_score, self.xpsnr_score) {
+            (Some(_), _) => ScoreKind::Vmaf,
+            (None, Some(_)) => ScoreKind::Xpsnr,
+            (None, None) => ScoreKind::Vmaf,
         }
     }
 
@@ -872,4 +995,441 @@ pub enum Update {
         result: EncodeResult,
     },
     Done(Output),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use rstest::rstest;
+    use std::time::Duration;
+
+    mod helpers {
+        use super::*;
+
+        pub fn encode_result(
+            sample_size: u64,
+            encoded_size: u64,
+            sample_duration_secs: u64,
+            vmaf: Option<f32>,
+            xpsnr: Option<f32>,
+        ) -> EncodeResult {
+            EncodeResult {
+                sample_size,
+                encoded_size,
+                vmaf_score: vmaf,
+                xpsnr_score: xpsnr,
+                encode_time: Duration::from_secs(sample_duration_secs),
+                sample_duration: Duration::from_secs(sample_duration_secs),
+                from_cache: false,
+            }
+        }
+    }
+
+    use helpers::*;
+
+    // ab-kgc.23: mirrors sample_encode::sample frame math
+    #[test]
+    fn sample_frame_calculation_does_not_truncate_large_products() {
+        // setup — mirrors sample_encode::sample frame math (ab-kgc.19)
+        let sample_duration = Duration::from_secs(100_000);
+        let fps = 50_000.0;
+
+        // execute
+        let product = sample_duration.as_secs_f64() * fps;
+        let frames = (product.round() as u64).max(1);
+
+        // assert — wrapping would request far too few frames
+        assert!(
+            frames as f64 >= product * 0.99,
+            "duration*fps product {product} must not truncate via u32 cast (got {frames})"
+        );
+    }
+
+    // ab-kgc.37–38: zero total sample duration must not yield infinite predictions
+    #[test]
+    fn estimate_encode_predictions_finite_for_zero_sample_duration() {
+        // setup
+        let size_results = vec![encode_result(1000, 500, 0, Some(90.0), None)];
+        let time_results = vec![encode_result(1000, 500, 0, None, Some(90.0))];
+        let input_duration = Duration::from_secs(100);
+
+        // execute
+        let size = size_results.estimate_encode_size_by_duration(input_duration, false);
+        let estimate = time_results.estimate_encode_time(input_duration, false);
+
+        // assert
+        assert!(
+            size < u64::MAX,
+            "size prediction must be finite for zero sample duration"
+        );
+        assert!(
+            estimate < Duration::from_secs(u64::MAX / 2),
+            "time prediction must be finite for zero sample duration"
+        );
+    }
+
+    // ab-kgc.39: empty encode results should not assume 100% size ratio
+    #[test]
+    fn encoded_percent_size_empty_results_returns_zero() {
+        // setup
+        let results: Vec<EncodeResult> = vec![];
+
+        // execute
+        let percent = results.encoded_percent_size();
+
+        // assert
+        assert_eq!(
+            percent, 0.0,
+            "empty results should not report 100% encoded size"
+        );
+    }
+
+    // ab-kgc.47: sample grid divisor must not wrap for sample counts above u32::MAX
+    #[test]
+    fn sample_grid_divisor_non_zero_for_huge_sample_counts() {
+        // setup — when samples > u32::MAX, `(samples as u32 + 1)` truncates to 1
+        let samples = u32::MAX as u64 + 1;
+
+        // execute
+        let divisor = super::sample_grid_divisor(samples);
+
+        // assert
+        assert_ne!(
+            divisor, 1,
+            "sample grid divisor must not truncate when samples exceed u32::MAX"
+        );
+    }
+
+    // ab-kgc.60: zero sample_duration_us must not yield infinite encode progress
+    #[test]
+    fn encode_progress_finite_when_sample_duration_zero() {
+        // setup — mirrors encode progress denominator in sample_encode::run
+        let progress = super::encode_progress_ratio(1_000, 0, 0, 4);
+
+        // execute / assert
+        assert!(
+            progress.is_finite(),
+            "encode progress must be finite when sample_duration is zero, got {progress}"
+        );
+    }
+
+    // ab-kgc.48–49: NaN scores must not produce NaN means
+    #[test]
+    fn mean_scores_ignore_nan_values() {
+        // setup
+        let vmaf_results = vec![
+            encode_result(1000, 500, 10, Some(f32::NAN), None),
+            encode_result(1000, 500, 10, Some(90.0), None),
+        ];
+        let xpsnr_results = vec![
+            encode_result(1000, 500, 10, None, Some(f32::NAN)),
+            encode_result(1000, 500, 10, None, Some(88.0)),
+        ];
+
+        // execute
+        let vmaf_mean = vmaf_results.mean_vmaf_score();
+        let xpsnr_mean = xpsnr_results.mean_xpsnr_score();
+
+        // assert
+        assert_eq!(
+            vmaf_mean,
+            Some(90.0),
+            "NaN vmaf scores must not poison the reported mean"
+        );
+        assert_eq!(
+            xpsnr_mean,
+            Some(88.0),
+            "NaN xpsnr scores must not poison the reported mean"
+        );
+    }
+
+    // ab-kgc.55: all-NaN vmaf scores should report None not Some(NaN)
+    #[test]
+    fn mean_vmaf_score_all_nan_returns_none() {
+        // setup
+        let results = vec![
+            encode_result(1000, 500, 10, Some(f32::NAN), None),
+            encode_result(1000, 500, 10, Some(f32::NAN), None),
+        ];
+
+        // execute
+        let mean = results.mean_vmaf_score();
+
+        // assert
+        assert_eq!(mean, None, "all-NaN vmaf scores should yield no mean");
+    }
+
+    // ab-kgc.50–63: zero sample_size must not yield infinite attempt percentages
+    #[test]
+    fn attempt_percentages_finite_when_sample_size_zero() {
+        // setup / execute: exercise the production percentage calculation.
+        let result = encode_result(0, 500, 1, None, None);
+        result.log_attempt(1, 1, 30.0);
+    }
+    // ab-kgc.51–52: absent scores must not guess defaults
+    #[test]
+    fn output_single_score_absent_has_no_silent_defaults() {
+        // setup
+        let output = Output {
+            vmaf_score: None,
+            xpsnr_score: None,
+            predicted_encode_size: 0,
+            encode_percent: 0.0,
+            predicted_encode_time: Duration::ZERO,
+            from_cache: false,
+        };
+
+        // execute
+        let score = output.single_score();
+        let kind = output.single_score_kind();
+
+        // assert
+        assert!(
+            score.is_nan(),
+            "single_score must not default to 0.0 when both scores are absent"
+        );
+        assert_eq!(
+            kind,
+            ScoreKind::Vmaf,
+            "single_score_kind must not default to Xpsnr when both scores are absent"
+        );
+    }
+
+    // ab-kgc.56–64: JSON cache roundtrip must preserve NaN scores
+    #[test]
+    fn encode_result_json_roundtrip_preserves_nan_scores() {
+        // setup
+        let vmaf_original = encode_result(1_000, 500, 10, Some(f32::NAN), None);
+        let xpsnr_original = encode_result(1_000, 500, 10, None, Some(f32::NAN));
+
+        // execute
+        let vmaf_decoded: EncodeResult =
+            serde_json::from_slice(&serde_json::to_vec(&vmaf_original).expect("serialize vmaf"))
+                .expect("deserialize vmaf");
+        let xpsnr_decoded: EncodeResult =
+            serde_json::from_slice(&serde_json::to_vec(&xpsnr_original).expect("serialize xpsnr"))
+                .expect("deserialize xpsnr");
+
+        // assert
+        assert!(vmaf_decoded.vmaf_score.unwrap().is_nan());
+        assert!(xpsnr_decoded.xpsnr_score.unwrap().is_nan());
+    }
+
+    // ab-kgc.62: estimate_encode_time must not truncate subseconds when scaled total >= 1s
+    #[test]
+    fn estimate_encode_time_preserves_subseconds_when_scaled_above_one_second() {
+        // setup — 600ms sample encode scaled 2× → 1.2s predicted; must not truncate to 1s
+        let mut result = encode_result(1000, 500, 0, None, Some(90.0));
+        result.encode_time = Duration::from_millis(600);
+        result.sample_duration = Duration::from_millis(600);
+        let results = vec![result];
+        let input_duration = Duration::from_millis(1200);
+
+        // execute
+        let estimate = results.estimate_encode_time(input_duration, false);
+
+        // assert
+        assert_eq!(
+            estimate,
+            Duration::from_millis(1200),
+            "scaled encode time must retain subsecond precision"
+        );
+    }
+
+    // ab-kgc.28: zero sample_size must not yield infinite encoded percent
+    #[test]
+    fn encoded_percent_size_with_zero_sample_size_is_finite() {
+        // setup
+        let results = vec![encode_result(0, 500, 10, Some(90.0), None)];
+
+        // execute
+        let percent = results.encoded_percent_size();
+
+        // assert
+        assert!(
+            percent.is_finite(),
+            "encoded percent must be finite when sample_size is zero, got {percent}"
+        );
+    }
+
+    #[test]
+    fn encoded_percent_size_averages_multiple_samples() {
+        // setup
+        let results = vec![
+            encode_result(1000, 500, 10, Some(90.0), None),
+            encode_result(1000, 600, 10, Some(92.0), None),
+        ];
+
+        // execute / assert
+        assert!((results.encoded_percent_size() - 55.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn mean_scores_average_present_values() {
+        // setup
+        let results = vec![
+            encode_result(1000, 500, 10, Some(90.0), Some(88.0)),
+            encode_result(1000, 500, 10, Some(94.0), Some(92.0)),
+        ];
+
+        // execute / assert
+        assert_eq!(results.mean_vmaf_score(), Some(92.0));
+        assert_eq!(results.mean_xpsnr_score(), Some(90.0));
+    }
+
+    // ab-kgc.22: sparse per-sample scores must not dilute the mean
+    #[test]
+    fn mean_scores_average_only_samples_with_scores() {
+        // setup — mixed cache/legacy rows where only some samples have scores
+        let vmaf_results = vec![
+            encode_result(1000, 500, 10, Some(90.0), None),
+            encode_result(1000, 500, 10, None, None),
+        ];
+        let xpsnr_results = vec![
+            encode_result(1000, 500, 10, None, Some(88.0)),
+            encode_result(1000, 500, 10, None, Some(92.0)),
+            encode_result(1000, 500, 10, None, None),
+        ];
+
+        // execute
+        let vmaf_mean = vmaf_results.mean_vmaf_score();
+        let xpsnr_mean = xpsnr_results.mean_xpsnr_score();
+
+        // assert — must not divide by total sample count when scores are sparse
+        assert_eq!(
+            vmaf_mean,
+            Some(90.0),
+            "expected vmaf mean of present scores only"
+        );
+        assert_eq!(
+            xpsnr_mean,
+            Some(90.0),
+            "expected xpsnr mean of present scores only"
+        );
+    }
+
+    #[test]
+    fn estimate_encode_size_scales_by_duration_ratio() {
+        // setup
+        let results = vec![encode_result(1000, 500, 10, Some(90.0), None)];
+        let input_duration = Duration::from_secs(100);
+
+        // execute
+        let size = results.estimate_encode_size_by_duration(input_duration, false);
+
+        // assert — 500 bytes per 10s sample → 5000 for 100s input
+        assert_eq!(size, 5000);
+    }
+
+    #[test]
+    fn estimate_encode_time_scales_by_duration_ratio() {
+        // setup
+        let results = vec![
+            encode_result(1000, 500, 10, None, Some(90.0)),
+            encode_result(1000, 500, 10, None, Some(91.0)),
+        ];
+        let input_duration = Duration::from_secs(100);
+
+        // execute
+        let estimate = results.estimate_encode_time(input_duration, false);
+
+        // assert — 20s total sample encode time scaled 5× → 100s
+        assert_eq!(estimate, Duration::from_secs(100));
+    }
+
+    #[test]
+    fn single_full_pass_prediction_uses_first_sample_only() {
+        // setup
+        let results = vec![
+            encode_result(1000, 400, 10, Some(90.0), None),
+            encode_result(1000, 900, 10, Some(95.0), None),
+        ];
+        let input_duration = Duration::from_secs(3600);
+
+        // execute / assert
+        assert_eq!(
+            results.estimate_encode_size_by_duration(input_duration, true),
+            400
+        );
+        assert_eq!(
+            results.estimate_encode_time(input_duration, true),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn encode_result_json_roundtrip_for_cache() {
+        // setup
+        let original = encode_result(1_000_000, 500_000, 20, Some(95.5), Some(92.0));
+
+        // execute
+        let bytes = serde_json::to_vec(&original).expect("serialize");
+        let decoded: EncodeResult = serde_json::from_slice(&bytes).expect("deserialize");
+
+        // assert
+        assert_eq!(decoded.sample_size, original.sample_size);
+        assert_eq!(decoded.encoded_size, original.encoded_size);
+        assert_eq!(decoded.vmaf_score, original.vmaf_score);
+        assert_eq!(decoded.xpsnr_score, original.xpsnr_score);
+        assert!(!decoded.from_cache);
+    }
+
+    #[test]
+    fn encode_result_json_accepts_missing_score_fields() {
+        let json = r#"{
+            "sample_size": 1000,
+            "encoded_size": 500,
+            "encode_time": {"secs": 1, "nanos": 0},
+            "sample_duration": {"secs": 1, "nanos": 0},
+            "from_cache": false
+        }"#;
+        let decoded: EncodeResult = serde_json::from_str(json).expect("deserialize old cache");
+        assert_eq!(decoded.vmaf_score, None);
+        assert_eq!(decoded.xpsnr_score, None);
+    }
+
+    #[rstest]
+    #[case::vmaf_only(false, Some(70.0), None, ScoreKind::Vmaf)]
+    #[case::xpsnr_only(true, None, Some(92.0), ScoreKind::Xpsnr)]
+    #[case::vmaf_when_both_present(false, Some(70.0), Some(92.0), ScoreKind::Vmaf)]
+    fn output_single_score_kind_matrix(
+        #[case] use_xpsnr: bool,
+        #[case] vmaf: Option<f32>,
+        #[case] xpsnr: Option<f32>,
+        #[case] expected: ScoreKind,
+    ) {
+        // setup
+        let output = Output {
+            vmaf_score: vmaf,
+            xpsnr_score: xpsnr,
+            predicted_encode_size: 0,
+            encode_percent: 0.0,
+            predicted_encode_time: Duration::ZERO,
+            from_cache: false,
+        };
+
+        // execute / assert
+        let _ = use_xpsnr;
+        assert_eq!(output.single_score_kind(), expected);
+    }
+
+    mod proptest_predictions {
+        use super::*;
+
+        proptest! {
+            #[test]
+            fn encoded_percent_monotonic_with_encoded_size(
+                sample_size in 1000u64..10_000u64,
+                encoded_a in 100u64..5000u64,
+                encoded_b in 100u64..5000u64,
+            ) {
+                let results_a = vec![encode_result(sample_size, encoded_a, 10, None, None)];
+                let results_b = vec![encode_result(sample_size, encoded_b, 10, None, None)];
+                let pct_a = results_a.encoded_percent_size();
+                let pct_b = results_b.encoded_percent_size();
+                prop_assert_eq!(pct_a <= pct_b, encoded_a <= encoded_b);
+            }
+        }
+    }
 }

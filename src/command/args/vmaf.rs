@@ -100,8 +100,7 @@ impl Vmaf {
 
         let mut model = VmafModel::from_args(&args);
         if let (None, Some((w, h))) = (model, distorted_res)
-            && w > 2560
-            && h > 1440
+            && (w > 2560 || h > 1440)
         {
             // for >2k resolutions use 4k model
             lavfi.push_str(":model=version=vmaf_4k_v0.6.1");
@@ -138,7 +137,7 @@ impl Vmaf {
         match (self.vmaf_scale, distorted_res) {
             (VmafScale::Auto, Some((w, h))) => match model {
                 // upscale small resolutions to 1k for use with the 1k model
-                VmafModel::Vmaf1K if w < 1728 && h < 972 => {
+                VmafModel::Vmaf1K if w < 1728 || h < 972 => {
                     Some(minimally_scale((w, h), (1920, 1080)))
                 }
                 // upscale small resolutions to 4k for use with the 4k model
@@ -187,6 +186,9 @@ fn parse_vmaf_scale(vs: &str) -> anyhow::Result<VmafScale> {
         _ => {
             let (w, h) = vs.split_once('x').context(ERR)?;
             let (width, height) = (w.parse().context(ERR)?, h.parse().context(ERR)?);
+            if width == 0 || height == 0 {
+                anyhow::bail!("{ERR}");
+            }
             Ok(VmafScale::Custom { width, height })
         }
     }
@@ -215,7 +217,8 @@ enum VmafModel {
 
 impl VmafModel {
     fn from_args(args: &[Arc<str>]) -> Option<Self> {
-        let mut using_custom_model: Vec<_> = args.iter().filter(|v| v.contains("model")).collect();
+        let mut using_custom_model: Vec<_> =
+            args.iter().filter(|v| is_vmaf_model_override(v)).collect();
 
         match using_custom_model.len() {
             0 => None,
@@ -227,6 +230,11 @@ impl VmafModel {
             _ => Some(Self::Custom),
         }
     }
+}
+
+/// True when a libvmaf arg explicitly selects a model (not e.g. `phone_model=1`).
+fn is_vmaf_model_override(arg: &str) -> bool {
+    arg.split(':').any(|part| part.starts_with("model="))
 }
 
 #[test]
@@ -390,5 +398,123 @@ fn vmaf_lavfi_1080p() {
         "[0:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[dis];\
          [1:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[ref];\
          [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:n_subsample=4"
+    );
+}
+
+// bug-hunt-red → ab-kgc.79: width >2560 must select 4k VMAF model
+#[test]
+fn vmaf_lavfi_wide_2561x1440_selects_4k_model() {
+    let vmaf = Vmaf::default();
+    let lavfi = vmaf.ffmpeg_lavfi(Some((2561, 1440)), Some(PixelFormat::Yuv420p), None);
+    assert!(
+        lavfi.contains("model=version=vmaf_4k_v0.6.1"),
+        "2561x1440 should use the 4k model: {lavfi}"
+    );
+}
+
+// ab-kgc.80: ultrawide 4k-width sources must not stay on the 1k model
+#[test]
+fn vmaf_lavfi_ultrawide_3840x1440_selects_4k_model() {
+    let vmaf = Vmaf::default();
+    let lavfi = vmaf.ffmpeg_lavfi(Some((3840, 1440)), Some(PixelFormat::Yuv420p), None);
+    assert!(
+        lavfi.contains("model=version=vmaf_4k_v0.6.1"),
+        "3840x1440 should use the 4k model: {lavfi}"
+    );
+}
+
+#[test]
+fn vmaf_fps_zero_disables_override() {
+    let vmaf = Vmaf {
+        vmaf_fps: 0.0,
+        ..Default::default()
+    };
+    assert_eq!(vmaf.fps(), None);
+}
+
+#[test]
+fn vmaf_lavfi_scale_none_skips_auto_upscale() {
+    let vmaf = Vmaf {
+        vmaf_scale: VmafScale::None,
+        ..Default::default()
+    };
+    let lavfi = vmaf.ffmpeg_lavfi(Some((1280, 720)), Some(PixelFormat::Yuv420p), None);
+    assert!(
+        !lavfi.contains("scale="),
+        "vmaf-scale=none must disable auto upscale: {lavfi}"
+    );
+}
+
+#[test]
+fn vmaf_lavfi_exact_2k_boundary_uses_1k_model() {
+    let vmaf = Vmaf::default();
+    let lavfi = vmaf.ffmpeg_lavfi(Some((2560, 1440)), Some(PixelFormat::Yuv420p), None);
+    assert!(
+        !lavfi.contains("model=version=vmaf_4k_v0.6.1"),
+        "exact 2560x1440 should remain on the 1k model: {lavfi}"
+    );
+}
+
+// ab-kgc.81: portrait 720p must upscale height for the 1k model
+#[test]
+fn vmaf_lavfi_portrait_720x1280_auto_upscales_height() {
+    let vmaf = Vmaf::default();
+    let lavfi = vmaf.ffmpeg_lavfi(Some((720, 1280)), Some(PixelFormat::Yuv420p), None);
+    assert!(
+        lavfi.contains("scale=-1:1080:flags=bicubic"),
+        "portrait sources should upscale to 1080p height: {lavfi}"
+    );
+}
+
+#[test]
+fn vmaf_fps_negative_disables_use() {
+    let vmaf = Vmaf {
+        vmaf_fps: -1.0,
+        ..Default::default()
+    };
+    assert_eq!(vmaf.fps(), None);
+}
+
+#[test]
+fn vmaf_hash_distinguishes_and_vmaf_flag() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let off = Vmaf {
+        and_vmaf: None,
+        ..Default::default()
+    };
+    let on = Vmaf {
+        and_vmaf: Some(true),
+        ..Default::default()
+    };
+
+    let hash = |v: &Vmaf| {
+        let mut h = DefaultHasher::new();
+        v.hash(&mut h);
+        h.finish()
+    };
+    assert_ne!(hash(&off), hash(&on));
+}
+
+// ab-kgc.78: parse_vmaf_scale must reject zero WxH dimensions
+#[test]
+fn parse_vmaf_scale_rejects_zero_dimensions() {
+    let err = parse_vmaf_scale("0x1080").expect_err("zero width");
+    assert!(err.to_string().contains("vmaf-scale"));
+    let err = parse_vmaf_scale("1920x0").expect_err("zero height");
+    assert!(err.to_string().contains("vmaf-scale"));
+}
+
+#[test]
+fn vmaf_phone_model_does_not_count_as_model_override() {
+    let vmaf = Vmaf {
+        vmaf_args: vec!["phone_model=1".into(), "n_threads=5".into()],
+        ..Default::default()
+    };
+    let lavfi = vmaf.ffmpeg_lavfi(Some((3840, 2160)), Some(PixelFormat::Yuv420p), None);
+    assert!(
+        lavfi.contains("model=version=vmaf_4k_v0.6.1"),
+        "phone_model=1 must not suppress automatic 4k model selection: {lavfi}"
     );
 }
