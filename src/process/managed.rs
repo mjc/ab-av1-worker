@@ -187,9 +187,23 @@ impl Drop for TerminateOnDropProcess {
             return;
         };
 
-        handle.spawn(async move {
+        let terminate = async move {
             let _ = process.terminate_after(Duration::ZERO).await;
-        });
+        };
+
+        // The process handle's drop guard must be disarmed before the owned
+        // handle is dropped. Spawning this cleanup from `Drop` races that
+        // guard with the spawned task: the task may not get scheduled before
+        // the stream's destructor drops its captured process. Drive cleanup to
+        // completion on Tokio's blocking escape hatch instead.
+        if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            tokio::task::block_in_place(|| handle.block_on(terminate));
+        } else {
+            handle.spawn(terminate);
+        }
     }
 }
 
