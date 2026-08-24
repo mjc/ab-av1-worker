@@ -345,7 +345,7 @@ pin_project_lite::pin_project! {
     #[must_use = "streams do nothing unless polled"]
     pub struct FfmpegOutStream {
         #[pin]
-        events: Pin<Box<dyn Stream<Item = anyhow::Result<ManagedEvent>>>>,
+        events: Pin<Box<dyn Stream<Item = anyhow::Result<ManagedEvent>> + Send>>,
         name: &'static str,
         cmd_str: String,
         chunks: Chunks,

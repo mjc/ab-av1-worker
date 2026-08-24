@@ -671,6 +671,9 @@ impl TerminateOnDropProcess {
 mod test_support;
 
 #[cfg(test)]
+pub(crate) const MANAGED_PROCESS_FIXTURE_TEST: &str = test_support::FIXTURE_TEST;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::Context;

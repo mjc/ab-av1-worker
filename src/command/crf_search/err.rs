@@ -156,9 +156,6 @@ mod tests {
         let message = err.to_string();
 
         // assert
-        assert!(
-            message.contains("37.5") || message.contains("37"),
-            "NoGoodCrf display should mention last crf, got: {message}"
-        );
+        assert_eq!(message, "Failed to find a suitable crf (last crf 37.5)");
     }
 }

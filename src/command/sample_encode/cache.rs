@@ -8,6 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+const CACHE_KEY_PREFIX: &[u8] = b"v2:";
+const CACHE_NAMESPACE_KEY: &[u8] = b"__ab-av1-cache-namespace";
+
 /// Return a previous stored encode result for the same sample & args.
 #[allow(clippy::too_many_arguments)]
 pub async fn cached_encode(
@@ -40,7 +43,7 @@ pub async fn cached_encode(
 
     let cached = tokio::task::spawn_blocking::<_, anyhow::Result<_>>(move || {
         let db = open_db()?;
-        Ok(match db.get(key.0.to_hex().as_bytes())? {
+        Ok(match db.get(storage_key(key))? {
             Some(data) => Some(serde_json::from_slice::<super::EncodeResult>(&data)?),
             None => None,
         })
@@ -66,7 +69,7 @@ pub async fn cache_result(key: Key, result: &super::EncodeResult) -> anyhow::Res
     let data = serde_json::to_vec(result)?;
     let insert = tokio::task::spawn_blocking::<_, anyhow::Result<_>>(move || {
         let db = open_db()?;
-        db.insert(key.0.to_hex().as_bytes(), data)?;
+        db.insert(storage_key(key), data)?;
         db.flush()?;
         Ok(())
     })
@@ -75,7 +78,7 @@ pub async fn cache_result(key: Key, result: &super::EncodeResult) -> anyhow::Res
     .and_then(|r| r);
 
     if let Err(err) = insert {
-        eprintln!("cache error: {err}")
+        log::warn!("cache error: {err}")
     }
     Ok(())
 }
@@ -87,10 +90,37 @@ fn open_db() -> anyhow::Result<sled::Db> {
     let a = Instant::now();
     let mut db = sled::open(&path);
     while db.is_err() && a.elapsed() < LOCK_MAX_WAIT {
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(10));
         db = sled::open(&path);
     }
-    db.with_context(|| format!("failed to open sample-encode cache at {}", path.display()))
+    let db =
+        db.with_context(|| format!("failed to open sample-encode cache at {}", path.display()))?;
+    migrate_cache_namespace(&db)?;
+    Ok(db)
+}
+
+fn storage_key(key: Key) -> Vec<u8> {
+    let mut storage = CACHE_KEY_PREFIX.to_vec();
+    storage.extend_from_slice(key.0.to_hex().as_bytes());
+    storage
+}
+
+fn migrate_cache_namespace(db: &sled::Db) -> anyhow::Result<()> {
+    if db.get(CACHE_NAMESPACE_KEY)?.as_deref() == Some(b"v2") {
+        return Ok(());
+    }
+    let stale_keys = db
+        .iter()
+        .keys()
+        .filter_map(Result::ok)
+        .filter(|key| key.as_ref() != CACHE_NAMESPACE_KEY && !key.starts_with(CACHE_KEY_PREFIX))
+        .collect::<Vec<_>>();
+    for key in stale_keys {
+        db.remove(key)?;
+    }
+    db.insert(CACHE_NAMESPACE_KEY, b"v2")?;
+    db.flush()?;
+    Ok(())
 }
 
 pub(crate) fn sample_encode_cache_path(cache_dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -109,7 +139,7 @@ pub struct Key(blake3::Hash);
 /// Source file identity for sample-encode cache keys.
 #[derive(Clone, Copy)]
 struct SourceIdentity<'a> {
-    sample: &'a Path,
+    sample_name: Option<&'a OsStr>,
     source_input: &'a Path,
     input_duration: Duration,
     input_extension: Option<&'a OsStr>,
@@ -120,10 +150,7 @@ struct SourceIdentity<'a> {
 
 impl Hash for SourceIdentity<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.sample
-            .file_name()
-            .map_or(self.sample.as_os_str(), |name| name)
-            .hash(state);
+        self.sample_name.hash(state);
         self.source_input.hash(state);
         self.input_duration.hash(state);
         self.input_extension.hash(state);
@@ -180,7 +207,7 @@ pub(crate) fn encode_cache_key(
 ) -> Key {
     CacheKeyBuilder::new(
         SourceIdentity {
-            sample,
+            sample_name: sample.file_name(),
             source_input,
             input_duration,
             input_extension,
@@ -279,7 +306,7 @@ mod tests {
             size: u64,
         ) -> SourceIdentity<'a> {
             SourceIdentity {
-                sample,
+                sample_name: sample.file_name(),
                 source_input: input,
                 input_duration: duration,
                 input_extension: extension,

@@ -56,7 +56,7 @@ pub fn decide_next_transition(
                 Ok(SearchTransition::Done(sample.clone()))
             }
             Some(upper) => Ok(SearchTransition::Continue {
-                next_q: vmaf_lerp_q(min_score, upper, sample, use_xpsnr),
+                next_q: vmaf_lerp_q(min_score, upper, sample, use_xpsnr)?,
             }),
             None if sample.q == max_q => {
                 Error::ensure_or_no_good_crf(sample_small_enough, sample)?;
@@ -84,7 +84,7 @@ pub fn decide_next_transition(
 
     match l_bound {
         Some(lower) if lower.q + 1 == sample.q => {
-            let lower_score = output_search_score(&lower.enc, use_xpsnr);
+            let lower_score = output_search_score(&lower.enc, use_xpsnr)?;
             if lower_score >= min_score {
                 Error::ensure_or_no_good_crf(
                     lower.enc.encode_percent <= max_encoded_percent.get(),
@@ -96,12 +96,12 @@ pub fn decide_next_transition(
                 })
             } else {
                 Ok(SearchTransition::Continue {
-                    next_q: vmaf_lerp_q(min_score, sample, lower, use_xpsnr),
+                    next_q: vmaf_lerp_q(min_score, sample, lower, use_xpsnr)?,
                 })
             }
         }
         Some(lower) => Ok(SearchTransition::Continue {
-            next_q: vmaf_lerp_q(min_score, sample, lower, use_xpsnr),
+            next_q: vmaf_lerp_q(min_score, sample, lower, use_xpsnr)?,
         }),
         None if cut_on_iter2 && run == 1 && sample.q > min_q + 1 => {
             Ok(SearchTransition::Continue {
@@ -113,12 +113,17 @@ pub fn decide_next_transition(
 }
 
 /// Produce a q value between given samples using vmaf score linear interpolation.
-pub fn vmaf_lerp_q(min_vmaf: f32, worse_q: &Sample, better_q: &Sample, use_xpsnr: bool) -> i64 {
-    let worse_score = output_search_score(&worse_q.enc, use_xpsnr);
-    let better_score = output_search_score(&better_q.enc, use_xpsnr);
+pub fn vmaf_lerp_q(
+    min_vmaf: f32,
+    worse_q: &Sample,
+    better_q: &Sample,
+    use_xpsnr: bool,
+) -> Result<i64, Error> {
+    let worse_score = output_search_score(&worse_q.enc, use_xpsnr)?;
+    let better_score = output_search_score(&better_q.enc, use_xpsnr)?;
     if !(worse_score <= min_vmaf && worse_score < better_score && worse_q.q > better_q.q) {
-        return ((worse_q.q + better_q.q) / 2)
-            .clamp(better_q.q.min(worse_q.q), better_q.q.max(worse_q.q));
+        return Ok(((worse_q.q + better_q.q) / 2)
+            .clamp(better_q.q.min(worse_q.q), better_q.q.max(worse_q.q)));
     }
 
     let vmaf_diff = better_score - worse_score;
@@ -130,11 +135,11 @@ pub fn vmaf_lerp_q(min_vmaf: f32, worse_q: &Sample, better_q: &Sample, use_xpsnr
     let hi = worse_q.q - 1;
     if lo > hi {
         if min_vmaf > better_score {
-            return better_q.q - 1;
+            return Ok(better_q.q - 1);
         }
-        return worse_q.q;
+        return Ok(worse_q.q);
     }
-    lerp.clamp(lo, hi)
+    Ok(lerp.clamp(lo, hi))
 }
 
 /// sample_progress: [0, 1]

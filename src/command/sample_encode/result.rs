@@ -14,6 +14,8 @@ mod score_json {
     {
         match score {
             Some(v) if v.is_nan() => serializer.serialize_str("NaN"),
+            // JSON encodes infinities as null; reading that back intentionally
+            // treats it as a missing score, like the mean-score path does.
             Some(v) => serializer.serialize_some(v),
             None => serializer.serialize_none(),
         }
@@ -46,12 +48,14 @@ pub struct EncodeResult {
     pub encoded_size: u64,
     #[serde(
         serialize_with = "score_json::serialize",
-        deserialize_with = "score_json::deserialize"
+        deserialize_with = "score_json::deserialize",
+        default
     )]
     pub vmaf_score: Option<f32>,
     #[serde(
         serialize_with = "score_json::serialize",
-        deserialize_with = "score_json::deserialize"
+        deserialize_with = "score_json::deserialize",
+        default
     )]
     pub xpsnr_score: Option<f32>,
     pub encode_time: Duration,
@@ -239,7 +243,8 @@ impl EncodeResults for Vec<EncodeResult> {
         let sample_factor = input_duration.as_secs_f64() / sample_secs;
         let sample_encode_time: Duration = self.iter().map(|r| r.encode_time).sum();
 
-        sample_encode_time.mul_f64(sample_factor)
+        Duration::try_from_secs_f64(sample_encode_time.as_secs_f64() * sample_factor)
+            .unwrap_or(Duration::MAX)
     }
 }
 
@@ -379,6 +384,40 @@ mod tests {
                 "predicted_encode_seconds": 1_560.0,
                 "vmaf": 95.5,
             })
+        );
+    }
+
+    #[test]
+    fn encode_result_json_accepts_missing_score_fields() {
+        let json = r#"{
+            "sample_size": 1000,
+            "encoded_size": 500,
+            "encode_time": {"secs": 1, "nanos": 0},
+            "sample_duration": {"secs": 1, "nanos": 0},
+            "from_cache": false
+        }"#;
+
+        let decoded: EncodeResult = serde_json::from_str(json).expect("deserialize old cache");
+
+        assert_eq!(decoded.vmaf_score, None);
+        assert_eq!(decoded.xpsnr_score, None);
+    }
+
+    #[test]
+    fn estimate_encode_time_clamps_overflow() {
+        let results = vec![EncodeResult {
+            sample_size: 1,
+            encoded_size: 1,
+            vmaf_score: Some(95.0),
+            xpsnr_score: None,
+            encode_time: Duration::MAX,
+            sample_duration: Duration::from_nanos(1),
+            from_cache: false,
+        }];
+
+        assert_eq!(
+            results.estimate_encode_time(Duration::MAX, false),
+            Duration::MAX
         );
     }
 }

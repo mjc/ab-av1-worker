@@ -209,8 +209,9 @@ pub fn encode(
 
 pub fn pre_extension_name(vcodec: &str) -> &str {
     match vcodec {
-        "libsvtav1" | "libaom-av1" | "libdav1d" | "svtav1" => "av1",
-        "libvpx-vp9" | "libvpx" => "vp9",
+        "libsvtav1" | "libaom-av1" | "svtav1" => "av1",
+        "libvpx-vp9" => "vp9",
+        "libvpx" => "vp8",
         _ => match vcodec.strip_prefix("lib").filter(|s| !s.is_empty()) {
             Some(suffix) => suffix,
             None => vcodec,
@@ -271,6 +272,12 @@ pub fn remove_arg(args: &mut Vec<Arc<String>>, arg: &'static str) {
     }
 }
 
+pub fn remove_all_args(args: &mut Vec<Arc<String>>, arg: &'static str) {
+    while args.iter().any(|a| a.as_str() == arg) {
+        remove_arg(args, arg);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,9 +292,9 @@ mod tests {
         assert_eq!(pre_extension_name("libvpx-vp9"), "vp9");
         assert_eq!(pre_extension_name("libx264"), "x264");
         assert_eq!(pre_extension_name("libaom-av1"), "av1");
-        assert_eq!(pre_extension_name("libdav1d"), "av1");
+        assert_eq!(pre_extension_name("libdav1d"), "dav1d");
         assert_eq!(pre_extension_name("svtav1"), "av1");
-        assert_eq!(pre_extension_name("libvpx"), "vp9");
+        assert_eq!(pre_extension_name("libvpx"), "vp8");
         assert_eq!(
             pre_extension_name("libaom-av1"),
             pre_extension_name("libsvtav1"),
@@ -296,7 +303,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::libsvtav1("libsvtav1", "-crf", "-preset", 63.0)]
+    #[case::libsvtav1("libsvtav1", "-crf", "-preset", 70.0)]
     #[case::librav1e("librav1e", "-qp", "-speed", 40.0)]
     #[case::libx264("libx264", "-crf", "-preset", 32.0)]
     #[case::hevc_vt("hevc_videotoolbox", "-q:v", "-preset", 50.0)]

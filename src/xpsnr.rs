@@ -163,7 +163,7 @@ fn parse_score_number(s: &str) -> ParsedScore {
 
     let Some(end_idx) = s
         .char_indices()
-        .take_while(|(_, c)| *c == '-' || *c == '.' || c.is_numeric())
+        .take_while(|(_, c)| *c == '-' || *c == '.' || c.is_ascii_digit())
         .last()
         .map(|(idx, _)| idx)
     else {

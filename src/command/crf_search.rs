@@ -34,11 +34,16 @@ const DEFAULT_MIN_VMAF: f32 = 95.0;
 ///
 /// When the user targets XPSNR (`--min-xpsnr`), search must use XPSNR even if VMAF
 /// is also present (e.g. `--and-vmaf`).
-fn output_search_score(enc: &sample_encode::Output, use_xpsnr: bool) -> f32 {
-    match use_xpsnr {
-        true => enc.xpsnr_score.or(enc.vmaf_score).unwrap_or_default(),
-        false => enc.vmaf_score.or(enc.xpsnr_score).unwrap_or_default(),
+fn output_search_score(enc: &sample_encode::Output, use_xpsnr: bool) -> anyhow::Result<f32> {
+    let score = match use_xpsnr {
+        true => enc.xpsnr_score.or(enc.vmaf_score),
+        false => enc.vmaf_score.or(enc.xpsnr_score),
     }
+    .context("sample encode produced no score")?;
+    if !score.is_finite() {
+        return Err(anyhow::anyhow!("sample encode produced no finite score"));
+    }
+    Ok(score)
 }
 
 #[cfg(test)]
@@ -558,7 +563,7 @@ pub fn run(
                 q,
                 sample_enc_output.context("no sample output?")?,
             );
-            let score = output_search_score(&sample.enc, use_xpsnr);
+            let score = output_search_score(&sample.enc, use_xpsnr)?;
             crf_attempts.push(sample.clone());
             yield Update::SampleEncodeDone(sample.clone());
 
@@ -616,7 +621,7 @@ impl Sample {
         max_encoded_percent: MaxEncodedPercent,
         use_xpsnr: bool,
     ) {
-        let score_v = output_search_score(&self.enc, use_xpsnr);
+        let score_v = output_search_score(&self.enc, use_xpsnr).unwrap_or(f32::NAN);
         let score_kind = match (use_xpsnr, self.enc.xpsnr_score, self.enc.vmaf_score) {
             (true, Some(_), _) => sample_encode::ScoreKind::Xpsnr,
             (false, _, Some(_)) | (true, None, Some(_)) => sample_encode::ScoreKind::Vmaf,
@@ -1224,7 +1229,16 @@ mod crf_search_tests {
         let enc = mock_output(vmaf, xpsnr, 50.0);
 
         // execute / assert
-        assert_eq!(output_search_score(&enc, use_xpsnr), expected);
+        assert_eq!(output_search_score(&enc, use_xpsnr).unwrap(), expected);
+    }
+
+    #[test]
+    fn output_search_score_rejects_missing_and_non_finite_scores() {
+        let missing = mock_output(None, None, 50.0);
+        let non_finite = mock_output(Some(f32::NAN), None, 50.0);
+
+        assert!(output_search_score(&missing, false).is_err());
+        assert!(output_search_score(&non_finite, false).is_err());
     }
 
     #[rstest]
@@ -1258,7 +1272,7 @@ mod crf_search_tests {
         };
 
         // execute
-        let q = vmaf_lerp_q(92.0, &worse, &better, use_xpsnr);
+        let q = vmaf_lerp_q(92.0, &worse, &better, use_xpsnr).unwrap();
 
         // assert
         assert!((26..=28).contains(&q));
@@ -1277,7 +1291,7 @@ mod crf_search_tests {
             enc: mock_output(Some(90.0), None, 50.0),
         };
 
-        assert_eq!(vmaf_lerp_q(92.0, &worse, &better, false), 25);
+        assert_eq!(vmaf_lerp_q(92.0, &worse, &better, false).unwrap(), 25);
     }
 
     #[tokio::test]
@@ -1347,7 +1361,7 @@ mod crf_search_tests {
 
         // execute / assert
         assert_eq!(
-            output_search_score(&enc, true),
+            output_search_score(&enc, true).unwrap(),
             96.0,
             "use_xpsnr search should fall back to VMAF when XPSNR score is missing"
         );
@@ -1403,7 +1417,7 @@ mod crf_search_tests {
         };
 
         // execute
-        let q = vmaf_lerp_q(92.0, &worse, &better, use_xpsnr);
+        let q = vmaf_lerp_q(92.0, &worse, &better, use_xpsnr).unwrap();
 
         // assert
         assert!((26..=28).contains(&q));
@@ -1725,7 +1739,7 @@ mod crf_search_tests {
                     enc: mock_output(Some(better_score), None, 50.0),
                 };
 
-                let q = vmaf_lerp_q(min_vmaf, &worse, &better, false);
+                let q = vmaf_lerp_q(min_vmaf, &worse, &better, false).unwrap();
 
                 prop_assert!(q > better_q && q < worse_q);
             }

@@ -6,6 +6,7 @@ use crate::{
     },
     ffprobe::Ffprobe,
 };
+use anyhow::Context;
 use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
 
 pub(crate) mod test_hooks {
@@ -35,9 +36,9 @@ pub(crate) fn test_ffmpeg_stream(
     use tokio::process::Command;
 
     const FIXTURE_ENV: &str = "AB_AV1_MANAGED_PROCESS_FIXTURE";
-    const FIXTURE_TEST: &str = "process::managed::tests::managed_process_fixture_child";
+    const FIXTURE_TEST: &str = crate::process::managed::MANAGED_PROCESS_FIXTURE_TEST;
 
-    let mut cmd = Command::new(env::current_exe().expect("current test executable"));
+    let mut cmd = Command::new(env::current_exe().context("resolve current test executable")?);
     cmd.arg("--exact")
         .arg(FIXTURE_TEST)
         .arg("--nocapture")
