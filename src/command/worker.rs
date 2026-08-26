@@ -1479,22 +1479,50 @@ async fn run_multiplex_job(
     output: UnboundedSender<MultiplexOutput>,
 ) {
     let job_id = job.assignment.job_id.clone();
+    let mut cleanup_guard = WorkerInputCleanup::new(&job);
     let process_scope = ProcessScope::new(job_id.clone());
     let result = process_scope
         .run(run_multiplex_job_inner(&job, &mut commands, &output))
         .await;
-    if let Err(error) = cleanup_multiplex_worker_input(&job, &result) {
-        debug!(
-            job_id = %job.assignment.job_id,
-            error = %error,
-            "failed to remove completed multiplexed worker job directory"
-        );
+    match cleanup_multiplex_worker_input(&job, &result) {
+        Ok(()) => cleanup_guard.disarm(),
+        Err(error) => {
+            debug!(
+                job_id = %job.assignment.job_id,
+                error = %error,
+                "failed to remove completed multiplexed worker job directory"
+            );
+        }
     }
     let outcome = result.map_err(|error| format!("{error:#}"));
     let _ = output.send(MultiplexOutput::Done {
         job_id,
         result: outcome,
     });
+}
+
+struct WorkerInputCleanup {
+    input_dir: Option<PathBuf>,
+}
+
+impl WorkerInputCleanup {
+    fn new(job: &WorkerJob) -> Self {
+        let input_dir = (job.input_dir == worker_job_input_dir(&job.assignment.job_id))
+            .then(|| job.input_dir.clone());
+        Self { input_dir }
+    }
+
+    fn disarm(&mut self) {
+        self.input_dir = None;
+    }
+}
+
+impl Drop for WorkerInputCleanup {
+    fn drop(&mut self) {
+        if let Some(input_dir) = self.input_dir.take() {
+            let _ = fs::remove_dir_all(input_dir);
+        }
+    }
 }
 
 fn cleanup_multiplex_worker_input(
@@ -3401,12 +3429,12 @@ async fn send_multiplex_heartbeat(
     }
 
     let active_job = jobs.values().find(|job| !job.finished);
-    let path = active_job.map_or(Path::new("."), |job| job.job.input_dir.as_path());
+    let path = worker_heartbeat_path(active_job);
     let active_video_id = active_job.map(|job| job.job.assignment.video_id);
 
     match worker
         .send_event(ClientEvent::Heartbeat(heartbeat_payload(
-            path,
+            &path,
             active_video_id,
         )))
         .await
@@ -3420,6 +3448,12 @@ async fn send_multiplex_heartbeat(
             false
         }
     }
+}
+
+fn worker_heartbeat_path(active_job: Option<&MultiplexJob>) -> PathBuf {
+    active_job
+        .map(|job| job.job.input_dir.clone())
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 async fn expire_offline_jobs(
@@ -4863,6 +4897,12 @@ mod tests {
             next_job_type_after_no_work(WorkerMode::Both, JobKind::CrfSearch),
             Some(JobKind::Encode)
         );
+    }
+
+    #[test]
+    fn idle_multiplex_heartbeat_uses_absolute_temp_path() {
+        assert!(worker_heartbeat_path(None).is_absolute());
+        assert_eq!(worker_heartbeat_path(None), std::env::temp_dir());
     }
 
     #[test]
