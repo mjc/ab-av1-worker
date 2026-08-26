@@ -50,7 +50,7 @@ fn bash_completion_contains_expected_command_paths() {
     assert!(output.status.success());
 
     let completions = String::from_utf8_lossy(&output.stdout);
-    assert!(completions.contains("_ab_av1()"));
+    assert!(completions.contains("_ab__av1()"));
     assert!(completions.contains("ab__av1__subcmd__crf__subcmd__search"));
     assert!(completions.contains("ab__av1__subcmd__print__subcmd__completions"));
 }

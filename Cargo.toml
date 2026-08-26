@@ -34,9 +34,9 @@ serde = { version = "1.0.185", features = ["derive"] }
 serde_json = "1.0.105"
 shell-escape = "0.1.5"
 sled = "0.34.7"
-sysinfo = "0.30"
+sysinfo = "0.38.4"
 thiserror = "2"
-ureq = { version = "2.12", default-features = false }
+ureq = { version = "3.4", default-features = false }
 rustls = { version = "0.23", features = ["ring"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -52,7 +52,7 @@ tokio = { version = "1.15", features = [
 ] }
 tokio-process-tools = "0.11.2"
 tokio-stream = "0.1"
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 
 [profile.release]
 lto = true
@@ -62,7 +62,7 @@ strip = true
 [dev-dependencies]
 allocation-counter = "0.8.1"
 proptest = "1"
-rstest = "0.24"
+rstest = "0.26"
 serial_test = "3"
 test-case = "3"
 

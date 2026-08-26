@@ -29,7 +29,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use sysinfo::{Disks, Pid, System};
+use sysinfo::{Disks, Pid, ProcessesToUpdate, System};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::{
@@ -92,10 +92,11 @@ struct ControlledReader<R> {
 }
 
 fn worker_http_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_read(HTTP_TRANSFER_IDLE_TIMEOUT)
-        .timeout_write(HTTP_TRANSFER_IDLE_TIMEOUT)
+    ureq::Agent::config_builder()
+        .timeout_recv_body(Some(HTTP_TRANSFER_IDLE_TIMEOUT))
+        .timeout_send_body(Some(HTTP_TRANSFER_IDLE_TIMEOUT))
         .build()
+        .into()
 }
 
 impl<R: Read> Read for ControlledReader<R> {
@@ -1171,15 +1172,15 @@ async fn send_worker_event(
 fn heartbeat_payload(path: &Path, active_video_id: Option<u64>) -> HeartbeatPayload {
     let system = HEARTBEAT_SYSTEM.get_or_init(|| {
         let mut system = System::new_all();
-        system.refresh_cpu();
+        system.refresh_cpu_all();
         Mutex::new(system)
     });
     let mut system = system.lock().expect("heartbeat system lock");
-    system.refresh_cpu();
+    system.refresh_cpu_all();
     system.refresh_memory();
 
     let pid = Pid::from_u32(std::process::id());
-    system.refresh_process(pid);
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
     let memory_rss_bytes = system.process(pid).map(|process| process.memory());
 
     let disks = Disks::new_with_refreshed_list();
@@ -1189,7 +1190,7 @@ fn heartbeat_payload(path: &Path, active_video_id: Option<u64>) -> HeartbeatPayl
         .max_by_key(|disk| disk.mount_point().as_os_str().len());
 
     HeartbeatPayload {
-        cpu_percent: Some(system.global_cpu_info().cpu_usage()),
+        cpu_percent: Some(system.global_cpu_usage()),
         memory_rss_bytes,
         memory_total_bytes: Some(system.total_memory()),
         disk_free_bytes: disk.map(|disk| disk.available_space()),
@@ -1441,7 +1442,7 @@ impl MultiplexedWorker {
 
     async fn send_pong(&mut self, payload: Vec<u8>) -> Result<()> {
         self.writer
-            .send(Message::Pong(payload))
+            .send(Message::Pong(payload.into()))
             .await
             .context("send websocket pong")
     }
@@ -1688,14 +1689,14 @@ async fn download_multiplex_input(
     let copy = tokio::task::spawn_blocking(move || -> Result<u64> {
         let response = worker_http_agent()
             .get(&transfer.url)
-            .set(&transfer.auth.header, &transfer.auth.value)
+            .header(&transfer.auth.header, &transfer.auth.value)
             .call()
             .map_err(|error| {
                 anyhow!("HTTP input download failed for job {copy_job_id}: {error}")
             })?;
         let reader = ControlledReader {
             inner: CountingReader {
-                inner: response.into_reader(),
+                inner: response.into_body().into_reader(),
                 received: copy_received,
             },
             gate: copy_gate,
@@ -2119,9 +2120,9 @@ async fn upload_multiplex_output(
         };
         worker_http_agent()
             .put(&transfer.url)
-            .set(&transfer.auth.header, &transfer.auth.value)
-            .set("Content-Length", &output_bytes.to_string())
-            .send(reader)
+            .header(&transfer.auth.header, &transfer.auth.value)
+            .header("Content-Length", output_bytes.to_string())
+            .send(ureq::SendBody::from_owned_reader(reader))
             .map_err(|error| anyhow!("HTTP output upload failed for job {job_id}: {error}"))?;
         Ok(())
     });
@@ -2292,7 +2293,7 @@ impl ConnectedWorker {
             match decode_worker_frame(self.socket.next().await)? {
                 Some(WorkerFrame::Ping(payload)) => {
                     self.socket
-                        .send(Message::Pong(payload))
+                        .send(Message::Pong(payload.into()))
                         .await
                         .context("send websocket pong")?;
                 }
@@ -2764,12 +2765,12 @@ async fn download_worker_input(worker: &mut ConnectedWorker, job: &WorkerJob) ->
     let mut copy = tokio::task::spawn_blocking(move || -> Result<u64> {
         let response = worker_http_agent()
             .get(&transfer.url)
-            .set(&transfer.auth.header, &transfer.auth.value)
+            .header(&transfer.auth.header, &transfer.auth.value)
             .call()
             .map_err(|error| anyhow!("HTTP input download failed for job {job_id}: {error}"))?;
 
         let reader = CountingReader {
-            inner: response.into_reader(),
+            inner: response.into_body().into_reader(),
             received: copy_received,
         };
         let mut output =
@@ -4180,10 +4181,10 @@ fn decode_worker_frame(
     match frame {
         Message::Text(text) => Ok(match decode_worker_push(&text)? {
             Some(push) => Some(WorkerFrame::Push(push)),
-            None => Some(WorkerFrame::Text(text)),
+            None => Some(WorkerFrame::Text(text.to_string())),
         }),
-        Message::Binary(bytes) => Ok(Some(WorkerFrame::Binary(bytes))),
-        Message::Ping(payload) => Ok(Some(WorkerFrame::Ping(payload))),
+        Message::Binary(bytes) => Ok(Some(WorkerFrame::Binary(bytes.to_vec()))),
+        Message::Ping(payload) => Ok(Some(WorkerFrame::Ping(payload.to_vec()))),
         Message::Pong(_) | Message::Frame(_) => Ok(None),
         Message::Close(frame) => bail!("worker websocket closed: {frame:?}"),
     }
@@ -4390,11 +4391,9 @@ fn worker_websocket_url(base_url: &str, token: &str) -> Result<String> {
 }
 
 fn worker_websocket_config() -> WebSocketConfig {
-    WebSocketConfig {
-        max_message_size: Some(MAX_TRANSFER_FRAME_BYTES),
-        max_frame_size: Some(MAX_TRANSFER_FRAME_BYTES),
-        ..WebSocketConfig::default()
-    }
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_TRANSFER_FRAME_BYTES))
+        .max_frame_size(Some(MAX_TRANSFER_FRAME_BYTES))
 }
 
 async fn send_json<W, T>(writer: &mut W, value: T) -> Result<()>
@@ -4404,7 +4403,7 @@ where
 {
     writer
         .send(Message::Text(
-            serde_json::to_string(&value).context("encode websocket message")?,
+            (serde_json::to_string(&value).context("encode websocket message")?).into(),
         ))
         .await
         .context("send websocket message")
@@ -5092,7 +5091,7 @@ mod tests {
         for event in ["phx_error", "phx_close"] {
             let text = json!([null, null, CRF_SEARCH_TOPIC, event, {}]).to_string();
 
-            assert!(decode_worker_frame(Some(Ok(Message::Text(text)))).is_err());
+            assert!(decode_worker_frame(Some(Ok(Message::Text(text.into())))).is_err());
         }
 
         assert!(decode_worker_frame(Some(Ok(Message::Close(None)))).is_err());
@@ -5334,7 +5333,11 @@ mod tests {
             let headers = String::from_utf8_lossy(&request[..header_end]);
             let content_length = headers
                 .lines()
-                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then_some(value.trim())
+                })
                 .context("missing output content length")?
                 .parse::<usize>()?;
             while request.len() < header_end + content_length {
@@ -5521,7 +5524,11 @@ mod tests {
             let headers = String::from_utf8_lossy(&request[..header_end]);
             let content_length = headers
                 .lines()
-                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then_some(value.trim())
+                })
                 .context("missing output content length")?
                 .parse::<usize>()?;
             std::thread::sleep(Duration::from_millis(25));
@@ -5761,11 +5768,12 @@ mod tests {
             };
             writer
                 .send(Message::Text(
-                    serde_json::to_string(&ServerFrame::reply(
+                    (serde_json::to_string(&ServerFrame::reply(
                         3,
                         ReplyBody::ok(ServerReply::JobAssigned(assignment)),
                     ))
-                    .expect("encode assignment json"),
+                    .expect("encode assignment json"))
+                    .into(),
                 ))
                 .await
                 .expect("send encode assignment");
@@ -5801,11 +5809,12 @@ mod tests {
                     let request_ref = frame[1].as_str().expect("encode_completed replay ref");
                     writer
                         .send(Message::Text(
-                            json!(["1", request_ref, CRF_SEARCH_TOPIC, "phx_reply", {
+                            (json!(["1", request_ref, CRF_SEARCH_TOPIC, "phx_reply", {
                                 "status": "ok",
                                 "response": {}
                             }])
-                            .to_string(),
+                            .to_string())
+                            .into(),
                         ))
                         .await
                         .expect("send replayed encode_completed ack");
@@ -6055,10 +6064,13 @@ mod tests {
         let mut scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(1).unwrap());
         let (output, _outputs) = mpsc::unbounded_channel();
         let mut completed_pulls = 0;
-        let frame = Message::Text(serde_json::to_string(&ServerFrame::reply(
-            3,
-            ReplyBody::error(ErrorReplyPayload::new("unmatched topic")),
-        ))?);
+        let frame = Message::Text(
+            (serde_json::to_string(&ServerFrame::reply(
+                3,
+                ReplyBody::error(ErrorReplyPayload::new("unmatched topic")),
+            ))?)
+            .into(),
+        );
 
         let connection_is_alive = handle_multiplex_frame(
             decode_worker_frame(Some(Ok(frame))).map(|frame| frame.expect("text worker frame")),
@@ -6086,8 +6098,9 @@ mod tests {
         let mut scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(1).unwrap());
         let (output, _outputs) = mpsc::unbounded_channel();
         let mut completed_pulls = 0;
-        let frame =
-            Message::Text(json!([null, null, CRF_SEARCH_TOPIC, "phx_error", {}]).to_string());
+        let frame = Message::Text(
+            (json!([null, null, CRF_SEARCH_TOPIC, "phx_error", {}]).to_string()).into(),
+        );
 
         let connection_is_alive = handle_multiplex_frame(
             decode_worker_frame(Some(Ok(frame))).map(|frame| frame.expect("text worker frame")),
@@ -7511,11 +7524,12 @@ mod tests {
     {
         writer
             .send(Message::Text(
-                json!([null, "1", CRF_SEARCH_TOPIC, "phx_reply", {
+                (json!([null, "1", CRF_SEARCH_TOPIC, "phx_reply", {
                     "status": "ok",
                     "response": {"worker_id": "worker-123"}
                 }])
-                .to_string(),
+                .to_string())
+                .into(),
             ))
             .await
             .expect("send join reply");
@@ -7527,11 +7541,12 @@ mod tests {
     {
         writer
             .send(Message::Text(
-                serde_json::to_string(&ServerFrame::<Value>::reply(
+                (serde_json::to_string(&ServerFrame::<Value>::reply(
                     2,
                     ReplyBody::ok(json!({"accepted": true, "protocol_version": 1})),
                 ))
-                .expect("announce reply json"),
+                .expect("announce reply json"))
+                .into(),
             ))
             .await
             .expect("send announce reply");
@@ -7543,7 +7558,7 @@ mod tests {
     {
         writer
             .send(Message::Text(
-                serde_json::to_string(&ServerFrame::reply(
+                (serde_json::to_string(&ServerFrame::reply(
                     request_ref,
                     ReplyBody::ok(ServerReply::NoWork(
                         crate::command::worker_protocol::NoWorkPayload {
@@ -7551,7 +7566,8 @@ mod tests {
                         },
                     )),
                 ))
-                .expect("no_work reply json"),
+                .expect("no_work reply json"))
+                .into(),
             ))
             .await
             .expect("send pull_work reply");
@@ -7586,7 +7602,7 @@ mod tests {
         };
         writer
             .send(Message::Text(
-                serde_json::to_string(&ServerFrame::reply(
+                (serde_json::to_string(&ServerFrame::reply(
                     request_ref,
                     ReplyBody::ok(ServerReply::JobAssigned(JobAssignedPayload {
                         status,
@@ -7610,7 +7626,8 @@ mod tests {
                         ],
                     })),
                 ))
-                .expect("job reply json"),
+                .expect("job reply json"))
+                .into(),
             ))
             .await
             .expect("send job reply");
@@ -7622,14 +7639,15 @@ mod tests {
     {
         writer
             .send(Message::Text(
-                serde_json::to_string(&crate::command::worker_protocol::ServerFrame::reply(
+                (serde_json::to_string(&crate::command::worker_protocol::ServerFrame::reply(
                     request_ref,
                     ReplyBody::error(
                         serde_json::from_value::<ErrorReplyPayload>(response)
                             .expect("error payload"),
                     ),
                 ))
-                .expect("announce error reply json"),
+                .expect("announce error reply json"))
+                .into(),
             ))
             .await
             .expect("send announce error reply");
@@ -7641,14 +7659,15 @@ mod tests {
     {
         writer
             .send(Message::Text(
-                serde_json::to_string(&ServerPushFrame::new(
+                (serde_json::to_string(&ServerPushFrame::new(
                     "cancel",
                     CancelPayload {
                         job_id: job_id.into(),
                         reason: reason.into(),
                     },
                 ))
-                .expect("cancel push json"),
+                .expect("cancel push json"))
+                .into(),
             ))
             .await
             .expect("send cancel push");
@@ -7660,7 +7679,7 @@ mod tests {
     {
         writer
             .send(Message::Text(
-                serde_json::to_string(&ServerPushFrame::new(
+                (serde_json::to_string(&ServerPushFrame::new(
                     "control",
                     ControlPayload {
                         action,
@@ -7669,7 +7688,8 @@ mod tests {
                         command_id: None,
                     },
                 ))
-                .expect("control push json"),
+                .expect("control push json"))
+                .into(),
             ))
             .await
             .expect("send control push");

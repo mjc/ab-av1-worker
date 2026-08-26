@@ -134,7 +134,7 @@ where
     W: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     writer
-        .send(Message::Text(value.to_string()))
+        .send(Message::Text((value.to_string()).into()))
         .await
         .expect("send websocket message");
 }
