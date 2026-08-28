@@ -1364,7 +1364,7 @@ enum MultiplexOutput {
     },
     Done {
         job_id: String,
-        result: std::result::Result<WorkerJobOutcome, String>,
+        result: anyhow::Result<WorkerJobOutcome>,
     },
     RequestInputResend {
         job_id: String,
@@ -1494,11 +1494,7 @@ async fn run_multiplex_job(
             );
         }
     }
-    let outcome = result.map_err(|error| format!("{error:#}"));
-    let _ = output.send(MultiplexOutput::Done {
-        job_id,
-        result: outcome,
-    });
+    let _ = output.send(MultiplexOutput::Done { job_id, result });
 }
 
 struct WorkerInputCleanup {
@@ -3503,7 +3499,7 @@ fn handle_multiplex_output_offline(
             if let Some(job) = jobs.get_mut(&job_id) {
                 job.finished = true;
                 if let Err(error) = result {
-                    job.state.failure = Some(job.job.failure_payload(&anyhow!(error)));
+                    job.state.failure = Some(job.job.failure_payload(&error));
                 }
             }
         }
@@ -3614,7 +3610,7 @@ async fn handle_multiplex_output(
                 Err(error) => warn!(%job_id, %error, "worker job failed"),
             }
             if let Err(error) = result {
-                let failure = job.job.failure_payload(&anyhow!(error));
+                let failure = job.job.failure_payload(&error);
                 job.state.failure = Some(failure.clone());
                 if !send_multiplex_event(
                     worker,
