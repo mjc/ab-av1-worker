@@ -568,6 +568,11 @@ impl WorkerJob {
             (Some(_), _) => "crf_optimization",
             (None, _) => "process_failure",
         };
+        let code = match category {
+            "size_limits" => "SIZE_LIMIT".to_owned(),
+            "crf_optimization" => "CRF_NOT_FOUND".to_owned(),
+            _ => format!("EXIT_{exit_code}"),
+        };
         let argv = match self.assignment.job_type {
             JobKind::CrfSearch => &self.assignment.crf_search_args,
             JobKind::Encode => &self.assignment.encode_args,
@@ -583,7 +588,7 @@ impl WorkerJob {
             .into(),
             category: category.into(),
             message: error.to_string(),
-            code: format!("EXIT_{exit_code}"),
+            code,
             context: json!({
                 "job_id": self.assignment.job_id,
                 "source_name": self.assignment.source_name,
@@ -4861,14 +4866,29 @@ mod tests {
         );
 
         let error = anyhow!(crf_search::Error::Other(anyhow!(
-            crf_search::Error::NoGoodCrf { last: sample }
+            crf_search::Error::NoGoodCrf {
+                last: sample.clone()
+            }
         )))
         .context("worker CRF search failed");
         let payload = job.failure_payload(&error);
 
         assert_eq!(payload.category, "size_limits");
+        assert_eq!(payload.code, "SIZE_LIMIT");
         assert_eq!(payload.context["encode_percent"], json!(81.0));
         assert_eq!(payload.context["max_encoded_percent"], json!(80.0));
+
+        let mut optimization_sample = sample.clone();
+        optimization_sample.enc.encode_percent = 70.0;
+        let optimization_error = anyhow!(crf_search::Error::Other(anyhow!(
+            crf_search::Error::NoGoodCrf {
+                last: optimization_sample
+            }
+        )));
+        let optimization_payload = job.failure_payload(&optimization_error);
+
+        assert_eq!(optimization_payload.category, "crf_optimization");
+        assert_eq!(optimization_payload.code, "CRF_NOT_FOUND");
     }
 
     #[test]
