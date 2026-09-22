@@ -1,4 +1,13 @@
-# Unreleased (0.11.6)
+# v0.11.7
+* Add encode & auto-encode `--verify`, decoding the finished encode & failing on decode errors
+  or a duration mismatch with the input. The checks can be enabled separately with
+  `--verify-decode` & `--verify-duration`.
+* Add encode & auto-encode `--fail-fast` to stop the final encode at the first ffmpeg reported
+  error, which catches input decode errors that may leave no trace in the result.
+* Use ffmpeg (instead of SvtAv1EncApp) to find svt-av1 version for caching validity logic.
+* Add auto-scaling support for VMAF v1.0.16 models and their high-frame-rate variants.
+
+# v0.11.6
 * libx265: Default `--enc tag:v=hvc1` for better compatibility. The ffmpeg default can be explicitly set with `--enc tag:v=hev1`.
 
 # v0.11.5
