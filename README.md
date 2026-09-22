@@ -88,6 +88,17 @@ ab-av1 xpsnr --reference <REFERENCE> --distorted <DISTORTED>
 ## JSON output
 See `--stdout-format json` [docs](./stdout-format-json.md).
 
+## Development environment
+Install [devenv](https://devenv.sh/) and enter the project shell with:
+
+```sh
+devenv shell
+```
+
+The environment is defined in `devenv.nix`, the Rust toolchain in
+`rust-toolchain.toml`, and Nix inputs are pinned by `devenv.lock`. On shells with
+devenv's native hook enabled, run `devenv allow` once to enable auto-activation.
+
 ## Install
 ### Arch Linux
 Available in the [AUR](https://aur.archlinux.org/packages/ab-av1).
@@ -129,10 +140,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 ## Full Verification
-Use the devshell for the slower end-to-end test pass when one is available:
+Run the slower end-to-end test pass inside the project environment:
 
 ```sh
-nix develop -c cargo test -- --test-threads=1
+devenv shell -- cargo test --locked -- --test-threads=1
 ```
 
 ## Minimum supported rust compiler

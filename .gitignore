@@ -1,8 +1,10 @@
 /target
 /aur
 /ab-av1-worker-*/
-.envrc
+.devenv/
 .direnv/
+devenv.local.nix
+devenv.local.yaml
 *.log
 .DS_Store
 *.json
