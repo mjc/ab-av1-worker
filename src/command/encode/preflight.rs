@@ -100,6 +100,10 @@ mod tests {
             downmix_to_stereo: false,
             video_only: false,
             overwrite_input: false,
+            verify: false,
+            verify_decode: false,
+            verify_duration: false,
+            fail_fast: false,
         };
         let encoder: Encoder = "libsvtav1".parse().unwrap();
         let err = match resolve_output(&input, &encoder, &encode_to, &test_probe(Some(6))) {
@@ -118,6 +122,10 @@ mod tests {
             downmix_to_stereo: true,
             video_only: false,
             overwrite_input: false,
+            verify: false,
+            verify_decode: false,
+            verify_duration: false,
+            fail_fast: false,
         };
         let err = match audio_config(&encode_to, &test_probe(Some(6))) {
             Err(err) => err,

@@ -592,7 +592,7 @@ mod tests {
                 worker_id: "abav1-dev".into(),
                 hostname: None,
                 protocol_version: 1,
-                version: "0.11.4".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
                 capabilities: Capabilities {
                     crf_search: true,
                     encode: false,
@@ -614,7 +614,7 @@ mod tests {
                 {
                     "worker_id": "abav1-dev",
                     "protocol_version": 1,
-                    "version": "0.11.4",
+                    "version": env!("CARGO_PKG_VERSION"),
                     "capabilities": {
                         "crf_search": true,
                         "encode": false,

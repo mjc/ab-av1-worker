@@ -54,6 +54,24 @@ pub struct EncodeToOutput {
     /// Setting this option overrides that allowing input overwrites.
     #[arg(long)]
     pub overwrite_input: bool,
+
+    /// Verify the encoded result before moving it into place. Enables all
+    /// `--verify-*` checks. A failed check leaves no output file.
+    #[arg(long)]
+    pub verify: bool,
+
+    /// Verify the encoded result decodes without errors. Costs an extra full decode.
+    #[arg(long)]
+    pub verify_decode: bool,
+
+    /// Verify the encoded result duration matches the input duration, within 2s.
+    #[arg(long)]
+    pub verify_duration: bool,
+
+    /// Stop the encode as soon as ffmpeg reports an error instead of finishing with
+    /// a damaged result. Applies to the final encode only, not sample encodes.
+    #[arg(long)]
+    pub fail_fast: bool,
 }
 
 /// Sampling arguments.

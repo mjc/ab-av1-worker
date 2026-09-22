@@ -96,7 +96,11 @@ pub(crate) async fn run_with_spawner(
     }
     bar.set_message("encoding, ");
     if let Ok(d) = &plan.probe().duration {
-        bar.set_length(d.as_micros_u64().max(1));
+        let mut len = d.as_micros_u64();
+        if plan.verify_decode() {
+            len += len / 2;
+        }
+        bar.set_length(len.max(1));
     }
 
     let run = running::run_encode(plan, bar, spawner).await?;
@@ -171,6 +175,25 @@ mod tests {
 
         assert!(matches!(args.as_ref().map(|args| args.crf.get()), Ok(30.0)));
         assert!(Args::try_parse_from(["ab-av1", "--input", "input.mkv", "--crf", "NaN"]).is_err());
+    }
+
+    #[test]
+    fn parse_verification_flags() {
+        let args = Args::try_parse_from([
+            "ab-av1",
+            "--input",
+            "input.mkv",
+            "--crf",
+            "30",
+            "--verify",
+            "--fail-fast",
+        ])
+        .expect("verification flags should parse");
+
+        assert!(args.encode.verify);
+        assert!(args.encode.fail_fast);
+        assert!(!args.encode.verify_decode);
+        assert!(!args.encode.verify_duration);
     }
 
     #[test]

@@ -283,6 +283,10 @@ mod tests {
                 downmix_to_stereo: false,
                 video_only: false,
                 overwrite_input: false,
+                verify: false,
+                verify_decode: false,
+                verify_duration: false,
+                fail_fast: false,
             },
         };
 
@@ -366,6 +370,10 @@ mod tests {
                     downmix_to_stereo: false,
                     video_only: false,
                     overwrite_input: false,
+                    verify: false,
+                    verify_decode: false,
+                    verify_duration: false,
+                    fail_fast: false,
                 },
             }
         }

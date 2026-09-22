@@ -100,6 +100,10 @@ pub fn encode_args(input: PathBuf, output: Option<PathBuf>) -> Args {
             downmix_to_stereo: false,
             video_only: false,
             overwrite_input: false,
+            verify: false,
+            verify_decode: false,
+            verify_duration: false,
+            fail_fast: false,
         },
     }
 }

@@ -4587,7 +4587,7 @@ mod tests {
                 connect: format!("http://{}", self.address),
                 token: "test-worker-token".into(),
                 worker_id: "abav1-dev".into(),
-                version: "0.11.4".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
                 protocol_version: config.protocol_version,
                 once: config.once,
                 local_path: None,
@@ -4630,6 +4630,23 @@ mod tests {
             Some(1)
         );
         assert_eq!(config.crf_searches_per_encode, None);
+    }
+
+    #[test]
+    fn args_default_worker_version_matches_package_version() {
+        let args = Args::try_parse_from([
+            "ab-av1",
+            "--connect",
+            "http://127.0.0.1:4000",
+            "--token",
+            "token",
+            "--worker-id",
+            "abav1-dev",
+        ])
+        .expect("parse worker args");
+
+        let config = WorkerConfig::try_from(args).expect("lower worker args");
+        assert_eq!(config.version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -5322,7 +5339,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_assignment_replaces_server_input_with_worker_path() {
+    fn encode_assignment_replaces_server_input_and_preserves_encode_options() {
         let input = std::env::temp_dir().join("worker-local-input.mkv");
         let job = WorkerJob::new(
             JobAssignedPayload {
@@ -5344,6 +5361,10 @@ mod tests {
                     "/server/movie.mkv".into(),
                     "--crf".into(),
                     "30".into(),
+                    "--verify".into(),
+                    "--verify-decode".into(),
+                    "--verify-duration".into(),
+                    "--fail-fast".into(),
                     "--output".into(),
                     "encoded.mkv".into(),
                 ],
@@ -5355,6 +5376,10 @@ mod tests {
 
         let config = job.encode_config().expect("encode config");
         assert_eq!(config.input(), input.as_path());
+        assert!(config.encode_to.verify);
+        assert!(config.encode_to.verify_decode);
+        assert!(config.encode_to.verify_duration);
+        assert!(config.encode_to.fail_fast);
 
         let mut shared_assignment = job.assignment.clone();
         shared_assignment.output_shared_path = Some("/shared/movie.av1.mkv".into());
@@ -5883,7 +5908,7 @@ mod tests {
             connect: format!("http://{address}"),
             token: "test-worker-token".into(),
             worker_id: "abav1-dev".into(),
-            version: "0.11.4".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
             protocol_version: 1,
             once: false,
             local_path: Some(input.clone()),
@@ -7535,7 +7560,7 @@ mod tests {
         assert_eq!(frame[3], "announce");
         assert_eq!(frame[4]["worker_id"], "abav1-dev");
         assert_eq!(frame[4]["protocol_version"], protocol_version);
-        assert_eq!(frame[4]["version"], "0.11.4");
+        assert_eq!(frame[4]["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             frame[4]["capabilities"]["crf_search"],
             matches!(

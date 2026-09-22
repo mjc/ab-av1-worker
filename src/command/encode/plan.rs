@@ -19,6 +19,10 @@ pub struct SpawnConfig {
     encode: args::Encode,
     crf: f32,
     output_ext: Arc<str>,
+    verify: bool,
+    verify_decode: bool,
+    verify_duration: bool,
+    fail_fast: bool,
 }
 
 /// Validated encode inputs lowered from the raw clap surface.
@@ -101,6 +105,10 @@ impl EncodePlan {
                 crf,
                 output_ext,
                 video_only: encode_to.video_only,
+                verify: encode_to.verify,
+                verify_decode: encode_to.verify_decode,
+                verify_duration: encode_to.verify_duration,
+                fail_fast: encode_to.fail_fast,
             },
         })
     }
@@ -115,6 +123,10 @@ impl EncodePlan {
 
     pub fn output_path(&self) -> &Path {
         self.planned.path()
+    }
+
+    pub fn verify_decode(&self) -> bool {
+        self.spawn.verify || self.spawn.verify_decode
     }
 
     #[cfg(test)]
@@ -161,6 +173,18 @@ impl EncodeSession {
 
     pub fn audio_codec(&self) -> Option<&str> {
         self.spawn.audio_codec.as_deref()
+    }
+
+    pub fn verify_decode(&self) -> bool {
+        self.spawn.verify || self.spawn.verify_decode
+    }
+
+    pub fn verify_duration(&self) -> bool {
+        self.spawn.verify || self.spawn.verify_duration
+    }
+
+    pub fn fail_fast(&self) -> bool {
+        self.spawn.fail_fast
     }
 }
 

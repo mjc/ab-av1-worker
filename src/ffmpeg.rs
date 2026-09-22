@@ -2,20 +2,24 @@
 use crate::{
     command::args::PixelFormat,
     float::TerseF32,
-    process::managed::ManagedProcess,
-    process::{CommandExt, FfmpegOut, FfmpegOutStream},
+    process::managed::{ManagedEvent, ManagedProcess},
+    process::{Chunks, CommandExt, FfmpegOut, FfmpegOutStream, exit_ok_stderr},
     temporary::{self, TempKind},
 };
 use anyhow::Context;
-use log::debug;
+use bstr::ByteSlice;
+use log::{debug, info};
 use std::{
     collections::HashSet,
     fmt::Write,
     hash::{Hash, Hasher},
+    io::Read,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{Arc, LazyLock},
 };
 use tokio::process::Command;
+use tokio_stream::StreamExt;
 
 /// Encode output registered for cleanup until the run succeeds.
 ///
@@ -40,11 +44,9 @@ pub struct FfmpegEncodeArgs<'a> {
 
 impl FfmpegEncodeArgs<'_> {
     pub fn sample_encode_hash(&self, state: &mut impl Hasher) {
-        static SVT_AV1_V: LazyLock<Vec<u8>> = LazyLock::new(|| {
-            std::process::Command::new("SvtAv1EncApp")
-                .arg("--version")
-                .output()
-                .map(|o| o.stdout)
+        static SVT_AV1_V: LazyLock<String> = LazyLock::new(|| {
+            ffmpeg_svtav1_version()
+                .inspect_err(|e| debug!("read_ffmpeg_svtav1_version: {e}"))
                 .unwrap_or_default()
         });
 
@@ -147,6 +149,7 @@ pub fn encode(
     has_audio: bool,
     audio_codec: Option<&str>,
     downmix_to_stereo: bool,
+    fail_fast: bool,
 ) -> anyhow::Result<FfmpegOutStream> {
     let output = output.encode_destination();
     let oargs: HashSet<_> = output_args.iter().map(|a| a.as_str()).collect();
@@ -181,6 +184,7 @@ pub fn encode(
     cmd.arg("-nostdin")
         .args(FfmpegArgValues::new(&input_args).iter())
         .arg("-y")
+        .arg_if(fail_fast, "-xerror")
         .arg2("-i", input)
         .arg2("-map", map)
         .arg2("-c:v", "copy")
@@ -276,6 +280,107 @@ pub fn remove_all_args(args: &mut Vec<Arc<String>>, arg: &'static str) {
     while args.iter().any(|a| a.as_str() == arg) {
         remove_arg(args, arg);
     }
+}
+
+fn ffmpeg_svtav1_version() -> anyhow::Result<String> {
+    let mut ffmpeg = std::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-f",
+            "lavfi",
+            "-i",
+            "color",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "libsvtav1",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    const BUF_QUARTER_LEN: usize = 64;
+    let mut buf = [0; 4 * BUF_QUARTER_LEN];
+    let mut read_up_to = 0;
+    let mut stderr = ffmpeg.stderr.take().context("stderr")?;
+
+    std::thread::spawn(move || _ = ffmpeg.wait());
+
+    loop {
+        let n = stderr.read(&mut buf[read_up_to..])?;
+        anyhow::ensure!(n != 0, "EOF: No version string found");
+        read_up_to += n;
+
+        if let Some(idx) = buf[..read_up_to].find_iter("SVT-AV1 Encoder Lib v").next()
+            && let Some(last_byte) = buf[..read_up_to].last()
+            && !matches!(*last_byte, b'0'..=b'9' | b'.' | b'v')
+        {
+            let ver: Vec<_> = buf[idx + "SVT-AV1 Encoder Lib v".len()..read_up_to]
+                .iter()
+                .copied()
+                .take_while(|b| matches!(b, b'0'..=b'9' | b'.'))
+                .collect();
+            return Ok(String::try_from(ver)?);
+        }
+
+        if read_up_to > 3 * BUF_QUARTER_LEN {
+            buf.rotate_left(2 * BUF_QUARTER_LEN);
+            read_up_to -= 2 * BUF_QUARTER_LEN;
+        }
+    }
+}
+
+/// Decode all video and audio streams, failing on the first decode error.
+pub async fn decode(file: &Path, mut on_progress: impl FnMut(FfmpegOut)) -> anyhow::Result<()> {
+    info!(
+        "verifying {}",
+        file.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+    );
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.kill_on_drop(true)
+        .arg2("-v", "error")
+        .arg("-stats")
+        .arg("-xerror")
+        .arg2("-i", file)
+        .arg2("-map", "0:v?")
+        .arg2("-map", "0:a?")
+        .arg2("-f", "null")
+        .arg("-")
+        .stdin(Stdio::null());
+
+    let cmd_str = cmd.to_cmd_str();
+    debug!("cmd `{cmd_str}`");
+    let mut events = Box::pin(
+        ManagedProcess::spawn("ffmpeg verify", cmd)
+            .context("ffmpeg verify")?
+            .must_complete()
+            .stderr_events(),
+    );
+    let mut chunks = Chunks::default();
+    while let Some(next) = events.next().await {
+        match next? {
+            ManagedEvent::RawStderr(chunk) => {
+                chunks.push(chunk.as_bytes());
+                if let Some(out) = FfmpegOut::try_parse(chunks.last_line()) {
+                    on_progress(out);
+                }
+            }
+            ManagedEvent::ReplayGap(_) => {}
+            ManagedEvent::ProcessDone(done) => {
+                exit_ok_stderr("ffmpeg verify", Ok(done.status()), &cmd_str, &chunks)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

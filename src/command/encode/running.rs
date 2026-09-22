@@ -5,10 +5,14 @@ use super::{
     sink::ProgressSink,
     spawner::EncodeSpawner,
 };
-use crate::{command::SmallDuration, log::ProgressLogger};
+use crate::{command::SmallDuration, ffmpeg, ffprobe, log::ProgressLogger};
+use anyhow::ensure;
 use log::info;
 use std::time::{Duration, Instant};
 use tokio_stream::StreamExt;
+
+const VERIFY_DURATION_TOLERANCE: Duration = Duration::from_secs(2);
+const VERIFY_BAR_DIVISOR: u64 = 2;
 
 pub struct EncodeRun {
     pub input: std::path::PathBuf,
@@ -65,6 +69,43 @@ where
         }
     }
     enc.wait().await?;
+
+    // Verify while the output is still staged, so a failed check cannot replace
+    // an existing destination.
+    if session.verify_decode() {
+        sink.set_message("verifying, ");
+        let encode_len = session
+            .probe
+            .duration
+            .as_ref()
+            .ok()
+            .map(|d| d.as_micros_u64());
+        ffmpeg::decode(&output, |event| {
+            if let crate::process::FfmpegOut::Progress { fps, time, .. } = event {
+                sink.set_message(if fps > 0.0 {
+                    format!("verifying {fps} fps, ")
+                } else {
+                    "verifying, ".into()
+                });
+                if let Some(len) = encode_len {
+                    sink.set_position(len + time.as_micros_u64() / VERIFY_BAR_DIVISOR);
+                }
+            }
+        })
+        .await?;
+    }
+    if session.verify_duration()
+        && let Ok(expected) = &session.probe.duration
+        && !expected.is_zero()
+    {
+        let actual = ffprobe::probe(&output).duration?;
+        ensure!(
+            expected.abs_diff(actual) <= VERIFY_DURATION_TOLERANCE,
+            "verify: output duration {} does not match input duration {}",
+            humantime::format_duration(floor_ms(actual)),
+            humantime::format_duration(floor_ms(*expected)),
+        );
+    }
     sink.finish();
 
     spawner.finalize_output(&output).await?;
@@ -74,6 +115,10 @@ where
         output: partial.commit()?,
         stream_sizes: progress.stream_sizes,
     })
+}
+
+fn floor_ms(duration: Duration) -> Duration {
+    Duration::from_millis(duration.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
 fn media_time(frame: u64, reported: Duration, source_fps: f64) -> Duration {

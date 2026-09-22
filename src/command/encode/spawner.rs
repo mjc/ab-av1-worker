@@ -34,6 +34,7 @@ impl EncodeSpawner for FfmpegSpawner {
             session.has_audio(),
             session.audio_codec(),
             session.stereo_downmix(),
+            session.fail_fast(),
         )
     }
 }
