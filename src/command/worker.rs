@@ -502,6 +502,19 @@ impl WorkerJob {
         )?))
     }
 
+    fn local_output_path(&self) -> Option<PathBuf> {
+        if self.assignment.job_type != JobKind::Encode {
+            return None;
+        }
+
+        self.assignment
+            .encode_args
+            .windows(2)
+            .find(|args| args[0] == "--output" || args[0] == "-o")
+            .and_then(|args| Path::new(&args[1]).file_name())
+            .map(|name| self.input_dir.join(name))
+    }
+
     fn progress_payload(
         &self,
         crf: f32,
@@ -1540,16 +1553,16 @@ fn cleanup_multiplex_worker_input(
         let retain_local_output = job.assignment.job_type == JobKind::Encode
             && job.assignment.output_transfer.is_none()
             && job.assignment.output_shared_path.is_none();
-        if retain_local_output
-            && job.input_dir == worker_job_input_dir(&job.assignment.job_id)
-            && job.input_path().starts_with(&job.input_dir)
-        {
-            fs::remove_file(job.input_path()).with_context(|| {
-                format!(
-                    "remove completed worker input {}",
-                    job.input_path().display()
-                )
-            })?;
+        if retain_local_output {
+            if let Some(output_path) = job.local_output_path() {
+                if output_path.starts_with(&job.input_dir) {
+                    remove_worker_input_except(job, &output_path)?;
+                } else {
+                    remove_worker_input(job)?;
+                }
+            } else {
+                remove_worker_input(job)?;
+            }
         } else {
             remove_worker_input(job)?;
         }
@@ -2657,6 +2670,33 @@ fn remove_worker_input(job: &WorkerJob) -> Result<()> {
     );
     fs::remove_dir_all(&job.input_dir)
         .with_context(|| format!("remove worker input directory {}", job.input_dir.display()))?;
+    Ok(())
+}
+
+fn remove_worker_input_except(job: &WorkerJob, retained_path: &Path) -> Result<()> {
+    if job.input_dir != worker_job_input_dir(&job.assignment.job_id) || !job.input_dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(&job.input_dir)
+        .with_context(|| format!("read worker input directory {}", job.input_dir.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("read worker input directory {}", job.input_dir.display()))?
+            .path();
+        if path == retained_path {
+            continue;
+        }
+
+        if path.is_dir() {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("remove worker artifact {}", path.display()))?;
+        } else {
+            fs::remove_file(&path)
+                .with_context(|| format!("remove worker artifact {}", path.display()))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -7110,8 +7150,10 @@ mod tests {
         let source_root =
             std::env::temp_dir().join(format!("ab-av1-worker-source-{}", std::process::id()));
         let source_path = source_root.join("movie.mkv");
+        let output_path = root.join("movie.av1.mkv");
         fs::create_dir_all(&source_root)?;
         fs::write(&source_path, b"input")?;
+        fs::write(&output_path, b"output")?;
         let job = WorkerJob::new(
             JobAssignedPayload {
                 status: WorkStatus::JobAssigned,
@@ -7141,8 +7183,9 @@ mod tests {
         cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Completed))?;
 
         assert!(source_path.exists());
-        assert!(!root.exists());
+        assert!(output_path.exists());
         fs::remove_dir_all(source_root)?;
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 
