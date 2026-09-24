@@ -3595,7 +3595,14 @@ async fn run_multiplexed_worker(
                             let worker_id = candidate.assigned_worker_id.clone();
                             let mut candidate = MultiplexedWorker::from_connected(candidate);
                             pending_acks.clear();
-                            if replay_multiplex_jobs(&mut candidate, &jobs, &mut pending_acks).await {
+                            if replay_multiplex_jobs(
+                                &mut candidate,
+                                &jobs,
+                                &mut pending,
+                                &mut pending_acks,
+                            )
+                            .await
+                            {
                                 info!(
                                     %worker_id,
                                     active_jobs = jobs.len(),
@@ -3877,30 +3884,7 @@ async fn handle_multiplex_output(
             let Some(job) = jobs.get(&job_id) else {
                 return Ok(true);
             };
-            send_multiplex_event(
-                worker,
-                ClientEvent::TransferFailure(TransferFailurePayload {
-                    job_id: job_id.clone(),
-                    stage: TransferStage::ReceiveChunk,
-                    retriable: true,
-                    reason: format!(
-                        "worker input is missing at {}",
-                        job.job.input_path().display()
-                    ),
-                }),
-                &job_id,
-                "transfer_failed",
-                pending_acks,
-            )
-            .await;
-            let reference = worker
-                .send_pull(PullWorkPayload {
-                    input_missing: true,
-                    job_type: Some(job.job.assignment.job_type),
-                })
-                .await?;
-            pending.insert(reference, (job.job.assignment.job_type, Some(job_id)));
-            Ok(true)
+            Ok(request_multiplex_input_resend(worker, job, pending, pending_acks).await)
         }
     }
 }
@@ -4250,6 +4234,7 @@ fn remove_finished_job_if_acknowledged(
 async fn replay_multiplex_jobs(
     worker: &mut MultiplexedWorker,
     jobs: &HashMap<String, MultiplexJob>,
+    pending: &mut HashMap<String, (JobKind, Option<String>)>,
     pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> bool {
     for (job_id, job) in jobs {
@@ -4296,7 +4281,59 @@ async fn replay_multiplex_jobs(
         if !replay_multiplex_state(worker, &job.state, job_id, pending_acks).await {
             return false;
         }
+        if !job.job.input_path().exists()
+            && job.job.assignment.transfer.is_none()
+            && !request_multiplex_input_resend(worker, job, pending, pending_acks).await
+        {
+            return false;
+        }
     }
+    true
+}
+
+async fn request_multiplex_input_resend(
+    worker: &mut MultiplexedWorker,
+    job: &MultiplexJob,
+    pending: &mut HashMap<String, (JobKind, Option<String>)>,
+    pending_acks: &mut HashMap<String, PendingEventAck>,
+) -> bool {
+    let job_id = &job.job.assignment.job_id;
+    if !send_multiplex_event(
+        worker,
+        ClientEvent::TransferFailure(TransferFailurePayload {
+            job_id: job_id.clone(),
+            stage: TransferStage::ReceiveChunk,
+            retriable: true,
+            reason: format!(
+                "worker input is missing at {}",
+                job.job.input_path().display()
+            ),
+        }),
+        job_id,
+        "transfer_failed",
+        pending_acks,
+    )
+    .await
+    {
+        return false;
+    }
+    let reference = match worker
+        .send_pull(PullWorkPayload {
+            input_missing: true,
+            job_type: Some(job.job.assignment.job_type),
+        })
+        .await
+    {
+        Ok(reference) => reference,
+        Err(error) => {
+            debug!(%error, %job_id, "failed to request worker input resend");
+            return false;
+        }
+    };
+    pending.insert(
+        reference,
+        (job.job.assignment.job_type, Some(job_id.clone())),
+    );
     true
 }
 
