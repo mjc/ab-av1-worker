@@ -61,6 +61,22 @@ impl ProcessScope {
         PROCESS_SCOPE.scope(self.clone(), future).await
     }
 
+    pub(crate) fn has_active_processes(&self) -> bool {
+        #[cfg(unix)]
+        {
+            scoped_process_groups()
+                .lock()
+                .expect("scoped process groups lock")
+                .get(self)
+                .is_some_and(|groups| !groups.is_empty())
+        }
+
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     #[cfg(unix)]
     pub fn pause(&self) -> anyhow::Result<()> {
         self.signal(Signal::SIGSTOP)

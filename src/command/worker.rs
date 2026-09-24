@@ -1696,11 +1696,19 @@ where
                     if let Some(outcome) =
                         apply_job_control(job, &control, output, Some(&process_scope), &mut paused)?
                     {
+                        if outcome == WorkerJobOutcome::Stopped
+                            && process_scope.has_active_processes()
+                        {
+                            let _ = (&mut probe).await;
+                        }
                         return Ok(Err(outcome));
                     }
                 }
                 Some(JobCommand::Cancel(cancel)) => {
                     process_scope.stop()?;
+                    if process_scope.has_active_processes() {
+                        let _ = (&mut probe).await;
+                    }
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
                 Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
@@ -1709,6 +1717,9 @@ where
                 }
                 None => {
                     process_scope.stop()?;
+                    if process_scope.has_active_processes() {
+                        let _ = (&mut probe).await;
+                    }
                     bail!("worker command channel closed while probing input");
                 }
             }
@@ -1931,8 +1942,26 @@ async fn run_multiplex_crf(
     commands: &mut UnboundedReceiver<JobCommand>,
     output: &UnboundedSender<MultiplexOutput>,
 ) -> Result<WorkerJobOutcome> {
-    let crf_config = job.crf_search_config()?;
     let process_scope = ProcessScope::new(job.assignment.job_id.clone());
+    process_scope
+        .run(run_multiplex_crf_inner(
+            job,
+            probe,
+            commands,
+            output,
+            &process_scope,
+        ))
+        .await
+}
+
+async fn run_multiplex_crf_inner(
+    job: &WorkerJob,
+    probe: Arc<Ffprobe>,
+    commands: &mut UnboundedReceiver<JobCommand>,
+    output: &UnboundedSender<MultiplexOutput>,
+    process_scope: &ProcessScope,
+) -> Result<WorkerJobOutcome> {
+    let crf_config = job.crf_search_config()?;
     let mut run = std::pin::pin!(crf_search::run(crf_config, probe));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1940,6 +1969,7 @@ async fn run_multiplex_crf(
 
     loop {
         tokio::select! {
+            biased;
             _ = heartbeat.tick() => {
                 let _ = multiplex_event(
                     output,
@@ -1950,12 +1980,21 @@ async fn run_multiplex_crf(
             }
             command = commands.recv() => match command {
                 Some(JobCommand::Cancel(cancel)) => {
+                    process_scope.stop()?;
+                    if process_scope.has_active_processes() {
+                        while run.next().await.is_some() {}
+                    }
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
                 Some(JobCommand::Control(control)) => {
                     if let Some(outcome) =
-                        apply_job_control(job, &control, output, Some(&process_scope), &mut paused)?
+                        apply_job_control(job, &control, output, Some(process_scope), &mut paused)?
                     {
+                        if outcome == WorkerJobOutcome::Stopped
+                            && process_scope.has_active_processes()
+                        {
+                            while run.next().await.is_some() {}
+                        }
                         return Ok(outcome);
                     }
                 }
@@ -2034,8 +2073,28 @@ async fn run_multiplex_encode_with_heartbeat_interval(
     output: &UnboundedSender<MultiplexOutput>,
     heartbeat_interval: Duration,
 ) -> Result<WorkerJobOutcome> {
-    let config = job.encode_config()?;
     let process_scope = ProcessScope::new(job.assignment.job_id.clone());
+    process_scope
+        .run(run_multiplex_encode_inner(
+            job,
+            probe,
+            commands,
+            output,
+            heartbeat_interval,
+            &process_scope,
+        ))
+        .await
+}
+
+async fn run_multiplex_encode_inner(
+    job: &WorkerJob,
+    probe: Arc<Ffprobe>,
+    commands: &mut UnboundedReceiver<JobCommand>,
+    output: &UnboundedSender<MultiplexOutput>,
+    heartbeat_interval: Duration,
+    process_scope: &ProcessScope,
+) -> Result<WorkerJobOutcome> {
+    let config = job.encode_config()?;
     let _ = multiplex_event(
         output,
         &job.assignment.job_id,
@@ -2093,6 +2152,7 @@ async fn run_multiplex_encode_with_heartbeat_interval(
     let mut paused = false;
     loop {
         tokio::select! {
+            biased;
             _ = heartbeat.tick() => {
                 let _ = multiplex_event(
                     output,
@@ -2151,12 +2211,21 @@ async fn run_multiplex_encode_with_heartbeat_interval(
             }
             command = commands.recv() => match command {
                 Some(JobCommand::Cancel(cancel)) => {
+                    process_scope.stop()?;
+                    if process_scope.has_active_processes() {
+                        let _ = (&mut run).await;
+                    }
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
                 Some(JobCommand::Control(control)) => {
                     if let Some(outcome) =
-                        apply_job_control(job, &control, output, Some(&process_scope), &mut paused)?
+                        apply_job_control(job, &control, output, Some(process_scope), &mut paused)?
                     {
+                        if outcome == WorkerJobOutcome::Stopped
+                            && process_scope.has_active_processes()
+                        {
+                            let _ = (&mut run).await;
+                        }
                         return Ok(outcome);
                     }
                 }
