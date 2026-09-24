@@ -14,14 +14,16 @@ use crate::process::{ProcessExitError, managed::ProcessScope};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    any::Any,
     collections::{HashMap, VecDeque},
     fs, io,
     io::Read,
     num::NonZeroU64,
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
@@ -1508,9 +1510,14 @@ async fn run_multiplex_job(
     let job_id = job.assignment.job_id.clone();
     let mut cleanup_guard = WorkerInputCleanup::new(&job);
     let process_scope = ProcessScope::new(job_id.clone());
-    let result = process_scope
-        .run(run_multiplex_job_inner(&job, &mut commands, &output))
-        .await;
+    let result = observe_multiplex_job(
+        &process_scope,
+        run_multiplex_job_inner(&job, &mut commands, &output),
+    )
+    .await;
+    if result.is_err() {
+        let _ = process_scope.stop();
+    }
     match cleanup_multiplex_worker_input(&job, &result) {
         Ok(()) => cleanup_guard.disarm(),
         Err(error) => {
@@ -1522,6 +1529,34 @@ async fn run_multiplex_job(
         }
     }
     let _ = output.send(MultiplexOutput::Done { job_id, result });
+}
+
+async fn observe_multiplex_job<F>(
+    process_scope: &ProcessScope,
+    future: F,
+) -> Result<WorkerJobOutcome>
+where
+    F: std::future::Future<Output = Result<WorkerJobOutcome>>,
+{
+    match AssertUnwindSafe(process_scope.run(future))
+        .catch_unwind()
+        .await
+    {
+        Ok(result) => result,
+        Err(payload) => Err(anyhow!(
+            "worker job panicked: {}",
+            panic_message(payload.as_ref())
+        )),
+    }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
+        .to_owned()
 }
 
 struct WorkerInputCleanup {
@@ -4765,6 +4800,24 @@ mod tests {
     struct WorkerTestConfig {
         once: bool,
         protocol_version: u64,
+    }
+
+    #[tokio::test]
+    async fn multiplex_job_panics_become_failure_results() {
+        let scope = ProcessScope::new("panic-test");
+        let result = observe_multiplex_job(&scope, async {
+            panic!("fixture panic");
+            #[allow(unreachable_code)]
+            Ok(WorkerJobOutcome::Completed)
+        })
+        .await;
+
+        assert_eq!(
+            result
+                .expect_err("panic should become a worker failure")
+                .to_string(),
+            "worker job panicked: fixture panic"
+        );
     }
 
     impl WorkerTestConfig {
