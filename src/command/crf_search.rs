@@ -18,6 +18,7 @@ use crate::{
     console_ext::style,
     ffprobe::{self, Ffprobe},
     float::TerseF32,
+    process::managed::ProcessScope,
 };
 use anyhow::Context;
 use clap::{ArgAction, Parser};
@@ -206,6 +207,7 @@ pub struct CrfSearchConfig {
     pub sample: args::Sample,
     pub scoring: sample_encode::ScoringConfig,
     pub verbose: clap_verbosity_flag::Verbosity,
+    pub process_scope: Option<ProcessScope>,
 }
 
 impl CrfSearchConfig {
@@ -266,6 +268,7 @@ impl From<Args> for CrfSearchConfig {
                 xpsnr_opts: xpsnr.into(),
             },
             verbose,
+            process_scope: None,
         }
     }
 }
@@ -476,6 +479,7 @@ pub fn run(
         cache,
         scoring,
         verbose: _,
+        process_scope,
     }: CrfSearchConfig,
     input_probe: Arc<Ffprobe>,
 ) -> impl Stream<Item = Result<Update, Error>> {
@@ -522,6 +526,7 @@ pub fn run(
             cache,
             stdout_format: sample_encode::StdoutFormat::Human,
             scoring,
+            process_scope: process_scope.clone(),
         };
 
         let mut crf_attempts = Vec::new();

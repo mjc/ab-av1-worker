@@ -19,7 +19,7 @@ use crate::{
     ffmpeg::{self, FfmpegEncodeArgs, remove_all_args},
     ffprobe::{self, Ffprobe},
     log::ProgressLogger,
-    process::FfmpegOut,
+    process::{FfmpegOut, managed::ProcessScope},
     sample, temporary,
     vmaf::{self, VmafOut},
     xpsnr::{self, XpsnrOut},
@@ -110,6 +110,7 @@ pub struct SampleEncodeConfig {
     pub cache: bool,
     pub stdout_format: StdoutFormat,
     pub scoring: ScoringConfig,
+    pub process_scope: Option<ProcessScope>,
 }
 
 impl From<Args> for SampleEncodeConfig {
@@ -138,6 +139,7 @@ impl From<Args> for SampleEncodeConfig {
                 xpsnr,
                 xpsnr_opts: xpsnr_opts.into(),
             },
+            process_scope: None,
         }
     }
 }
@@ -211,6 +213,7 @@ pub fn run(
         cache,
         stdout_format: _,
         scoring,
+        process_scope,
     }: SampleEncodeConfig,
     input_probe: Arc<Ffprobe>,
 ) -> impl Stream<Item = anyhow::Result<Update>> {
@@ -244,7 +247,7 @@ pub fn run(
         let (tx, mut sample_tasks) = tokio::sync::mpsc::unbounded_channel();
         let sample_temp = temp_dir.clone();
         let sample_in = input.clone();
-        let sample_task = tokio::task::spawn_local(async move {
+        let copy_samples = async move {
             if full_pass {
                 // Use the entire video as a single sample
                 let _ = tx.send((0, Ok((sample_in.clone(), input_len))));
@@ -261,6 +264,13 @@ pub fn run(
                         break;
                     }
                 }
+            }
+        };
+        let sample_task = tokio::task::spawn_local(async move {
+            if let Some(scope) = process_scope {
+                scope.run(copy_samples).await;
+            } else {
+                copy_samples.await;
             }
         });
 

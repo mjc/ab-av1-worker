@@ -1989,7 +1989,8 @@ async fn run_multiplex_crf_inner(
     output: &UnboundedSender<MultiplexOutput>,
     process_scope: &ProcessScope,
 ) -> Result<WorkerJobOutcome> {
-    let crf_config = job.crf_search_config()?;
+    let mut crf_config = job.crf_search_config()?;
+    crf_config.process_scope = Some(process_scope.clone());
     let mut run = std::pin::pin!(crf_search::run(crf_config, probe));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
