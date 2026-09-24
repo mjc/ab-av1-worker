@@ -27,7 +27,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -1892,14 +1892,6 @@ async fn receive_multiplex_input(
         }
 
         tokio::select! {
-            _ = heartbeat.tick() => {
-                let _ = multiplex_event(
-                    output,
-                    &job.assignment.job_id,
-                    ClientEvent::Heartbeat(heartbeat_payload(&job.input_dir, Some(job.assignment.video_id))),
-                    "heartbeat",
-                );
-            }
             command = commands.recv() => match command {
                 Some(command @ (JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)))
                     if paused =>
@@ -2006,14 +1998,6 @@ async fn run_multiplex_crf_inner(
     loop {
         tokio::select! {
             biased;
-            _ = heartbeat.tick() => {
-                let _ = multiplex_event(
-                    output,
-                    &job.assignment.job_id,
-                    ClientEvent::Heartbeat(heartbeat_payload(&job.input_dir, Some(job.assignment.video_id))),
-                    "heartbeat",
-                );
-            }
             command = commands.recv() => match command {
                 Some(JobCommand::Cancel(cancel)) => {
                     process_scope.stop()?;
@@ -2182,6 +2166,12 @@ async fn run_multiplex_encode_inner(
             "encode_progress",
         );
     });
+    let run_started = Arc::new(AtomicBool::new(false));
+    let run_started_for_future = Arc::clone(&run_started);
+    let run = async move {
+        run_started_for_future.store(true, Ordering::Release);
+        run.await
+    };
     tokio::pin!(run);
     let mut heartbeat = tokio::time::interval(heartbeat_interval);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2189,6 +2179,32 @@ async fn run_multiplex_encode_inner(
     loop {
         tokio::select! {
             biased;
+            command = commands.recv() => match command {
+                Some(JobCommand::Cancel(cancel)) => {
+                    process_scope.stop()?;
+                    if process_scope.has_active_processes() {
+                        let _ = (&mut run).await;
+                    }
+                    bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
+                }
+                Some(JobCommand::Control(control)) => {
+                    if let Some(outcome) =
+                        apply_job_control(job, &control, output, Some(process_scope), &mut paused)?
+                    {
+                        if outcome == WorkerJobOutcome::Stopped
+                            && process_scope.has_active_processes()
+                        {
+                            let _ = (&mut run).await;
+                        }
+                        return Ok(outcome);
+                    }
+                }
+                Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
+                Some(JobCommand::TransferFailed(failure)) => {
+                    bail!("worker input transfer failed for job {} at {:?}: {}", failure.job_id, failure.stage, failure.reason);
+                }
+                None => bail!("worker command channel closed while running encode"),
+            },
             _ = heartbeat.tick() => {
                 let _ = multiplex_event(
                     output,
@@ -2197,7 +2213,7 @@ async fn run_multiplex_encode_inner(
                     "heartbeat",
                 );
             }
-            result = &mut run => {
+            result = &mut run, if !paused || run_started.load(Ordering::Acquire) => {
                 let (output_path, finished) = result?;
                 let output_bytes = finished.metrics.output_bytes;
                 let output_percent = finished.metrics.percent;
@@ -2219,6 +2235,7 @@ async fn run_multiplex_encode_inner(
                         output_bytes,
                         commands,
                         output,
+                        paused,
                     )
                     .await?
                     {
@@ -2245,32 +2262,6 @@ async fn run_multiplex_encode_inner(
                 );
                 return Ok(WorkerJobOutcome::Completed);
             }
-            command = commands.recv() => match command {
-                Some(JobCommand::Cancel(cancel)) => {
-                    process_scope.stop()?;
-                    if process_scope.has_active_processes() {
-                        let _ = (&mut run).await;
-                    }
-                    bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
-                }
-                Some(JobCommand::Control(control)) => {
-                    if let Some(outcome) =
-                        apply_job_control(job, &control, output, Some(process_scope), &mut paused)?
-                    {
-                        if outcome == WorkerJobOutcome::Stopped
-                            && process_scope.has_active_processes()
-                        {
-                            let _ = (&mut run).await;
-                        }
-                        return Ok(outcome);
-                    }
-                }
-               Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
-                Some(JobCommand::TransferFailed(failure)) => {
-                    bail!("worker input transfer failed for job {} at {:?}: {}", failure.job_id, failure.stage, failure.reason);
-                }
-               None => bail!("worker command channel closed while running encode"),
-            }
         }
     }
 }
@@ -2282,11 +2273,15 @@ async fn upload_multiplex_output(
     output_bytes: u64,
     commands: &mut UnboundedReceiver<JobCommand>,
     output: &UnboundedSender<MultiplexOutput>,
+    initially_paused: bool,
 ) -> Result<Option<WorkerJobOutcome>> {
     let output_path = output_path.to_path_buf();
     let transfer = transfer.clone();
     let job_id = job.assignment.job_id.clone();
     let gate = Arc::new(TransferGate::running());
+    if initially_paused {
+        gate.set(ControlState::Paused);
+    }
     let copy_gate = Arc::clone(&gate);
     let upload = tokio::task::spawn_blocking(move || -> Result<()> {
         let file = fs::File::open(&output_path).with_context(|| {
@@ -5991,6 +5986,7 @@ mod tests {
                 4 * 1024 * 1024,
                 &mut command_receiver,
                 &output,
+                false,
             )
             .await?,
             Some(WorkerJobOutcome::Stopped)
@@ -6072,6 +6068,12 @@ mod tests {
             Duration::from_millis(1),
         ));
 
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Pause,
+            video_id: Some(123),
+            job_id: Some("heartbeat-job".into()),
+            command_id: Some("pause-before-encode".into()),
+        }))?;
         assert!(matches!(
             tokio::select! {
                 item = outputs.recv() => item,
@@ -6082,6 +6084,37 @@ mod tests {
                 ..
             })
         ));
+        let paused = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                match outputs.recv().await {
+                    Some(MultiplexOutput::Event {
+                        event:
+                            ClientEvent::ControlState(ControlStatePayload {
+                                state: ControlState::Paused,
+                                ..
+                            }),
+                        ..
+                    }) => break true,
+                    Some(_) => continue,
+                    None => break false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(paused, "pause must be acknowledged before encode starts");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut run)
+                .await
+                .is_err(),
+            "paused encode must not advance before resume"
+        );
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Resume,
+            video_id: Some(123),
+            job_id: Some("heartbeat-job".into()),
+            command_id: Some("resume-before-encode".into()),
+        }))?;
         let heartbeat = tokio::time::timeout(Duration::from_millis(100), async {
             loop {
                 tokio::select! {
