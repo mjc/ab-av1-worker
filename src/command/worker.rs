@@ -43,6 +43,7 @@ use tracing::{debug, info, trace, warn};
 
 const PHOENIX_VSN: &str = "2.0.0";
 const SUPPORTED_PROTOCOL_VERSION: u64 = 1;
+const RECONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TRANSFER_CHUNK_MAGIC: &[u8; 4] = b"RAV1";
 const TRANSFER_CHUNK_VERSION: u8 = 1;
 const TRANSFER_CHUNK_TYPE: u8 = 1;
@@ -3590,8 +3591,12 @@ async fn run_multiplexed_worker(
                     handle_multiplex_output_offline(item, &mut jobs, &mut pending)?;
                 }
                 _ = reconnect.tick() => {
-                    match ConnectedWorker::connect(config).await {
-                        Ok(candidate) => {
+                    let handshake_timeout = runtime.offline_job_timeout.min(RECONNECT_HANDSHAKE_TIMEOUT);
+                    match tokio::time::timeout(handshake_timeout, ConnectedWorker::connect(config)).await {
+                        Err(_) => {
+                            trace!(?handshake_timeout, "multiplexed worker reconnect handshake timed out");
+                        }
+                        Ok(Ok(candidate)) => {
                             let worker_id = candidate.assigned_worker_id.clone();
                             let mut candidate = MultiplexedWorker::from_connected(candidate);
                             pending_acks.clear();
@@ -3617,7 +3622,7 @@ async fn run_multiplexed_worker(
                                 heartbeat.tick().await;
                             }
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             trace!(error = %error, "multiplexed worker reconnect attempt failed");
                         }
                     }
