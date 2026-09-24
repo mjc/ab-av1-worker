@@ -380,7 +380,7 @@ impl WorkerConfig {
 fn initial_pull_work_payload(mode: WorkerMode) -> PullWorkPayload {
     PullWorkPayload {
         input_missing: false,
-        job_type: (mode != WorkerMode::CrfSearch).then_some(match mode {
+        job_type: Some(match mode {
             WorkerMode::CrfSearch | WorkerMode::Both | WorkerMode::Weighted => JobKind::CrfSearch,
             WorkerMode::Encode => JobKind::Encode,
         }),
@@ -3138,13 +3138,11 @@ pub async fn worker(config: WorkerConfig) -> Result<()> {
 
 async fn run_worker_until(config: &WorkerConfig, runtime: WorkerRuntime) -> Result<()> {
     let mut completed_pulls = 0usize;
-    let mut control_state = WorkerControlState::Running;
     let mut reconnect_backoff =
         ReconnectBackoff::new(runtime.reconnect_base_delay, runtime.reconnect_max_delay);
 
     loop {
-        match run_connected_worker(config, runtime, &mut completed_pulls, &mut control_state).await
-        {
+        match run_connected_worker(config, runtime, &mut completed_pulls).await {
             Ok(()) => {
                 reconnect_backoff.reset();
                 return Ok(());
@@ -3246,244 +3244,8 @@ async fn run_connected_worker(
     config: &WorkerConfig,
     runtime: WorkerRuntime,
     completed_pulls: &mut usize,
-    control_state: &mut WorkerControlState,
 ) -> Result<()> {
-    if config.worker_mode != WorkerMode::CrfSearch {
-        return run_multiplexed_worker(config, runtime, completed_pulls).await;
-    }
-
-    debug!(
-        connect = %config.connect,
-        worker_id = %config.worker_id,
-        once = config.once,
-        local_path = ?config.local_path,
-        "connecting worker"
-    );
-    let mut worker = Some(ConnectedWorker::connect(config).await?);
-    let mut pending_job: Option<PendingJob> = None;
-    let mut requested_job_type = initial_pull_work_payload(config.worker_mode).job_type;
-
-    if *control_state != WorkerControlState::Running {
-        let reported_state = match control_state {
-            WorkerControlState::Paused => ControlState::Paused,
-            WorkerControlState::Stopped => ControlState::Stopped,
-            WorkerControlState::Running => unreachable!(),
-        };
-        worker
-            .as_mut()
-            .expect("connected worker")
-            .send_control_state(reported_state, None)
-            .await?;
-    }
-
-    loop {
-        if *control_state != WorkerControlState::Running {
-            let stopped = worker
-                .as_mut()
-                .expect("connected worker")
-                .wait_until_running(control_state, runtime.idle_delay)
-                .await?;
-            if stopped {
-                remove_pending_worker_input(&mut pending_job)?;
-            }
-        }
-
-        if pending_job.is_some() {
-            let next = {
-                let job = pending_job.as_mut().expect("pending job");
-                trace!(
-                    job_id = %job.job.assignment.job_id,
-                    input = %job.input_path().display(),
-                    "waiting for pending job input"
-                );
-                worker
-                    .as_mut()
-                    .expect("connected worker")
-                    .wait_for_pending_job(job, runtime.idle_delay)
-                    .await?
-            };
-
-            match next {
-                PendingJobOutcome::Waiting => {
-                    debug!(
-                        job_id = %pending_job.as_ref().expect("pending job").job.assignment.job_id,
-                        received_bytes = pending_job
-                            .as_ref()
-                            .and_then(|job| job.receiver.as_ref().map(ChunkReceiver::received_bytes))
-                            .unwrap_or_default(),
-                        "pending job still waiting"
-                    );
-                    continue;
-                }
-                PendingJobOutcome::Canceled => {
-                    if let Some(job) = pending_job.as_ref() {
-                        debug!(job_id = %job.job.assignment.job_id, "pending job canceled");
-                    }
-                    remove_pending_worker_input(&mut pending_job)?;
-                    continue;
-                }
-                PendingJobOutcome::Paused => {
-                    *control_state = WorkerControlState::Paused;
-                    continue;
-                }
-                PendingJobOutcome::Stopped => {
-                    remove_pending_worker_input(&mut pending_job)?;
-                    *control_state = WorkerControlState::Stopped;
-                    continue;
-                }
-                PendingJobOutcome::Ready => {
-                    let job = pending_job.take().expect("pending job");
-                    debug!(
-                        job_id = %job.job.assignment.job_id,
-                        input = %job.input_path().display(),
-                        "pending job input arrived"
-                    );
-                    if run_worker_job_and_publish(config, &mut worker, &job.job).await?
-                        == WorkerJobOutcome::Stopped
-                    {
-                        *control_state = WorkerControlState::Stopped;
-                    }
-                    continue;
-                }
-            }
-        }
-
-        debug!("requesting work");
-        let worker_ref = worker.as_mut().expect("connected worker");
-        let work_status = match requested_job_type {
-            Some(job_type) => worker_ref.request_work_kind(job_type).await?,
-            None => worker_ref.request_work().await?,
-        };
-        for control in worker_ref.take_pending_controls() {
-            match control.action {
-                ControlAction::Stop => {
-                    worker_ref
-                        .send_control_state_for(ControlState::Stopped, None, Some(&control))
-                        .await?;
-                    *control_state = WorkerControlState::Stopped;
-                    continue;
-                }
-                ControlAction::Pause => {
-                    worker_ref
-                        .send_control_state_for(ControlState::Paused, None, Some(&control))
-                        .await?;
-                    *control_state = WorkerControlState::Paused;
-                    continue;
-                }
-                ControlAction::Resume | ControlAction::Start => {
-                    worker_ref
-                        .send_control_state_for(ControlState::Running, None, Some(&control))
-                        .await?;
-                }
-            }
-        }
-        requested_job_type = match &work_status {
-            ServerReply::NoWork(_) => requested_job_type
-                .and_then(|kind| next_job_type_after_no_work(config.worker_mode, kind)),
-            ServerReply::JobAssigned(_) => initial_pull_work_payload(config.worker_mode).job_type,
-        };
-        *completed_pulls += 1;
-        let status = work_status_label(&work_status);
-        println!(
-            "connected worker {} via {} and received {}",
-            worker_ref.assigned_worker_id, worker_ref.negotiated_protocol_version, status
-        );
-
-        if let ServerReply::JobAssigned(assignment) = work_status {
-            let job = build_worker_job(assignment, config.local_path.as_deref())?;
-            debug!(
-                job_id = %job.assignment.job_id,
-                status = %job.assignment.status.as_str(),
-                input = %job.input_path().display(),
-                already_present = job.input_path().exists(),
-                pending_transfer = job.assignment.status == WorkStatus::JobAssigned
-                    && !job.input_path().exists()
-                    && config.local_path.is_none(),
-                "job assigned"
-            );
-            if let Some(current_worker) = worker.as_mut() {
-                current_worker
-                    .send_event(ClientEvent::Heartbeat(heartbeat_payload(
-                        &job.input_dir,
-                        Some(job.assignment.video_id),
-                    )))
-                    .await?;
-            }
-            let phase = worker_job_phase(&job, config.local_path.as_deref())?;
-            match phase {
-                WorkerJobPhase::InputReady | WorkerJobPhase::CrfSearching => {
-                    debug!(
-                        job_id = %job.assignment.job_id,
-                        input = %job.input_path().display(),
-                        phase = ?phase,
-                        "input already present, starting job"
-                    );
-                    if run_worker_job_and_publish(config, &mut worker, &job).await?
-                        == WorkerJobOutcome::Stopped
-                    {
-                        *control_state = WorkerControlState::Stopped;
-                    }
-                }
-                WorkerJobPhase::AwaitingInput(delivery) => {
-                    let pending = match delivery {
-                        InputDelivery::Http => {
-                            match download_or_wait_for_input(
-                                worker.as_mut().expect("connected worker"),
-                                &job,
-                                config.local_path.as_deref(),
-                            )
-                            .await?
-                            {
-                                None => {
-                                    debug!(
-                                        job_id = %job.assignment.job_id,
-                                        input = %job.input_path().display(),
-                                        "downloaded worker input over HTTP, starting job"
-                                    );
-                                    if run_worker_job_and_publish(config, &mut worker, &job).await?
-                                        == WorkerJobOutcome::Stopped
-                                    {
-                                        *control_state = WorkerControlState::Stopped;
-                                    }
-                                    None
-                                }
-                                Some(pending) => Some(pending),
-                            }
-                        }
-                        InputDelivery::Resend => Some(
-                            request_pending_input(
-                                worker.as_mut().expect("connected worker"),
-                                &job,
-                                config.local_path.as_deref(),
-                            )
-                            .await?,
-                        ),
-                        InputDelivery::Websocket => Some(PendingJob::waiting(job)),
-                    };
-
-                    if let Some(pending) = pending {
-                        debug!(
-                            job_id = %pending.job.assignment.job_id,
-                            input = %pending.input_path().display(),
-                            temp_dir = %pending.job.input_dir.display(),
-                            phase = ?phase,
-                            receiver_ready = false,
-                            pending_job = true,
-                            "waiting for worker input"
-                        );
-                        pending_job = Some(pending);
-                    }
-                }
-            }
-            continue;
-        }
-
-        if runtime.max_pulls == Some(*completed_pulls) {
-            return Ok(());
-        }
-
-        tokio::time::sleep(runtime.idle_delay).await;
-    }
+    run_multiplexed_worker(config, runtime, completed_pulls).await
 }
 
 async fn run_multiplexed_worker(
@@ -5245,7 +5007,10 @@ mod tests {
     fn worker_mode_selects_only_its_requested_job_kind() {
         assert_eq!(
             initial_pull_work_payload(WorkerMode::CrfSearch),
-            PullWorkPayload::default()
+            PullWorkPayload {
+                input_missing: false,
+                job_type: Some(JobKind::CrfSearch),
+            }
         );
         assert_eq!(
             initial_pull_work_payload(WorkerMode::Encode).job_type,
@@ -6781,7 +6546,6 @@ mod tests {
         }
         .worker_config(WorkerTestConfig::continuous());
         let mut completed_pulls = 0;
-        let mut control_state = WorkerControlState::Running;
         let error = run_connected_worker(
             &config,
             WorkerRuntime {
@@ -6792,7 +6556,6 @@ mod tests {
                 max_pulls: None,
             },
             &mut completed_pulls,
-            &mut control_state,
         )
         .await
         .expect_err("server closes after resend assignment");
@@ -8124,7 +7887,15 @@ mod tests {
         R: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
             + Unpin,
     {
-        expect_pull_work_payload(reader, request_ref, PullWorkPayload::default()).await;
+        expect_pull_work_payload(
+            reader,
+            request_ref,
+            PullWorkPayload {
+                input_missing: false,
+                job_type: Some(JobKind::CrfSearch),
+            },
+        )
+        .await;
     }
 
     async fn expect_pull_work_payload<R>(reader: &mut R, request_ref: u64, payload: PullWorkPayload)
@@ -8381,7 +8152,15 @@ mod tests {
         send_announce_reply(&mut writer).await;
 
         for request_ref in 3..(3 + no_work_replies as u64) {
-            expect_pull_work(&mut reader, request_ref).await;
+            expect_pull_work_payload(
+                &mut reader,
+                request_ref,
+                PullWorkPayload {
+                    input_missing: false,
+                    job_type: Some(JobKind::CrfSearch),
+                },
+            )
+            .await;
             send_no_work_reply(&mut writer, request_ref).await;
         }
     }
