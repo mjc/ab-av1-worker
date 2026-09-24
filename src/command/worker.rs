@@ -3801,6 +3801,7 @@ fn handle_multiplex_frame(
                         return Ok(true);
                     }
                     Err(error) => {
+                        discard_rejected_terminal_event(&ack, jobs, pending);
                         warn!(
                             job_id = %ack.job_id,
                             event = ack.name,
@@ -3958,6 +3959,21 @@ fn acknowledge_multiplex_event(
         .get(&ack.job_id)
         .is_some_and(|job| job.finished && terminal_event_name(job) == Some(ack.name))
     {
+        jobs.remove(&ack.job_id);
+        pending.retain(|_, (_, resend)| resend.as_deref() != Some(&ack.job_id));
+    }
+}
+
+fn discard_rejected_terminal_event(
+    ack: &PendingEventAck,
+    jobs: &mut HashMap<String, MultiplexJob>,
+    pending: &mut HashMap<String, (JobKind, Option<String>)>,
+) {
+    let is_terminal = jobs
+        .get(&ack.job_id)
+        .is_some_and(|job| job.finished && terminal_event_name(job) == Some(ack.name));
+
+    if is_terminal {
         jobs.remove(&ack.job_id);
         pending.retain(|_, (_, resend)| resend.as_deref() != Some(&ack.job_id));
     }
@@ -6177,9 +6193,15 @@ mod tests {
 
         let replacement = async move {
             tokio::time::sleep(Duration::from_millis(5)).await;
-            let listener = TcpListener::bind(address)
-                .await
-                .expect("bind replacement coordinator");
+            let listener = loop {
+                match TcpListener::bind(address).await {
+                    Ok(listener) => break listener,
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(error) => panic!("bind replacement coordinator: {error}"),
+                }
+            };
             serve_no_work_session(listener, 1).await;
         };
 
@@ -6256,6 +6278,65 @@ mod tests {
 
         assert!(connection_is_alive);
         assert!(pending_acks.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_terminal_event_does_not_leave_finished_job_in_scheduler() -> Result<()> {
+        let (command, _commands) = mpsc::unbounded_channel();
+        let job_id = "crf-rejected";
+        let job = probe_phase_job(job_id);
+        let video_id = job.assignment.video_id;
+        let mut jobs = HashMap::from([(
+            job_id.into(),
+            MultiplexJob {
+                job,
+                command,
+                state: WorkerJobReportState {
+                    crf_completed: Some(CrfSearchCompletedPayload {
+                        job_id: job_id.into(),
+                        video_id,
+                        result: "ok".into(),
+                        chosen_crf: 30.0,
+                        results: Vec::new(),
+                    }),
+                    ..WorkerJobReportState::default()
+                },
+                finished: true,
+            },
+        )]);
+        let mut pending = HashMap::new();
+        let mut no_work = HashMap::new();
+        let mut pending_acks = HashMap::from([(
+            "4".into(),
+            PendingEventAck::new(job_id, "crf_search_completed"),
+        )]);
+        let mut scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(1).unwrap());
+        let (output, _outputs) = mpsc::unbounded_channel();
+        let mut completed_pulls = 0;
+        let frame = Message::Text(
+            (serde_json::to_string(&ServerFrame::reply(
+                4,
+                ReplyBody::error(ErrorReplyPayload::new("stale worker attempt")),
+            ))?)
+            .into(),
+        );
+
+        let connection_is_alive = handle_multiplex_frame(
+            decode_worker_frame(Some(Ok(frame))).map(|frame| frame.expect("text worker frame")),
+            &mut jobs,
+            &mut pending,
+            &mut no_work,
+            &mut pending_acks,
+            &mut scheduler,
+            &output,
+            &mut completed_pulls,
+            None,
+        )?;
+
+        assert!(connection_is_alive);
+        assert!(pending_acks.is_empty());
+        assert!(!jobs.contains_key(job_id));
         Ok(())
     }
 
