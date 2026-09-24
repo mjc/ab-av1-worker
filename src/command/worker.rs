@@ -1328,6 +1328,7 @@ enum WorkerPush {
     Cancel(CancelPayload),
     Control(ControlPayload),
     Started(TransferStartedPayload),
+    TransferFailed(TransferFailurePayload),
 }
 
 #[derive(Debug)]
@@ -1357,6 +1358,7 @@ type WorkerReader = SplitStream<WorkerSocket>;
 enum JobCommand {
     TransferStarted(TransferStartedPayload),
     TransferChunk(TransferChunk),
+    TransferFailed(TransferFailurePayload),
     Control(ControlPayload),
     Cancel(CancelPayload),
 }
@@ -1682,6 +1684,9 @@ where
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
                 Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
+                Some(JobCommand::TransferFailed(failure)) => {
+                    bail!("worker input transfer failed for job {} at {:?}: {}", failure.job_id, failure.stage, failure.reason);
+                }
                 None => {
                     process_scope.stop()?;
                     bail!("worker command channel closed while probing input");
@@ -1784,6 +1789,11 @@ async fn download_multiplex_input(
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
                 Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
+                Some(JobCommand::TransferFailed(failure)) => {
+                    gate.set(ControlState::Stopped);
+                    let _ = (&mut copy).await;
+                    bail!("worker input transfer failed for job {} at {:?}: {}", failure.job_id, failure.stage, failure.reason);
+                }
                 None => {
                     gate.set(ControlState::Stopped);
                     let _ = (&mut copy).await;
@@ -1844,6 +1854,9 @@ async fn receive_multiplex_input(
                         return Ok(Some(outcome));
                     }
                 }
+                Some(JobCommand::TransferFailed(failure)) => {
+                    bail!("worker input transfer failed for job {} at {:?}: {}", failure.job_id, failure.stage, failure.reason);
+                }
                 None => bail!("worker command channel closed while receiving input"),
             }
         }
@@ -1876,6 +1889,14 @@ fn apply_input_command(
                 pending.finish()?;
                 return Ok(true);
             }
+        }
+        JobCommand::TransferFailed(failure) => {
+            bail!(
+                "worker input transfer failed for job {} at {:?}: {}",
+                failure.job_id,
+                failure.stage,
+                failure.reason
+            );
         }
         JobCommand::Cancel(_) | JobCommand::Control(_) => {
             unreachable!("only input transfer commands are deferred")
@@ -1918,8 +1939,11 @@ async fn run_multiplex_crf(
                         return Ok(outcome);
                     }
                 }
-                Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
-                None => bail!("worker command channel closed while running CRF search"),
+               Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
+                Some(JobCommand::TransferFailed(failure)) => {
+                    bail!("worker input transfer failed for job {} at {:?}: {}", failure.job_id, failure.stage, failure.reason);
+                }
+               None => bail!("worker command channel closed while running CRF search"),
             },
             update = run.next(), if !paused => {
                 match update {
@@ -2116,8 +2140,11 @@ async fn run_multiplex_encode_with_heartbeat_interval(
                         return Ok(outcome);
                     }
                 }
-                Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
-                None => bail!("worker command channel closed while running encode"),
+               Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
+                Some(JobCommand::TransferFailed(failure)) => {
+                    bail!("worker input transfer failed for job {} at {:?}: {}", failure.job_id, failure.stage, failure.reason);
+                }
+               None => bail!("worker command channel closed while running encode"),
             }
         }
     }
@@ -2177,8 +2204,11 @@ async fn upload_multiplex_output(
                     let _ = (&mut upload).await;
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
-                Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
-                None => {
+               Some(JobCommand::TransferStarted(_) | JobCommand::TransferChunk(_)) => {}
+                Some(JobCommand::TransferFailed(failure)) => {
+                    bail!("worker input transfer failed for job {} at {:?}: {}", failure.job_id, failure.stage, failure.reason);
+                }
+               None => {
                     gate.set(ControlState::Stopped);
                     let _ = (&mut upload).await;
                     bail!("worker command channel closed while uploading output");
@@ -2380,6 +2410,16 @@ impl ConnectedWorker {
                             cancel.job_id, cancel.reason
                         );
                         Ok(PendingJobOutcome::Canceled)
+                    }
+                    Ok(WorkerFrame::Push(WorkerPush::TransferFailed(failure)))
+                        if failure.job_id == pending_job.job().assignment.job_id =>
+                    {
+                        bail!(
+                            "worker input transfer failed for job {} at {:?}: {}",
+                            failure.job_id,
+                            failure.stage,
+                            failure.reason
+                        );
                     }
                     Ok(WorkerFrame::Push(WorkerPush::Started(started)))
                         if started.transfer_id == pending_job.job().assignment.job_id =>
@@ -3897,6 +3937,14 @@ fn handle_multiplex_frame(
             }
             Ok(true)
         }
+        WorkerFrame::Push(WorkerPush::TransferFailed(failure)) => {
+            if let Some(job) = jobs.get(&failure.job_id) {
+                job.command
+                    .send(JobCommand::TransferFailed(failure))
+                    .map_err(|_| anyhow!("worker input command channel closed"))?;
+            }
+            Ok(true)
+        }
         WorkerFrame::Ping(_) => Ok(true),
     }
 }
@@ -4259,6 +4307,10 @@ fn decode_worker_push(text: &str) -> Result<Option<WorkerPush>> {
         "transfer_started" => WorkerPush::Started(
             serde_json::from_value::<TransferStartedPayload>(payload.clone())
                 .with_context(|| format!("decode transfer started push event={}", frame.3))?,
+        ),
+        "transfer_failed" => WorkerPush::TransferFailed(
+            serde_json::from_value::<TransferFailurePayload>(payload.clone())
+                .with_context(|| format!("decode transfer failed push event={}", frame.3))?,
         ),
         _ => return Ok(None),
     };
@@ -6398,6 +6450,27 @@ mod tests {
                     command_id: None,
                 }
             ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn worker_decodes_transfer_failure_push() -> Result<()> {
+        let payload = TransferFailurePayload {
+            job_id: "crf-123".into(),
+            stage: TransferStage::ReceiveChunk,
+            retriable: true,
+            reason: "source unavailable".into(),
+        };
+        let text = serde_json::to_string(&ServerPushFrame::new("transfer_failed", payload))?;
+
+        assert!(matches!(
+            decode_worker_push(&text)?,
+            Some(WorkerPush::TransferFailed(TransferFailurePayload {
+                job_id,
+                retriable: true,
+                ..
+            })) if job_id == "crf-123"
         ));
         Ok(())
     }
