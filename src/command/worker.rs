@@ -3371,7 +3371,7 @@ async fn run_multiplexed_worker(
     let mut offline_deadline = None;
 
     loop {
-        if let Some(worker) = connection.as_mut() {
+        let schedule_ok = if let Some(worker) = connection.as_mut() {
             schedule_multiplex_pulls(
                 worker,
                 config.worker_mode,
@@ -3383,51 +3383,57 @@ async fn run_multiplexed_worker(
                 &mut *completed_pulls,
                 runtime.max_pulls,
             )
-            .await?;
-        }
+            .await?
+        } else {
+            true
+        };
 
-        let mut connection_lost = false;
-        if let Some(worker) = connection.as_mut() {
-            let event_ack_deadline = next_event_ack_deadline(&pending_acks, EVENT_ACK_TIMEOUT);
-            tokio::select! {
-                item = outputs.recv() => {
-                    connection_lost = !handle_multiplex_output(
-                        worker,
-                        item,
-                        &mut jobs,
-                        &mut pending,
-                        &mut pending_acks,
-                    ).await?;
-                }
-                frame = worker.next_frame() => {
-                    connection_lost = !handle_multiplex_frame(
-                        frame,
-                        &mut jobs,
-                        &mut pending,
-                        &mut no_work,
-                        &mut pending_acks,
-                        &mut scheduler,
-                        &output,
-                        completed_pulls,
-                        config.local_path.as_deref(),
-                    )?;
-                }
-                _ = heartbeat.tick() => {
-                    connection_lost = !send_multiplex_heartbeat(
-                        worker,
-                        &jobs,
-                        &mut pending_acks,
-                    ).await;
-                }
-                _ = wait_for_deadline(event_ack_deadline) => {
-                    warn!("worker channel acknowledgement timed out; reconnecting");
-                    connection_lost = true;
-                }
-                _ = reconnect.tick() => {
-                    no_work.clear();
+        let mut connection_lost = !schedule_ok;
+        if schedule_ok {
+            if let Some(worker) = connection.as_mut() {
+                let event_ack_deadline = next_event_ack_deadline(&pending_acks, EVENT_ACK_TIMEOUT);
+                tokio::select! {
+                        item = outputs.recv() => {
+                            connection_lost = !handle_multiplex_output(
+                                worker,
+                                item,
+                                &mut jobs,
+                                &mut pending,
+                                &mut pending_acks,
+                            ).await?;
+                        }
+                        frame = worker.next_frame() => {
+                            connection_lost = !handle_multiplex_frame(
+                                frame,
+                                &mut jobs,
+                                &mut pending,
+                                &mut no_work,
+                                &mut pending_acks,
+                                &mut scheduler,
+                                &output,
+                                completed_pulls,
+                                config.local_path.as_deref(),
+                            )?;
+                        }
+                        _ = heartbeat.tick() => {
+                            connection_lost = !send_multiplex_heartbeat(
+                                worker,
+                                &jobs,
+                                &mut pending_acks,
+                            ).await;
+                        }
+                        _ = wait_for_deadline(event_ack_deadline) => {
+                            warn!("worker channel acknowledgement timed out; reconnecting");
+                            connection_lost = true;
+                        }
+                        _ = reconnect.tick() => {
+                            no_work.clear();
+                    }
                 }
             }
-        } else {
+        }
+
+        if schedule_ok && connection.is_none() {
             tokio::select! {
                 item = outputs.recv() => {
                     let Some(item) = item else {
@@ -3609,7 +3615,7 @@ async fn schedule_multiplex_pulls(
     no_work: &HashMap<JobKind, bool>,
     completed_pulls: &mut usize,
     max_pulls: Option<usize>,
-) -> Result<()> {
+) -> Result<bool> {
     while jobs.len() + pending.len() < max_active_jobs
         && max_pulls.is_none_or(|max| *completed_pulls + pending.len() < max)
     {
@@ -3620,15 +3626,22 @@ async fn schedule_multiplex_pulls(
         else {
             break;
         };
-        let reference = worker
+        let reference = match worker
             .send_pull(PullWorkPayload {
                 input_missing: false,
                 job_type: Some(job_type),
             })
-            .await?;
+            .await
+        {
+            Ok(reference) => reference,
+            Err(error) => {
+                debug!(error = %error, "multiplexed pull request failed; reconnecting");
+                return Ok(false);
+            }
+        };
         pending.insert(reference, (job_type, None));
     }
-    Ok(())
+    Ok(true)
 }
 
 fn next_multiplex_job_type(
