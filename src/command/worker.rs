@@ -55,6 +55,10 @@ const HTTP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 const HTTP_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 static HEARTBEAT_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
+fn reconnect_handshake_timeout(offline_job_timeout: Duration) -> Duration {
+    offline_job_timeout.min(RECONNECT_HANDSHAKE_TIMEOUT)
+}
+
 #[derive(Debug)]
 struct TransferGate {
     state: Mutex<ControlState>,
@@ -2414,7 +2418,7 @@ async fn run_multiplexed_worker(
                     handle_multiplex_output_offline(item, &mut jobs, &mut pending)?;
                 }
                 _ = reconnect.tick() => {
-                    let handshake_timeout = runtime.offline_job_timeout.min(RECONNECT_HANDSHAKE_TIMEOUT);
+                    let handshake_timeout = reconnect_handshake_timeout(runtime.offline_job_timeout);
                     match tokio::time::timeout(handshake_timeout, ConnectedWorker::connect(config)).await {
                         Err(_) => {
                             trace!(?handshake_timeout, "multiplexed worker reconnect handshake timed out");
@@ -4843,6 +4847,104 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn paused_http_output_waits_for_resume_before_uploading() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> Result<Vec<u8>> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .context("missing HTTP request header terminator")?
+                + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then_some(value.trim())
+                })
+                .context("missing output content length")?
+                .parse::<usize>()?;
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
+            Ok(request[header_end..header_end + content_length].to_vec())
+        });
+
+        let job = probe_phase_job("pause-http-output");
+        let output_path = std::env::temp_dir().join(format!(
+            "ab-av1-pause-http-output-{}.mkv",
+            std::process::id()
+        ));
+        fs::write(&output_path, b"data")?;
+        let transfer = TransferSpec {
+            url: format!("http://{address}"),
+            auth: TransferAuth {
+                scheme: "Bearer".into(),
+                header: "Authorization".into(),
+                value: "token".into(),
+            },
+        };
+        let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        let result = {
+            let mut upload = std::pin::pin!(upload_multiplex_output(
+                &job,
+                &output_path,
+                &transfer,
+                4,
+                &mut command_receiver,
+                &output,
+                true,
+            ));
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), upload.as_mut())
+                    .await
+                    .is_err()
+            );
+
+            commands.send(JobCommand::Control(ControlPayload {
+                action: ControlAction::Resume,
+                video_id: Some(123),
+                job_id: Some("pause-http-output".into()),
+                command_id: Some("resume-http-output".into()),
+            }))?;
+            upload.await?
+        };
+        assert_eq!(result, None);
+        assert_eq!(server.join().expect("HTTP output server")?, b"data");
+        assert!(matches!(
+            outputs.try_recv(),
+            Ok(MultiplexOutput::Event {
+                event: ClientEvent::ControlState(ControlStatePayload {
+                    state: ControlState::Running,
+                    ..
+                }),
+                ..
+            })
+        ));
+        fs::remove_file(output_path)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn multiplex_encode_sends_heartbeat_without_ffmpeg_progress() -> Result<()> {
         let input_dir =
             std::env::temp_dir().join(format!("ab-av1-multiplex-heartbeat-{}", std::process::id()));
@@ -6118,6 +6220,75 @@ mod tests {
             worker_job_phase(&make_job(WorkStatus::JobAssigned, None), Some(&input_path)).is_err()
         );
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_progress_job_without_input_requests_resend_before_probe() -> Result<()> {
+        let job_id = format!("resend-input-{}", std::process::id());
+        let root = worker_job_input_dir(&job_id);
+        let _ = fs::remove_dir_all(&root);
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobInProgress,
+                job_type: JobKind::CrfSearch,
+                job_id: job_id.clone(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: Vec::new(),
+            },
+            root.clone(),
+            root.join("movie.mkv"),
+        );
+        let (_commands, mut command_receiver) = mpsc::unbounded_channel();
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        let run = run_multiplex_job_inner(&job, &mut command_receiver, &output);
+        tokio::pin!(run);
+
+        let event = tokio::select! {
+            event = outputs.recv() => event,
+            result = &mut run => panic!("job advanced before requesting input resend: {result:?}"),
+        };
+        assert!(matches!(
+            event,
+            Some(MultiplexOutput::RequestInputResend { job_id: actual }) if actual == job_id
+        ));
+
+        drop(run);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_reconnect_handshake_is_bounded_by_offline_lease() -> Result<()> {
+        let (listener, address) = FakeCoordinator::bind("127.0.0.1:0").await?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            let _socket = accept_async(stream).await.expect("accept websocket");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let config = FakeCoordinator {
+            address,
+            server: tokio::spawn(async {}),
+        }
+        .worker_config(WorkerTestConfig::continuous());
+        let timeout = reconnect_handshake_timeout(Duration::from_millis(10));
+
+        assert!(
+            tokio::time::timeout(timeout, ConnectedWorker::connect(&config))
+                .await
+                .is_err(),
+            "a join handshake must not outlive the offline job lease"
+        );
+
+        server.await.expect("stalled handshake server");
         Ok(())
     }
 

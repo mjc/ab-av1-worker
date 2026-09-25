@@ -196,6 +196,7 @@ pub(crate) mod test_hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::managed::ProcessScope;
     use serial_test::serial;
     use std::{env, fs};
 
@@ -373,6 +374,90 @@ mod tests {
         // cleanup
         temporary::clean_all().await;
         let _ = fs::remove_file(input);
+    }
+
+    #[cfg(unix)]
+    #[serial]
+    #[tokio::test(flavor = "current_thread")]
+    async fn scoped_sample_copies_are_cancelled_independently() -> anyhow::Result<()> {
+        let first_input = temp_input("scoped-first");
+        let second_input = temp_input("scoped-second");
+        let first_temp =
+            env::temp_dir().join(format!("ab-av1-sample-scoped-first-{}", std::process::id()));
+        let second_temp = env::temp_dir().join(format!(
+            "ab-av1-sample-scoped-second-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&first_temp)?;
+        fs::create_dir_all(&second_temp)?;
+        let _guard = FixtureGuard::set("sleep-long");
+        let first_scope = ProcessScope::new("sample-copy-first");
+        let second_scope = ProcessScope::new("sample-copy-second");
+        let first = {
+            let scope = first_scope.clone();
+            let input = first_input.clone();
+            tokio::spawn(async move {
+                scope
+                    .run(copy(
+                        &input,
+                        Duration::from_secs(1),
+                        true,
+                        12,
+                        Some(first_temp),
+                    ))
+                    .await
+            })
+        };
+        let second = {
+            let scope = second_scope.clone();
+            let input = second_input.clone();
+            tokio::spawn(async move {
+                scope
+                    .run(copy(
+                        &input,
+                        Duration::from_secs(2),
+                        true,
+                        12,
+                        Some(second_temp),
+                    ))
+                    .await
+            })
+        };
+
+        for _ in 0..100 {
+            if first_scope.has_active_processes() && second_scope.has_active_processes() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            first_scope.has_active_processes(),
+            "first sample copy did not start"
+        );
+        assert!(
+            second_scope.has_active_processes(),
+            "second sample copy did not start"
+        );
+
+        first_scope.stop()?;
+        let first_result = tokio::time::timeout(Duration::from_secs(1), first).await??;
+        assert!(first_result.is_err(), "stopped sample copy should fail");
+        assert!(
+            second_scope.has_active_processes(),
+            "stopping one sample copy must not stop its sibling"
+        );
+
+        second_scope.stop()?;
+        let second_result = tokio::time::timeout(Duration::from_secs(1), second).await??;
+        assert!(
+            second_result.is_err(),
+            "stopped sibling sample copy should fail"
+        );
+
+        temporary::clean_all().await;
+        let _ = fs::remove_file(first_input);
+        let _ = fs::remove_file(second_input);
+        Ok(())
     }
 
     /// Real ffmpeg copy against a minimal GIF input.
