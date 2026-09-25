@@ -119,6 +119,7 @@ pub(crate) struct PullWorkPayload {
 }
 
 impl PullWorkPayload {
+    #[cfg(test)]
     pub(crate) fn input_missing() -> Self {
         Self {
             input_missing: true,

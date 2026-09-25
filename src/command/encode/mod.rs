@@ -109,13 +109,6 @@ pub(crate) async fn run_with_spawner(
     Ok(())
 }
 
-pub(crate) async fn run_worker(
-    config: EncodeConfig,
-    probe: Arc<Ffprobe>,
-) -> anyhow::Result<(PathBuf, FinishedEncode)> {
-    run_worker_with_progress(config, probe, |_fps, _time, _output| {}).await
-}
-
 pub(crate) async fn run_worker_with_progress<F>(
     config: EncodeConfig,
     probe: Arc<Ffprobe>,
