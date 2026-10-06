@@ -52,7 +52,9 @@ const MAX_TRANSFER_FRAME_BYTES: usize = 640 * 1024 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const EVENT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
-const HTTP_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const HTTP_TRANSFER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_TRANSFER_BODY_GRACE_SECS: u64 = 300;
+const HTTP_TRANSFER_MIN_BYTES_PER_SECOND: u64 = 1024 * 1024;
 static HEARTBEAT_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
 fn reconnect_handshake_timeout(offline_job_timeout: Duration) -> Duration {
@@ -98,10 +100,19 @@ struct ControlledReader<R> {
     gate: Arc<TransferGate>,
 }
 
-fn worker_http_agent() -> ureq::Agent {
+// ureq's body timeout is a total budget, not an idle timeout; budget large media at 1 MiB/s.
+fn http_transfer_body_timeout(size_bytes: u64) -> Duration {
+    let minimum_transfer_seconds = size_bytes.div_ceil(HTTP_TRANSFER_MIN_BYTES_PER_SECOND);
+    Duration::from_secs(minimum_transfer_seconds.saturating_add(HTTP_TRANSFER_BODY_GRACE_SECS))
+}
+
+fn worker_http_agent(body_size_bytes: u64) -> ureq::Agent {
+    let body_timeout = Some(http_transfer_body_timeout(body_size_bytes));
+
     ureq::Agent::config_builder()
-        .timeout_recv_body(Some(HTTP_TRANSFER_IDLE_TIMEOUT))
-        .timeout_send_body(Some(HTTP_TRANSFER_IDLE_TIMEOUT))
+        .timeout_recv_response(Some(HTTP_TRANSFER_RESPONSE_TIMEOUT))
+        .timeout_recv_body(body_timeout)
+        .timeout_send_body(body_timeout)
         .build()
         .into()
 }
@@ -1372,7 +1383,7 @@ async fn download_multiplex_input(
     let copy_gate = Arc::clone(&gate);
     let copy_job_id = job_id.clone();
     let copy = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let response = worker_http_agent()
+        let response = worker_http_agent(expected_size)
             .get(&transfer.url)
             .header(&transfer.auth.header, &transfer.auth.value)
             .call()
@@ -1879,7 +1890,7 @@ async fn upload_multiplex_output(
             inner: file,
             gate: copy_gate,
         };
-        worker_http_agent()
+        worker_http_agent(output_bytes)
             .put(&transfer.url)
             .header(&transfer.auth.header, &transfer.auth.value)
             .header("Content-Length", output_bytes.to_string())
@@ -3664,6 +3675,16 @@ mod tests {
     };
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    #[test]
+    fn http_transfer_body_timeout_scales_for_large_media() {
+        let ten_gib = 10 * 1024 * 1024 * 1024;
+
+        assert_eq!(
+            http_transfer_body_timeout(ten_gib),
+            Duration::from_secs(300 + 10 * 1024)
+        );
+    }
 
     #[derive(Clone, Copy)]
     struct WorkerTestConfig {
