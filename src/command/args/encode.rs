@@ -19,7 +19,7 @@ use std::{
 /// Common svt-av1/ffmpeg input encoding arguments.
 #[derive(Parser, Clone)]
 pub struct Encode {
-    /// Encoder override. See https://ffmpeg.org/ffmpeg-all.html#toc-Video-Encoders.
+    /// Encoder override. See <https://ffmpeg.org/ffmpeg-all.html#toc-Video-Encoders>.
     ///
     /// [possible values: libsvtav1, libx264, libx265, libvpx-vp9, ...]
     #[arg(value_enum, short, long, default_value = "libsvtav1")]
@@ -32,7 +32,7 @@ pub struct Encode {
     /// Ffmpeg video filter applied to the input before encoding.
     /// E.g. --vfilter "scale=1280:-1,fps=24".
     ///
-    /// See https://ffmpeg.org/ffmpeg-filters.html#Video-Filters
+    /// See <https://ffmpeg.org/ffmpeg-filters.html#Video-Filters>
     ///
     /// For VMAF calculations this is also applied to the reference video meaning VMAF
     /// scores represent the quality of input stream *after* applying filters compared
@@ -78,7 +78,7 @@ pub struct Encode {
 
     /// Additional svt-av1 arg(s). E.g. --svt mbr=2000 --svt film-grain=8
     ///
-    /// See https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/svt-av1_encoder_user_guide.md#options
+    /// See <https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/svt-av1_encoder_user_guide.md#options>
     #[arg(long = "svt", value_parser = parse_svt_arg)]
     pub svt_args: Vec<SvtArg>,
 

@@ -2376,46 +2376,44 @@ async fn run_multiplexed_worker(
         };
 
         let mut connection_lost = !schedule_ok;
-        if schedule_ok {
-            if let Some(worker) = connection.as_mut() {
-                let event_ack_deadline = next_event_ack_deadline(&pending_acks, EVENT_ACK_TIMEOUT);
-                tokio::select! {
-                        item = outputs.recv() => {
-                            connection_lost = !handle_multiplex_output(
-                                worker,
-                                item,
-                                &mut jobs,
-                                &mut pending,
-                                &mut pending_acks,
-                            ).await?;
-                        }
-                        frame = worker.next_frame() => {
-                            connection_lost = !handle_multiplex_frame(
-                                frame,
-                                &mut jobs,
-                                &mut pending,
-                                &mut no_work,
-                                &mut pending_acks,
-                                &mut scheduler,
-                                &output,
-                                completed_pulls,
-                                config.local_path.as_deref(),
-                            )?;
-                        }
-                        _ = heartbeat.tick() => {
-                            connection_lost = !send_multiplex_heartbeat(
-                                worker,
-                                &jobs,
-                                &mut pending_acks,
-                            ).await;
-                        }
-                        _ = wait_for_deadline(event_ack_deadline) => {
-                            warn!("worker channel acknowledgement timed out; reconnecting");
-                            connection_lost = true;
-                        }
-                        _ = reconnect.tick() => {
-                            no_work.clear();
+        if schedule_ok && let Some(worker) = connection.as_mut() {
+            let event_ack_deadline = next_event_ack_deadline(&pending_acks, EVENT_ACK_TIMEOUT);
+            tokio::select! {
+                    item = outputs.recv() => {
+                        connection_lost = !handle_multiplex_output(
+                            worker,
+                            item,
+                            &mut jobs,
+                            &mut pending,
+                            &mut pending_acks,
+                        ).await?;
                     }
+                    frame = worker.next_frame() => {
+                        connection_lost = !handle_multiplex_frame(
+                            frame,
+                            &mut jobs,
+                            &mut pending,
+                            &mut no_work,
+                            &mut pending_acks,
+                            &mut scheduler,
+                            &output,
+                            completed_pulls,
+                            config.local_path.as_deref(),
+                        )?;
+                    }
+                    _ = heartbeat.tick() => {
+                        connection_lost = !send_multiplex_heartbeat(
+                            worker,
+                            &jobs,
+                            &mut pending_acks,
+                        ).await;
+                    }
+                    _ = wait_for_deadline(event_ack_deadline) => {
+                        warn!("worker channel acknowledgement timed out; reconnecting");
+                        connection_lost = true;
+                    }
+                    _ = reconnect.tick() => {
+                        no_work.clear();
                 }
             }
         }
@@ -6270,19 +6268,20 @@ mod tests {
         );
         let (_commands, mut command_receiver) = mpsc::unbounded_channel();
         let (output, mut outputs) = mpsc::unbounded_channel();
-        let run = run_multiplex_job_inner(&job, &mut command_receiver, &output);
-        tokio::pin!(run);
+        let event = {
+            let run = run_multiplex_job_inner(&job, &mut command_receiver, &output);
+            tokio::pin!(run);
 
-        let event = tokio::select! {
-            event = outputs.recv() => event,
-            result = &mut run => panic!("job advanced before requesting input resend: {result:?}"),
+            tokio::select! {
+                event = outputs.recv() => event,
+                result = &mut run => panic!("job advanced before requesting input resend: {result:?}"),
+            }
         };
         assert!(matches!(
             event,
             Some(MultiplexOutput::RequestInputResend { job_id: actual }) if actual == job_id
         ));
 
-        drop(run);
         let _ = fs::remove_dir_all(root);
         Ok(())
     }

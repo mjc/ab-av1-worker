@@ -19,7 +19,7 @@ pub struct Vmaf {
     ///
     /// By default `n_threads` is set to available system threads.
     ///
-    /// Also see https://ffmpeg.org/ffmpeg-filters.html#libvmaf.
+    /// Also see <https://ffmpeg.org/ffmpeg-filters.html#libvmaf>.
     #[arg(long = "vmaf", value_parser = parse_vmaf_arg)]
     pub vmaf_args: Vec<VmafArg>,
 

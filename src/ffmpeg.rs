@@ -22,8 +22,6 @@ use tokio::process::Command;
 use tokio_stream::StreamExt;
 
 /// Encode output registered for cleanup until the run succeeds.
-///
-/// Only [`crate::command::encode::PartialOutput`] implements this in production code.
 pub trait EncodeDestination {
     fn encode_destination(&self) -> &Path;
 }

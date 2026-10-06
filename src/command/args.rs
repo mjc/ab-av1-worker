@@ -33,7 +33,7 @@ pub struct EncodeToOutput {
     /// Set the output ffmpeg audio codec.
     /// By default 'copy' is used. Otherwise, if re-encoding is necessary, 'libopus' is default.
     ///
-    /// See https://ffmpeg.org/ffmpeg.html#Audio-Options.
+    /// See <https://ffmpeg.org/ffmpeg.html#Audio-Options>.
     #[arg(long = "acodec")]
     pub audio_codec: Option<String>,
 
