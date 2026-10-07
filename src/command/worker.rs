@@ -55,6 +55,8 @@ const HTTP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 const HTTP_TRANSFER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TRANSFER_BODY_GRACE_SECS: u64 = 300;
 const HTTP_TRANSFER_MIN_BYTES_PER_SECOND: u64 = 1024 * 1024;
+const HTTP_TRANSFER_MAX_ATTEMPTS: u32 = 5;
+const HTTP_TRANSFER_RETRY_DELAY: Duration = Duration::from_millis(500);
 static HEARTBEAT_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
 fn reconnect_handshake_timeout(offline_job_timeout: Duration) -> Duration {
@@ -100,6 +102,10 @@ struct ControlledReader<R> {
     gate: Arc<TransferGate>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("worker output delivery failed")]
+struct OutputDeliveryFailure;
+
 // ureq's body timeout is a total budget, not an idle timeout; budget large media at 1 MiB/s.
 fn http_transfer_body_timeout(size_bytes: u64) -> Duration {
     let minimum_transfer_seconds = size_bytes.div_ceil(HTTP_TRANSFER_MIN_BYTES_PER_SECOND);
@@ -115,6 +121,71 @@ fn worker_http_agent(body_size_bytes: u64) -> ureq::Agent {
         .timeout_send_body(body_timeout)
         .build()
         .into()
+}
+
+fn retry_http_transfer(attempt: u32, error: &ureq::Error) -> bool {
+    if attempt >= HTTP_TRANSFER_MAX_ATTEMPTS {
+        return false;
+    }
+    match error {
+        ureq::Error::StatusCode(status) => *status == 429 || *status >= 500,
+        ureq::Error::Io(_) | ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed => true,
+        _ => false,
+    }
+}
+
+fn retry_http_error(attempt: u32, error: &anyhow::Error, gate: &TransferGate) -> bool {
+    if attempt >= HTTP_TRANSFER_MAX_ATTEMPTS {
+        return false;
+    }
+    if *gate.state.lock().expect("transfer gate lock") == ControlState::Stopped {
+        return false;
+    }
+    if let Some(error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ureq::Error>())
+    {
+        return retry_http_transfer(attempt, error);
+    }
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::BrokenPipe
+            )
+        })
+}
+
+fn wait_http_retry(attempt: u32, gate: &TransferGate) -> io::Result<()> {
+    let multiplier = 1_u32 << attempt.saturating_sub(1).min(4);
+    let mut state = gate.state.lock().expect("transfer gate lock");
+    let deadline = std::time::Instant::now() + HTTP_TRANSFER_RETRY_DELAY * multiplier;
+    loop {
+        if *state == ControlState::Stopped {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "worker transfer stopped",
+            ));
+        }
+        if *state == ControlState::Paused {
+            state = gate.changed.wait(state).expect("transfer gate wait");
+            continue;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        let (next_state, _) = gate
+            .changed
+            .wait_timeout(state, remaining)
+            .expect("transfer gate wait");
+        state = next_state;
+    }
 }
 
 impl<R: Read> Read for ControlledReader<R> {
@@ -1183,7 +1254,23 @@ fn cleanup_multiplex_worker_input(
     job: &WorkerJob,
     outcome: &Result<WorkerJobOutcome>,
 ) -> Result<()> {
-    if outcome.is_err() || matches!(outcome, Ok(WorkerJobOutcome::Stopped)) {
+    if outcome.is_err() {
+        if job.assignment.job_type == JobKind::Encode
+            && outcome
+                .as_ref()
+                .unwrap_err()
+                .chain()
+                .any(|cause| cause.is::<OutputDeliveryFailure>())
+            && job.assignment.output_transfer.is_some()
+            && let Some(output_path) = job.local_output_path()
+            && output_path.starts_with(&job.input_dir)
+            && output_path.exists()
+        {
+            return remove_worker_input_except(job, &output_path);
+        }
+        return remove_worker_input(job);
+    }
+    if matches!(outcome, Ok(WorkerJobOutcome::Stopped)) {
         return remove_worker_input(job);
     }
 
@@ -1383,29 +1470,51 @@ async fn download_multiplex_input(
     let copy_gate = Arc::clone(&gate);
     let copy_job_id = job_id.clone();
     let copy = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let response = worker_http_agent(expected_size)
-            .get(&transfer.url)
-            .header(&transfer.auth.header, &transfer.auth.value)
-            .call()
-            .map_err(|error| {
-                anyhow!("HTTP input download failed for job {copy_job_id}: {error}")
-            })?;
-        let reader = ControlledReader {
-            inner: CountingReader {
-                inner: response.into_body().into_reader(),
-                received: copy_received,
-            },
-            gate: copy_gate,
+        let mut attempt = 1;
+        let bytes = loop {
+            let result = (|| -> std::result::Result<u64, anyhow::Error> {
+                copy_gate
+                    .wait_until_running()
+                    .context("wait to download worker input")?;
+                let response = worker_http_agent(expected_size)
+                    .get(&transfer.url)
+                    .header(&transfer.auth.header, &transfer.auth.value)
+                    .call()
+                    .map_err(anyhow::Error::new)
+                    .with_context(|| format!("HTTP input download failed for job {copy_job_id}"))?;
+                let reader = ControlledReader {
+                    inner: CountingReader {
+                        inner: response.into_body().into_reader(),
+                        received: Arc::clone(&copy_received),
+                    },
+                    gate: Arc::clone(&copy_gate),
+                };
+                let mut output_file =
+                    fs::File::create(&part_path).context("create HTTP worker input part file")?;
+                let bytes = io::copy(&mut reader.take(expected_size), &mut output_file)
+                    .context("write HTTP worker input")?;
+                if expected_size > 0 && bytes != expected_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("HTTP input download for job {copy_job_id} wrote {bytes} bytes, expected {expected_size}"),
+                    ).into());
+                }
+                Ok(bytes)
+            })();
+            match result {
+                Ok(bytes) => break bytes,
+                Err(error) if retry_http_error(attempt, &error, &copy_gate) => {
+                    // A partial body is safe to discard; each retry starts from byte zero.
+                    let _ = fs::remove_file(&part_path);
+                    copy_received.store(0, Ordering::Relaxed);
+                    wait_http_retry(attempt, &copy_gate)
+                        .context("wait before retrying HTTP input")?;
+                    attempt += 1;
+                    debug!(job_id = %copy_job_id, attempt, error = %error, "retrying HTTP input transfer");
+                }
+                Err(error) => return Err(error),
+            }
         };
-        let mut output_file =
-            fs::File::create(&part_path).context("create HTTP worker input part file")?;
-        let bytes = io::copy(&mut reader.take(expected_size), &mut output_file)
-            .context("write HTTP worker input")?;
-        if expected_size > 0 && bytes != expected_size {
-            bail!(
-                "HTTP input download for job {copy_job_id} wrote {bytes} bytes, expected {expected_size}"
-            );
-        }
         fs::rename(&part_path, &input_path).context("move HTTP worker input into place")?;
         Ok(bytes)
     });
@@ -1880,22 +1989,47 @@ async fn upload_multiplex_output(
     }
     let copy_gate = Arc::clone(&gate);
     let upload = tokio::task::spawn_blocking(move || -> Result<()> {
-        let file = fs::File::open(&output_path).with_context(|| {
-            format!(
-                "open encoded output for upload for job {job_id}: {}",
-                output_path.display()
-            )
-        })?;
-        let reader = ControlledReader {
-            inner: file,
-            gate: copy_gate,
-        };
-        worker_http_agent(output_bytes)
-            .put(&transfer.url)
-            .header(&transfer.auth.header, &transfer.auth.value)
-            .header("Content-Length", output_bytes.to_string())
-            .send(ureq::SendBody::from_owned_reader(reader))
-            .map_err(|error| anyhow!("HTTP output upload failed for job {job_id}: {error}"))?;
+        let mut attempt = 1;
+        loop {
+            // Reopen the encoded file for every attempt so a failed request never resumes
+            // from an uncertain body offset.
+            copy_gate
+                .wait_until_running()
+                .context("wait to upload worker output")?;
+            let file = fs::File::open(&output_path).with_context(|| {
+                format!(
+                    "open encoded output for upload for job {job_id}: {}",
+                    output_path.display()
+                )
+            })?;
+            let reader = ControlledReader {
+                inner: file,
+                gate: Arc::clone(&copy_gate),
+            };
+            match worker_http_agent(output_bytes)
+                .put(&transfer.url)
+                .header(&transfer.auth.header, &transfer.auth.value)
+                .header("Content-Length", output_bytes.to_string())
+                .send(ureq::SendBody::from_owned_reader(reader))
+            {
+                Ok(_) => break,
+                Err(error)
+                    if retry_http_transfer(attempt, &error)
+                        && *copy_gate.state.lock().expect("transfer gate lock")
+                            != ControlState::Stopped =>
+                {
+                    wait_http_retry(attempt, &copy_gate)
+                        .context("wait before retrying HTTP output")?;
+                    attempt += 1;
+                    debug!(job_id = %job_id, attempt, error = %error, "retrying HTTP output transfer");
+                }
+                Err(error) => {
+                    return Err(anyhow!(
+                        "HTTP output upload failed for job {job_id}: {error}"
+                    ));
+                }
+            }
+        }
         Ok(())
     });
     tokio::pin!(upload);
@@ -1903,7 +2037,9 @@ async fn upload_multiplex_output(
     loop {
         tokio::select! {
             result = &mut upload => {
-                result.context("join HTTP output upload task")??;
+                if let Err(error) = result.context("join HTTP output upload task")? {
+                    return Err(error.context(OutputDeliveryFailure));
+                }
                 return Ok(None);
             }
             command = commands.recv() => match command {
@@ -3684,6 +3820,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn http_retries_are_bounded_and_skip_permanent_statuses() {
+        let gate = TransferGate::running();
+        let io_error = anyhow!(io::Error::new(io::ErrorKind::ConnectionReset, "reset"));
+        assert!(retry_http_error(1, &io_error, &gate));
+        assert!(!retry_http_error(
+            HTTP_TRANSFER_MAX_ATTEMPTS,
+            &io_error,
+            &gate
+        ));
+
+        let unauthorized = anyhow!(ureq::Error::StatusCode(401));
+        let unavailable = anyhow!(ureq::Error::StatusCode(503));
+        assert!(!retry_http_error(1, &unauthorized, &gate));
+        assert!(retry_http_error(1, &unavailable, &gate));
+    }
+
     #[derive(Clone, Copy)]
     struct WorkerTestConfig {
         once: bool,
@@ -4694,11 +4847,201 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn http_output_retries_transient_status_with_same_encoded_bytes() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> Result<Vec<Vec<u8>>> {
+            let mut bodies = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer)?;
+                    if read == 0 {
+                        bail!("connection closed before headers")
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .unwrap()
+                    + 4;
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then_some(value.trim())
+                    })
+                    .context("missing content length")?
+                    .parse::<usize>()?;
+                while request.len() < header_end + content_length {
+                    let read = stream.read(&mut buffer)?;
+                    if read == 0 {
+                        bail!("connection closed before body")
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                bodies.push(request[header_end..header_end + content_length].to_vec());
+                let status = if attempt == 0 {
+                    "503 Service Unavailable"
+                } else {
+                    "204 No Content"
+                };
+                stream.write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                )?;
+            }
+            Ok(bodies)
+        });
+        let job = probe_phase_job("retry-http-output");
+        let output_path =
+            std::env::temp_dir().join(format!("ab-av1-retry-output-{}.mkv", std::process::id()));
+        fs::write(&output_path, b"completed-encode")?;
+        let transfer = TransferSpec {
+            url: format!("http://{address}"),
+            auth: TransferAuth {
+                scheme: "Bearer".into(),
+                header: "Authorization".into(),
+                value: "token".into(),
+            },
+        };
+        let (output, _) = mpsc::unbounded_channel();
+        let (_commands, mut commands) = mpsc::unbounded_channel();
+        assert_eq!(
+            upload_multiplex_output(
+                &job,
+                &output_path,
+                &transfer,
+                16,
+                &mut commands,
+                &output,
+                false
+            )
+            .await?,
+            None
+        );
+        let bodies = server.join().expect("HTTP upload server")?;
+        assert_eq!(
+            bodies,
+            vec![b"completed-encode".to_vec(), b"completed-encode".to_vec()]
+        );
+        fs::remove_file(output_path)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_during_http_retry_backoff_prevents_another_request() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let (request_seen, request_received) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || -> Result<bool> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    bail!("closed before headers")
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let content_length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then_some(value.trim())
+                })
+                .context("missing content length")?
+                .parse::<usize>()?;
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    bail!("closed before body")
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")?;
+            listener.set_nonblocking(true)?;
+            request_seen
+                .send(())
+                .map_err(|_| anyhow!("test receiver dropped"))?;
+            std::thread::sleep(Duration::from_millis(700));
+            Ok(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock))
+        });
+        let job = probe_phase_job("stop-http-retry");
+        let output_path =
+            std::env::temp_dir().join(format!("ab-av1-stop-retry-{}.mkv", std::process::id()));
+        fs::write(&output_path, b"data")?;
+        let transfer = TransferSpec {
+            url: format!("http://{address}"),
+            auth: TransferAuth {
+                scheme: "Bearer".into(),
+                header: "Authorization".into(),
+                value: "token".into(),
+            },
+        };
+        let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let (output, _) = mpsc::unbounded_channel();
+        {
+            let mut upload = std::pin::pin!(upload_multiplex_output(
+                &job,
+                &output_path,
+                &transfer,
+                4,
+                &mut command_receiver,
+                &output,
+                false
+            ));
+            tokio::select! {
+                result = &mut upload => panic!("upload ended before stop command: {result:?}"),
+                seen = tokio::task::spawn_blocking(move || request_received.recv()) => seen.context("join request signal")?.context("request signal closed")?,
+            }
+            commands.send(JobCommand::Control(ControlPayload {
+                action: ControlAction::Stop,
+                video_id: Some(123),
+                job_id: Some("stop-http-retry".into()),
+                command_id: Some("stop-http-retry".into()),
+            }))?;
+            assert_eq!(upload.await?, Some(WorkerJobOutcome::Stopped));
+        }
+        assert!(
+            server.join().expect("HTTP retry server")?,
+            "no retry request should follow stop"
+        );
+        fs::remove_file(output_path)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn stop_during_http_input_does_not_fall_through_to_execution() -> Result<()> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let server = std::thread::spawn(move || -> Result<()> {
-            let (mut stream, _) = listener.accept()?;
+            listener.set_nonblocking(true)?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
+            };
             let mut request = [0; 4096];
             let _ = stream.read(&mut request)?;
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")?;
@@ -4765,11 +5108,81 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn http_input_retries_interrupted_body_from_byte_zero() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut first, _) = listener.accept()?;
+            let mut request = [0; 1024];
+            let _ = first.read(&mut request)?;
+            first.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nno")?;
+            drop(first);
+            let (mut second, _) = listener.accept()?;
+            let _ = second.read(&mut request)?;
+            second.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata")?;
+            Ok(())
+        });
+        let job_id = format!("retry-http-input-{}", std::process::id());
+        let input_dir = worker_job_input_dir(&job_id);
+        let _ = fs::remove_dir_all(&input_dir);
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::CrfSearch,
+                job_id,
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: Some(TransferSpec {
+                    url: format!("http://{address}"),
+                    auth: TransferAuth {
+                        scheme: "Bearer".into(),
+                        header: "Authorization".into(),
+                        value: "token".into(),
+                    },
+                }),
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: Vec::new(),
+            },
+            input_dir.clone(),
+            input_dir.join("movie.mkv"),
+        );
+        let (_commands, mut commands) = mpsc::unbounded_channel();
+        let (output, _) = mpsc::unbounded_channel();
+        assert_eq!(
+            download_multiplex_input(&job, &mut commands, &output).await?,
+            None
+        );
+        server.join().expect("HTTP input server")?;
+        assert_eq!(fs::read(job.input_path())?, b"data");
+        fs::remove_dir_all(input_dir)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn stop_during_http_output_does_not_report_completion() -> Result<()> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let server = std::thread::spawn(move || -> Result<()> {
-            let (mut stream, _) = listener.accept()?;
+            listener.set_nonblocking(true)?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
+            };
             let mut request = Vec::new();
             let mut buffer = [0; 4096];
             while !request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -6118,6 +6531,69 @@ mod tests {
 
         assert!(!input_path.exists());
         assert!(output_path.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_encode_output_is_preserved_only_after_delivery_failure() -> Result<()> {
+        let job_id = format!("cleanup-delivery-output-{}", std::process::id());
+        let root = worker_job_input_dir(&job_id);
+        let _ = fs::remove_dir_all(&root);
+        let input_path = root.join("movie.mkv");
+        let output_path = root.join("movie.av1.mkv");
+        let make_job = || {
+            WorkerJob::new(
+                JobAssignedPayload {
+                    status: WorkStatus::JobAssigned,
+                    job_type: JobKind::Encode,
+                    job_id: job_id.clone(),
+                    video_id: 123,
+                    source_name: "movie.mkv".into(),
+                    size_bytes: 5,
+                    chunk_size_bytes: 5,
+                    target_vmaf: 0.0,
+                    transfer: None,
+                    output_transfer: Some(TransferSpec {
+                        url: "http://127.0.0.1/upload".into(),
+                        auth: TransferAuth {
+                            scheme: "Bearer".into(),
+                            header: "Authorization".into(),
+                            value: "token".into(),
+                        },
+                    }),
+                    output_shared_path: None,
+                    encode_args: vec![
+                        "encode".into(),
+                        "--input".into(),
+                        "movie.mkv".into(),
+                        "--output".into(),
+                        "movie.av1.mkv".into(),
+                    ],
+                    crf_search_args: Vec::new(),
+                },
+                root.clone(),
+                input_path.clone(),
+            )
+        };
+        fs::create_dir_all(&root)?;
+        fs::write(&input_path, b"input")?;
+        fs::write(&output_path, b"partial")?;
+        cleanup_multiplex_worker_input(&make_job(), &Err(anyhow!("encoder failed")))?;
+        assert!(!root.exists(), "partial encoder output should be removed");
+
+        fs::create_dir_all(&root)?;
+        fs::write(&input_path, b"input")?;
+        fs::write(&output_path, b"completed")?;
+        cleanup_multiplex_worker_input(
+            &make_job(),
+            &Err(anyhow!(OutputDeliveryFailure).context("exhausted HTTP upload retries")),
+        )?;
+        assert!(
+            output_path.exists(),
+            "completed output should survive delivery failure"
+        );
+        assert!(!input_path.exists());
         fs::remove_dir_all(root)?;
         Ok(())
     }
