@@ -3,10 +3,11 @@ use crate::command::worker_protocol::{
     ClientFrame, ControlAction, ControlPayload, ControlState, ControlStatePayload,
     CrfSearchCompletedPayload, CrfSearchProgressPayload, CrfSearchResultPayload,
     EncodeCompletedPayload, EncodeProgressPayload, ErrorReplyPayload, FailureReportPayload,
-    HeartbeatPayload, JobKind, PullWorkPayload, ReplyBody, ServerPushFrame, ServerReply,
-    TransferFailurePayload, TransferProgressPayload, TransferStage, TransferStartedPayload,
-    WorkStatus,
+    HeartbeatPayload, JobKind, JobTimingPayload, PullWorkPayload, ReplyBody, ServerPushFrame,
+    ServerReply, TransferFailurePayload, TransferProgressPayload, TransferStage,
+    TransferStartedPayload, WorkStatus,
 };
+use crate::command::worker_timing::JobClock;
 use crate::command::worker_transfer::{Chunk, ChunkReceiver};
 use crate::command::{crf_search, encode, sample_encode};
 use crate::ffprobe::Ffprobe;
@@ -487,6 +488,7 @@ struct WorkerJob {
     assignment: crate::command::worker_protocol::JobAssignedPayload,
     input_dir: PathBuf,
     input_path: PathBuf,
+    clock: Arc<Mutex<JobClock>>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -496,15 +498,42 @@ impl WorkerJob {
         input_dir: PathBuf,
         input_path: PathBuf,
     ) -> Self {
+        let accumulated = Duration::from_millis(assignment.active_milliseconds);
         Self {
             assignment,
             input_dir,
             input_path,
+            clock: Arc::new(Mutex::new(JobClock::restore(accumulated, Instant::now()))),
         }
     }
 
     fn input_path(&self) -> &Path {
         &self.input_path
+    }
+
+    fn set_clock_state(&self, state: ControlState) {
+        self.clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_state(state, Instant::now());
+    }
+
+    fn timing_payload(&self) -> JobTimingPayload {
+        let elapsed = self
+            .clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .elapsed(Instant::now());
+        JobTimingPayload {
+            job_id: self.assignment.job_id.clone(),
+            video_id: self.assignment.video_id,
+            job_type: self.assignment.job_type,
+            active_milliseconds: elapsed
+                .as_millis()
+                .min(9_223_372_036_854_775_807)
+                .try_into()
+                .unwrap_or(9_223_372_036_854_775_807),
+        }
     }
 
     fn crf_search_config(&self) -> Result<crf_search::CrfSearchConfig> {
@@ -1182,6 +1211,7 @@ async fn run_multiplex_job(
         run_multiplex_job_inner(&job, &mut commands, &output),
     )
     .await;
+    job.set_clock_state(ControlState::Stopped);
     if result.is_err() {
         let _ = process_scope.stop();
     }
@@ -1324,6 +1354,7 @@ fn apply_job_control(
             (ControlState::Stopped, Some(WorkerJobOutcome::Stopped))
         }
     };
+    job.set_clock_state(state);
     let _ = multiplex_event(
         output,
         &job.assignment.job_id,
@@ -1732,6 +1763,7 @@ async fn run_multiplex_crf_inner(
             update = run.next(), if !paused => {
                 match update {
                     Some(Ok(crf_search::Update::Done(best))) => {
+                        job.set_clock_state(ControlState::Stopped);
                         let payload = job.crf_result_payload(&best, true);
                         let _ = multiplex_event(
                             output,
@@ -1946,6 +1978,7 @@ async fn run_multiplex_encode_inner(
                     {
                         return Ok(outcome);
                     }
+                job.set_clock_state(ControlState::Stopped);
                 let _ = multiplex_event(
                     output,
                     &job.assignment.job_id,
@@ -2647,6 +2680,23 @@ async fn send_multiplex_heartbeat(
         return true;
     }
 
+    for (job_id, job) in jobs.iter().filter(|(_, job)| !job.finished) {
+        if !pending_acks
+            .values()
+            .any(|ack| ack.name == "job_timing" && ack.job_id == *job_id)
+            && !send_multiplex_event(
+                worker,
+                ClientEvent::JobTiming(job.job.timing_payload()),
+                job_id,
+                "job_timing",
+                pending_acks,
+            )
+            .await
+        {
+            return false;
+        }
+    }
+
     let active_job = jobs.values().find(|job| !job.finished);
     let path = worker_heartbeat_path(active_job);
     let active_video_id = active_job.map(|job| job.job.assignment.video_id);
@@ -2827,6 +2877,24 @@ async fn handle_multiplex_output(
         } => {
             if let Some(job) = jobs.get_mut(&job_id) {
                 record_multiplex_event(&mut job.state, &event);
+                if matches!(
+                    event,
+                    ClientEvent::ControlState(_)
+                        | ClientEvent::CrfSearchResult(_)
+                        | ClientEvent::CrfSearchCompleted(_)
+                        | ClientEvent::EncodeCompleted(_)
+                        | ClientEvent::VideoFailed(_)
+                ) && !send_multiplex_event(
+                    worker,
+                    ClientEvent::JobTiming(job.job.timing_payload()),
+                    &job_id,
+                    "job_timing",
+                    pending_acks,
+                )
+                .await
+                {
+                    return Ok(false);
+                }
             }
             Ok(send_multiplex_event(worker, event, &job_id, name, pending_acks).await)
         }
@@ -2835,6 +2903,20 @@ async fn handle_multiplex_output(
                 return Ok(true);
             };
             job.finished = true;
+            if !send_multiplex_event(
+                worker,
+                ClientEvent::JobTiming(job.job.timing_payload()),
+                &job_id,
+                "job_timing",
+                pending_acks,
+            )
+            .await
+            {
+                if let Err(error) = &result {
+                    job.state.failure = Some(job.job.failure_payload(error));
+                }
+                return Ok(false);
+            }
             match &result {
                 Ok(outcome) => info!(%job_id, ?outcome, "worker job finished"),
                 Err(error) => warn!(%job_id, %error, "worker job failed"),
@@ -2912,6 +2994,7 @@ fn record_multiplex_event(state: &mut WorkerJobReportState, event: &ClientEvent)
         ClientEvent::Join
         | ClientEvent::Announce(_)
         | ClientEvent::JobActive(_)
+        | ClientEvent::JobTiming(_)
         | ClientEvent::PullWork(_)
         | ClientEvent::TransferFailure(_) => {}
     }
@@ -3215,6 +3298,17 @@ async fn replay_multiplex_jobs(
     pending_acks: &mut HashMap<String, PendingEventAck>,
 ) -> bool {
     for (job_id, job) in jobs {
+        if !send_multiplex_event(
+            worker,
+            ClientEvent::JobTiming(job.job.timing_payload()),
+            job_id,
+            "job_timing",
+            pending_acks,
+        )
+        .await
+        {
+            return false;
+        }
         if !job.finished
             && !send_multiplex_event(
                 worker,
@@ -4149,6 +4243,7 @@ mod tests {
     fn worker_failure_payload_uses_cli_exit_code_shape() {
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::CrfSearch,
                 job_id: "crf-search-123".into(),
@@ -4182,6 +4277,7 @@ mod tests {
     fn worker_crf_failure_reports_why_no_crf_was_acceptable() {
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::CrfSearch,
                 job_id: "crf-search-123".into(),
@@ -4429,6 +4525,7 @@ mod tests {
             MultiplexJob {
                 job: WorkerJob::new(
                     JobAssignedPayload {
+                        active_milliseconds: 0,
                         status: WorkStatus::JobAssigned,
                         job_type: JobKind::Encode,
                         job_id: "encode-123".into(),
@@ -4629,6 +4726,7 @@ mod tests {
     fn reconnect_progress_identifies_active_encode_without_prior_progress() {
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::Encode,
                 job_id: "encode-123".into(),
@@ -4678,6 +4776,7 @@ mod tests {
         let input = std::env::temp_dir().join("worker-local-input.mkv");
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::Encode,
                 job_id: "encode-job".into(),
@@ -4775,6 +4874,7 @@ mod tests {
         crate::command::encode::test_hooks::set_fixture("stderr-ffmpeg-progress");
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::Encode,
                 job_id: "upload-job".into(),
@@ -5054,6 +5154,7 @@ mod tests {
         let _ = fs::remove_dir_all(&input_dir);
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::CrfSearch,
                 job_id: job_id.clone(),
@@ -5127,6 +5228,7 @@ mod tests {
         let _ = fs::remove_dir_all(&input_dir);
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::CrfSearch,
                 job_id,
@@ -5386,6 +5488,7 @@ mod tests {
         crate::command::encode::test_hooks::set_fixture("sleep-long");
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::Encode,
                 job_id: "heartbeat-job".into(),
@@ -5555,6 +5658,7 @@ mod tests {
             )
             .await;
             let assignment = JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::Encode,
                 job_id: "e2e-encode-job".into(),
@@ -5665,6 +5769,78 @@ mod tests {
         let _ = fs::remove_file(input);
         let _ = fs::remove_file(output);
         Ok(())
+    }
+
+    #[test]
+    fn resumed_assignment_retains_its_saved_time_and_reports_it_on_the_wire() {
+        let job = probe_phase_job("timed-restart");
+        let mut assignment = job.assignment;
+        assignment.active_milliseconds = 12_000;
+        let restored = WorkerJob::new(assignment, job.input_dir, job.input_path);
+        restored.set_clock_state(ControlState::Paused);
+        let counter = restored.timing_payload();
+        assert!(counter.active_milliseconds >= 12_000);
+        let frame =
+            serde_json::to_value(ClientFrame::new(1, ClientEvent::JobTiming(counter.clone())))
+                .expect("serialize job timing");
+        assert_eq!(frame[3], "job_timing");
+        assert_eq!(frame[4]["active_milliseconds"], counter.active_milliseconds);
+        assert_eq!(frame[4]["job_id"], "timed-restart");
+        assert_eq!(restored.timing_payload(), counter);
+    }
+
+    #[test]
+    fn job_control_updates_one_shared_clock_across_phases() {
+        let job = probe_phase_job("timed-controls");
+        let next_phase = job.clone();
+        let (output, _events) = mpsc::unbounded_channel();
+        let mut paused = false;
+        let control = |action| ControlPayload {
+            action,
+            job_id: Some(job.assignment.job_id.clone()),
+            video_id: Some(job.assignment.video_id),
+            command_id: Some("timed-command".into()),
+        };
+        apply_job_control(
+            &job,
+            &control(ControlAction::Pause),
+            &output,
+            None,
+            &mut paused,
+        )
+        .expect("pause clock");
+        let frozen = job.timing_payload();
+        assert_eq!(next_phase.timing_payload(), frozen);
+        apply_job_control(
+            &next_phase,
+            &control(ControlAction::Pause),
+            &output,
+            None,
+            &mut paused,
+        )
+        .expect("duplicate pause");
+        assert_eq!(job.timing_payload(), frozen);
+        apply_job_control(
+            &next_phase,
+            &control(ControlAction::Resume),
+            &output,
+            None,
+            &mut paused,
+        )
+        .expect("resume clock");
+        assert!(!paused);
+        assert!(job.timing_payload().active_milliseconds >= frozen.active_milliseconds);
+        apply_job_control(
+            &job,
+            &control(ControlAction::Stop),
+            &output,
+            None,
+            &mut paused,
+        )
+        .expect("stop clock");
+        let finished = job.timing_payload();
+        next_phase.set_clock_state(ControlState::Running);
+        assert_eq!(job.timing_payload(), finished);
     }
 
     #[test]
@@ -6078,6 +6254,7 @@ mod tests {
     #[test]
     fn worker_formats_assigned_job_status_with_job_id() {
         let status = work_status_label(&ServerReply::JobAssigned(JobAssignedPayload {
+            active_milliseconds: 0,
             status: WorkStatus::JobAssigned,
             job_type: JobKind::CrfSearch,
             job_id: "job-123".into(),
@@ -6117,6 +6294,7 @@ mod tests {
         let input_path = job_dir.join("movie.mkv");
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::CrfSearch,
                 job_id: "job-123".into(),
@@ -6152,6 +6330,7 @@ mod tests {
     #[test]
     fn build_worker_job_uses_local_path_only_when_requested() {
         let assignment = JobAssignedPayload {
+            active_milliseconds: 0,
             status: WorkStatus::JobAssigned,
             job_type: JobKind::CrfSearch,
             job_id: "job-123".into(),
@@ -6222,6 +6401,7 @@ mod tests {
 
         let job = build_worker_job(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobInProgress,
                 job_type: JobKind::CrfSearch,
                 job_id: "job-path-source".into(),
@@ -6257,6 +6437,7 @@ mod tests {
         let _ = fs::remove_dir_all(&input_dir);
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::CrfSearch,
                 job_id: job_id.clone(),
@@ -6370,6 +6551,7 @@ mod tests {
         fs::write(&input_path, b"data")?;
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::CrfSearch,
                 job_id: "cleanup-job".into(),
@@ -6408,6 +6590,7 @@ mod tests {
         fs::write(&input_path, b"data")?;
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::CrfSearch,
                 job_id,
@@ -6447,6 +6630,7 @@ mod tests {
                 let input_path = root.join("movie.mkv");
                 let job = WorkerJob::new(
                     JobAssignedPayload {
+                        active_milliseconds: 0,
                         status: WorkStatus::JobAssigned,
                         job_type: JobKind::CrfSearch,
                         job_id: job_id.clone(),
@@ -6503,6 +6687,7 @@ mod tests {
         fs::write(&output_path, b"output")?;
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::Encode,
                 job_id,
@@ -6545,6 +6730,7 @@ mod tests {
         let make_job = || {
             WorkerJob::new(
                 JobAssignedPayload {
+                    active_milliseconds: 0,
                     status: WorkStatus::JobAssigned,
                     job_type: JobKind::Encode,
                     job_id: job_id.clone(),
@@ -6613,6 +6799,7 @@ mod tests {
         fs::write(&output_path, b"output")?;
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::Encode,
                 job_id,
@@ -6653,6 +6840,7 @@ mod tests {
         let make_job = |status, transfer| {
             WorkerJob::new(
                 JobAssignedPayload {
+                    active_milliseconds: 0,
                     status,
                     job_type: JobKind::CrfSearch,
                     job_id: "phase-job".into(),
@@ -6725,6 +6913,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobInProgress,
                 job_type: JobKind::CrfSearch,
                 job_id: job_id.clone(),
@@ -6794,6 +6983,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::CrfSearch,
                 job_id: "stop-during-input".into(),
@@ -6846,6 +7036,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let job = WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobAssigned,
                 job_type: JobKind::CrfSearch,
                 job_id: job_id.clone(),
@@ -6988,6 +7179,7 @@ mod tests {
     fn probe_phase_job(job_id: &str) -> WorkerJob {
         WorkerJob::new(
             JobAssignedPayload {
+                active_milliseconds: 0,
                 status: WorkStatus::JobInProgress,
                 job_type: JobKind::CrfSearch,
                 job_id: job_id.into(),
@@ -7341,6 +7533,7 @@ mod tests {
                 (serde_json::to_string(&ServerFrame::reply(
                     request_ref,
                     ReplyBody::ok(ServerReply::JobAssigned(JobAssignedPayload {
+                        active_milliseconds: 0,
                         status,
                         job_type: JobKind::CrfSearch,
                         job_id: job_id.into(),

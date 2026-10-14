@@ -32,6 +32,7 @@ pub(crate) enum ClientEvent {
     Join,
     Announce(AnnouncePayload),
     JobActive(ActiveJobPayload),
+    JobTiming(JobTimingPayload),
     PullWork(PullWorkPayload),
     Heartbeat(HeartbeatPayload),
     ControlState(ControlStatePayload),
@@ -52,6 +53,7 @@ impl ClientEvent {
             Self::Join => ("phx_join", ClientPayload::Empty(EmptyPayload {})),
             Self::Announce(payload) => ("announce", ClientPayload::Announce(payload)),
             Self::JobActive(payload) => ("job_active", ClientPayload::JobActive(payload)),
+            Self::JobTiming(payload) => ("job_timing", ClientPayload::JobTiming(payload)),
             Self::PullWork(payload) => ("pull_work", ClientPayload::PullWork(payload)),
             Self::Heartbeat(payload) => ("heartbeat", ClientPayload::Heartbeat(payload)),
             Self::ControlState(payload) => ("control_state", ClientPayload::ControlState(payload)),
@@ -87,6 +89,7 @@ enum ClientPayload {
     Empty(EmptyPayload),
     Announce(AnnouncePayload),
     JobActive(ActiveJobPayload),
+    JobTiming(JobTimingPayload),
     PullWork(PullWorkPayload),
     Heartbeat(HeartbeatPayload),
     ControlState(ControlStatePayload),
@@ -108,6 +111,14 @@ pub(crate) struct ActiveJobPayload {
     pub(crate) job_id: String,
     pub(crate) video_id: u64,
     pub(crate) job_type: JobKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct JobTimingPayload {
+    pub(crate) job_id: String,
+    pub(crate) video_id: u64,
+    pub(crate) job_type: JobKind,
+    pub(crate) active_milliseconds: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -399,6 +410,8 @@ impl<'de> Deserialize<'de> for NoWorkPayload {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct JobAssignedPayload {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) active_milliseconds: u64,
     pub(crate) status: WorkStatus,
     #[serde(default)]
     pub(crate) job_type: JobKind,
@@ -420,6 +433,10 @@ pub(crate) struct JobAssignedPayload {
     /// A server-visible path for workers sharing the server's filesystem.
     #[serde(default)]
     pub(crate) output_shared_path: Option<String>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1088,6 +1105,7 @@ mod tests {
             ServerFrame::reply(
                 4,
                 ReplyBody::ok(ServerReply::JobAssigned(JobAssignedPayload {
+                    active_milliseconds: 0,
                     status: WorkStatus::JobAssigned,
                     job_type: JobKind::CrfSearch,
                     job_id: "job-123".into(),
@@ -1152,6 +1170,7 @@ mod tests {
             ServerFrame::reply(
                 3,
                 ReplyBody::ok(ServerReply::JobAssigned(JobAssignedPayload {
+                    active_milliseconds: 0,
                     status: WorkStatus::JobInProgress,
                     job_type: JobKind::CrfSearch,
                     job_id: "job-123".into(),
